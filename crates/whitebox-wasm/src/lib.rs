@@ -11,6 +11,7 @@
 //!   [`CogBuilder`] encodes Cloud Optimized GeoTIFFs to bytes).
 mod vector;
 mod lidar;
+mod analysis;
 use wasm_bindgen::prelude::*;
 use wbgeotiff::{CogLayout, CogWriter, Compression, GeoTiff, GeoTransform, SampleFormat};
 

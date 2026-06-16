@@ -75,7 +75,7 @@ await init({ module_or_path: readFileSync("node_modules/whitebox-wasm/whitebox_w
 - `geo_transform()` -> `[x_origin, pixel_width, row_rot, y_origin, col_rot, pixel_height]` (empty if none)
 - `bounding_box()` -> `[min_x, min_y, max_x, max_y]` in the dataset CRS (empty if not georeferenced)
 - `center()` -> `[x, y]` center in the dataset CRS
-- `center_lonlat()` -> `[lon, lat]` WGS84 degrees; `bounds_lonlat()` -> `[min_lon, min_lat, max_lon, max_lat]` (EPSG:4326/3857 only; empty for CRS that need PROJ)
+- `center_lonlat()` -> `[lon, lat]` WGS84 degrees; `bounds_lonlat()` -> `[min_lon, min_lat, max_lon, max_lat]` WGS84 (any EPSG via the bundled pure-Rust projection engine; also handles user-defined projections like NLCD's Albers; empty if not georeferenced)
 - `value_transform()` -> `[scale, offset]` (GDAL scale/offset; empty if none)
 - `info_json()`, `stats_json()` -> JSON strings
 - `read_band_f64(band)` / `read_all_f64()` -> `Float64Array` (any on-disk type converted)
@@ -147,5 +147,5 @@ decoded in-browser). For such data, read metadata only or process server-side.
 ## License
 
 Dual-licensed under MIT or Apache-2.0, at your option. Includes the vendored
-`wbgeotiff` crate (Copyright John Lindsay, Whitebox Geospatial Inc.), used under
-the same dual license.
+`wbgeotiff` and `wbprojection` crates (Copyright John Lindsay, Whitebox
+Geospatial Inc.), used under the same dual license.

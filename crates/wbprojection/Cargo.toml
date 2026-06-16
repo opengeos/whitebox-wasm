@@ -1,0 +1,21 @@
+[package]
+name = "wbprojection"
+version = "0.3.0"
+edition = "2021"
+authors = ["John Lindsay, Whitebox Geospatial Inc."]
+description = "Whitebox Projections is a map projection library for Rust, inspired by PROJ"
+license = "MIT OR Apache-2.0"
+keywords = ["gis", "projection", "cartography", "geodesy", "maps"]
+categories = ["science", "mathematics"]
+repository = "https://github.com/jblindsay/whitebox_next_gen"
+
+[dependencies]
+thiserror = "1.0"
+wide = "1.2"
+rayon = { version = "1.10", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+parallel = ["dep:rayon"]

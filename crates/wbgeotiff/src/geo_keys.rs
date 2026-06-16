@@ -255,6 +255,73 @@ impl GeoKeyDirectory {
         None
     }
 
+    /// Build a PROJ string for a *user-defined* projected CRS (ProjectedCSType =
+    /// 32767, e.g. NLCD's Albers) from the projection-parameter GeoKeys. Returns
+    /// `None` for CRS that carry a real projected EPSG code (use [`epsg`]) or
+    /// that are not projected. Covers the common projections.
+    pub fn to_proj_string(&self) -> Option<String> {
+        use key::*;
+        // Only for user-defined PROJECTED CRS.
+        if !matches!(self.get(GTModelTypeGeoKey), Some(GeoKeyValue::Short(1))) {
+            return None;
+        }
+        if let Some(GeoKeyValue::Short(n)) = self.get(ProjectedCSTypeGeoKey) {
+            if *n != 32767 && *n != 0 { return None; }
+        }
+        let ct = match self.get(ProjCoordTransGeoKey) {
+            Some(GeoKeyValue::Short(n)) => *n,
+            _ => return None,
+        };
+        let d = |k: u16| -> Option<f64> {
+            match self.get(k)? {
+                GeoKeyValue::Doubles(v) => v.first().copied(),
+                GeoKeyValue::Short(n) => Some(*n as f64),
+                _ => None,
+            }
+        };
+        let proj = match ct {
+            1 => "tmerc",
+            7 => "merc",
+            8 => "lcc",         // Lambert Conformal Conic (2SP)
+            10 => "laea",
+            11 => "aea",        // Albers Equal Area
+            12 => "aeqd",
+            14 | 15 | 16 => "stere",
+            17 => "eqc",
+            20 => "mill",
+            21 => "ortho",
+            24 => "sinu",
+            _ => return None,
+        };
+        let mut s = format!("+proj={proj}");
+        let lat0 = d(ProjNatOriginLatGeoKey)
+            .or_else(|| d(ProjCenterLatGeoKey))
+            .or_else(|| d(ProjFalseProjOriginLatGeoKey));
+        let lon0 = d(ProjNatOriginLongGeoKey)
+            .or_else(|| d(ProjCenterLongGeoKey))
+            .or_else(|| d(ProjFalseProjOriginLongGeoKey))
+            .or_else(|| d(ProjStraightVertPoleLongGeoKey));
+        if let Some(v) = d(ProjStdParallel1GeoKey) { s.push_str(&format!(" +lat_1={v}")); }
+        if let Some(v) = d(ProjStdParallel2GeoKey) { s.push_str(&format!(" +lat_2={v}")); }
+        if let Some(v) = lat0 { s.push_str(&format!(" +lat_0={v}")); }
+        if let Some(v) = lon0 { s.push_str(&format!(" +lon_0={v}")); }
+        if let Some(v) = d(ProjScaleAtNatOriginGeoKey) { s.push_str(&format!(" +k_0={v}")); }
+        s.push_str(&format!(" +x_0={} +y_0={}",
+            d(ProjFalseEastingGeoKey).unwrap_or(0.0),
+            d(ProjFalseNorthingGeoKey).unwrap_or(0.0)));
+        match self.get(GeographicTypeGeoKey) {
+            Some(GeoKeyValue::Short(4326)) => s.push_str(" +datum=WGS84"),
+            Some(GeoKeyValue::Short(4269)) => s.push_str(" +datum=NAD83"),
+            Some(GeoKeyValue::Short(4267)) => s.push_str(" +datum=NAD27"),
+            _ => match (d(GeogSemiMajorAxisGeoKey), d(GeogInvFlatteningGeoKey)) {
+                (Some(a), Some(rf)) if rf > 0.0 => s.push_str(&format!(" +a={a} +rf={rf}")),
+                _ => s.push_str(" +datum=WGS84"),
+            },
+        }
+        s.push_str(" +units=m +no_defs");
+        Some(s)
+    }
+
     // ── Serialisation ────────────────────────────────────────────────────────
 
     /// Encode the GeoKey directory into the three raw tag arrays suitable for

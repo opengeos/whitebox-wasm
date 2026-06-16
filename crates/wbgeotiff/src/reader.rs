@@ -88,6 +88,8 @@ pub struct GeoTiffMeta {
     pub tiled: bool,
     /// Affine geo-transform, if the file is georeferenced.
     pub geo_transform: Option<GeoTransform>,
+    /// PROJ string for a user-defined projected CRS (no EPSG code), if any.
+    pub proj_string: Option<String>,
 }
 
 /// A decoded GeoTIFF file, ready for data access.
@@ -172,6 +174,7 @@ impl GeoTiff {
             is_bigtiff,
             tiled,
             geo_transform: Self::parse_geo_transform(&ifd),
+            proj_string: geo_keys.as_ref().and_then(|gk| gk.to_proj_string()),
         })
     }
 
@@ -495,6 +498,11 @@ impl GeoTiff {
     /// EPSG code derived from the GeoKey directory.
     pub fn epsg(&self) -> Option<u16> {
         self.geo_keys.as_ref()?.epsg()
+    }
+
+    /// PROJ string for a user-defined projected CRS (no EPSG code), if any.
+    pub fn proj_string(&self) -> Option<String> {
+        self.geo_keys.as_ref()?.to_proj_string()
     }
 
     /// Optional linear value transform parsed from GDAL metadata.
@@ -830,6 +838,8 @@ pub struct CogLayout {
     pub no_data: Option<f64>,
     /// Affine geo-transform of level 0, if present.
     pub geo_transform: Option<GeoTransform>,
+    /// PROJ string for a user-defined projected CRS (no EPSG code), if any.
+    pub proj_string: Option<String>,
 }
 
 impl GeoTiff {
@@ -876,9 +886,11 @@ impl GeoTiff {
                 }
             }
         }
-        let epsg = Self::parse_geo_keys(&ifds[0])?.and_then(|gk| gk.epsg());
+        let gk0 = Self::parse_geo_keys(&ifds[0])?;
+        let epsg = gk0.as_ref().and_then(|gk| gk.epsg());
+        let proj_string = gk0.as_ref().and_then(|gk| gk.to_proj_string());
         let geo_transform = Self::parse_geo_transform(&ifds[0]);
-        Ok(CogLayout { levels, epsg, no_data, geo_transform })
+        Ok(CogLayout { levels, epsg, no_data, geo_transform, proj_string })
     }
 }
 

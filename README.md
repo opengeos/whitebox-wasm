@@ -63,7 +63,8 @@ Runnable Node examples: [`examples/node-demo.mjs`](examples/node-demo.mjs) and
 **`GeoTiffReader(bytes)`** - parse once, then: `width`/`height`/`bands`/`epsg`/
 `nodata`/`sample_format`/`compression`/`bits_per_sample`/`is_bigtiff`;
 `geo_transform()`, `bounding_box()`, `center()`, `center_lonlat()`,
-`bounds_lonlat()` (WGS84 for EPSG:4326/3857), `value_transform()`; `info_json()`,
+`bounds_lonlat()` (WGS84, full EPSG support via the bundled pure-Rust projection
+engine, plus user-defined projections), `value_transform()`; `info_json()`,
 `stats_json()`; `read_band_f64(band)`, `read_all_f64()`, `read_band_bytes(band)`,
 and native typed reads `read_band_u8|i8|u16|i16|u32|i32|f32`.
 
@@ -146,5 +147,7 @@ project.
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
-option. Includes the vendored `wbgeotiff` crate (© John Lindsay, Whitebox
-Geospatial Inc.), used under the same dual license.
+option. Includes the vendored `wbgeotiff` and `wbprojection` crates (© John
+Lindsay, Whitebox Geospatial Inc.) from
+[whitebox_next_gen](https://github.com/jblindsay/whitebox_next_gen), used under
+the same dual license.

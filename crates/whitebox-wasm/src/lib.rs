@@ -53,35 +53,60 @@ fn bbox_from_gt(g: &GeoTransform, width: u32, height: u32) -> [f64; 4] {
     [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)]
 }
 
-/// Convert a coordinate in a known web CRS to WGS84 `(lon, lat)` degrees.
-/// Supports EPSG:4326 (identity) and EPSG:3857 / 900913 (Web Mercator, exact
-/// closed form). Returns `None` for other CRS (no PROJ in this build).
-fn to_lonlat(epsg: Option<u16>, x: f64, y: f64) -> Option<(f64, f64)> {
-    match epsg {
-        // EPSG:4326 is the geographic base of many user-defined *projected* CRS
-        // (e.g. NLCD's Albers, which has no projected EPSG code). Only treat the
-        // coordinates as degrees when they actually fall in valid lon/lat range;
-        // otherwise they are projected units we cannot convert without PROJ.
-        Some(4326) if x.abs() <= 180.000_001 && y.abs() <= 90.000_001 => Some((x, y)),
-        Some(3857) | Some(3785) => {
-            const R: f64 = 6_378_137.0;
-            let lon = (x / R).to_degrees();
-            let lat = (2.0 * (y / R).exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees();
-            Some((lon, lat))
-        }
-        _ => None,
+/// Build the source CRS for lon/lat conversion using the pure-Rust
+/// `wbprojection` engine (full EPSG support, no PROJ/C). A user-defined
+/// projection's PROJ string is preferred (e.g. NLCD's Albers, which has no EPSG
+/// code and only reports its geographic base 4326); otherwise the EPSG code.
+fn lonlat_crs(epsg: Option<u16>, proj_string: Option<&str>) -> Option<wbprojection::Crs> {
+    if let Some(ps) = proj_string {
+        if let Ok(c) = wbprojection::from_proj_string(ps) { return Some(c); }
+    }
+    wbprojection::Crs::from_epsg(epsg? as u32).ok()
+}
+
+/// Transform one point from `src` to WGS84 `(lon, lat)`, rejecting implausible
+/// results (which catches a wrong/ambiguous CRS tag).
+fn project_lonlat(src: &wbprojection::Crs, x: f64, y: f64) -> Option<(f64, f64)> {
+    let wgs84 = wbprojection::Crs::wgs84_geographic();
+    let (lon, lat) = src.transform_to(x, y, &wgs84).ok()?;
+    if lon.is_finite() && lat.is_finite() && lon.abs() <= 180.000_001 && lat.abs() <= 90.000_001 {
+        Some((lon, lat))
+    } else {
+        None
     }
 }
 
-/// `[min_lon, min_lat, max_lon, max_lat]` for a CRS-native bbox, or empty if the
-/// CRS is not convertible without PROJ.
-fn bounds_lonlat(epsg: Option<u16>, b: [f64; 4]) -> Vec<f64> {
-    match (to_lonlat(epsg, b[0], b[1]), to_lonlat(epsg, b[2], b[3])) {
-        (Some((lo0, la0)), Some((lo1, la1))) => {
-            vec![lo0.min(lo1), la0.min(la1), lo0.max(lo1), la0.max(la1)]
+/// WGS84 `(lon, lat)` of a single coordinate, or `None` if not convertible.
+fn to_lonlat(epsg: Option<u16>, proj_string: Option<&str>, x: f64, y: f64) -> Option<(f64, f64)> {
+    project_lonlat(&lonlat_crs(epsg, proj_string)?, x, y)
+}
+
+/// `[min_lon, min_lat, max_lon, max_lat]` (WGS84) for a CRS-native bbox.
+///
+/// The bbox is densified - corners, edge midpoints, and center are reprojected
+/// and the min/max taken - so the geographic envelope is correct even for
+/// projections where the extremes fall on edges rather than corners. Returns
+/// empty if the CRS is not convertible.
+fn bounds_lonlat(epsg: Option<u16>, proj_string: Option<&str>, b: [f64; 4]) -> Vec<f64> {
+    let src = match lonlat_crs(epsg, proj_string) { Some(c) => c, None => return Vec::new() };
+    let (x0, y0, x1, y1) = (b[0], b[1], b[2], b[3]);
+    let (mx, my) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let samples = [
+        (x0, y0), (x1, y0), (x0, y1), (x1, y1), // corners
+        (mx, y0), (mx, y1), (x0, my), (x1, my), // edge midpoints
+        (mx, my),                               // center
+    ];
+    let (mut min_lon, mut min_lat, mut max_lon, mut max_lat) =
+        (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut any = false;
+    for (x, y) in samples {
+        if let Some((lon, lat)) = project_lonlat(&src, x, y) {
+            any = true;
+            min_lon = min_lon.min(lon); max_lon = max_lon.max(lon);
+            min_lat = min_lat.min(lat); max_lat = max_lat.max(lat);
         }
-        _ => Vec::new(),
     }
+    if any { vec![min_lon, min_lat, max_lon, max_lat] } else { Vec::new() }
 }
 
 /// Largest full-raster allocation we will attempt, in bytes. WASM is 32-bit
@@ -158,28 +183,33 @@ pub fn geotiff_info(data: &[u8]) -> String {
         Err(e) => return err_json(&format!("decode: {e}")),
     };
     let epsg = m.epsg.map(|e| e.to_string()).unwrap_or_else(|| "null".into());
-    let (bbox, center, center_lonlat) = match m.geo_transform.as_ref() {
+    let (bbox, center, center_lonlat, bbox_lonlat) = match m.geo_transform.as_ref() {
         Some(g) => {
             let b = bbox_from_gt(g, m.width, m.height);
             let cx = (b[0] + b[2]) / 2.0;
             let cy = (b[1] + b[3]) / 2.0;
             let bbox = format!("[{},{},{},{}]", b[0], b[1], b[2], b[3]);
             let center = format!("[{cx},{cy}]");
-            let cll = match to_lonlat(m.epsg, cx, cy) {
+            let ps = m.proj_string.as_deref();
+            let cll = match to_lonlat(m.epsg, ps, cx, cy) {
                 Some((lon, lat)) => format!("[{lon},{lat}]"),
                 None => "null".into(),
             };
-            (bbox, center, cll)
+            let bll = match bounds_lonlat(m.epsg, ps, b).as_slice() {
+                [a, c, d, e] => format!("[{a},{c},{d},{e}]"),
+                _ => "null".into(),
+            };
+            (bbox, center, cll, bll)
         }
-        None => ("null".into(), "null".into(), "null".into()),
+        None => ("null".into(), "null".into(), "null".into(), "null".into()),
     };
     format!(
         "{{\"ok\":true,\"width\":{},\"height\":{},\"bands\":{},\"epsg\":{},\"nodata\":{},\
 \"bits_per_sample\":{},\"sample_format\":\"{}\",\"compression\":\"{:?}\",\"tiled\":{},\"bigtiff\":{},\
-\"bbox\":{},\"center\":{},\"center_lonlat\":{}}}",
+\"bbox\":{},\"center\":{},\"center_lonlat\":{},\"bbox_lonlat\":{}}}",
         m.width, m.height, m.bands, epsg, json_opt_f64(m.no_data),
         m.bits_per_sample, sample_format_str(m.sample_format), m.compression, m.tiled, m.is_bigtiff,
-        bbox, center, center_lonlat
+        bbox, center, center_lonlat, bbox_lonlat
     )
 }
 
@@ -272,23 +302,24 @@ impl GeoTiffReader {
         }
     }
 
-    /// Image center `[lon, lat]` in WGS84 degrees (EPSG:4326/3857 only), or
-    /// empty if not georeferenced or the CRS is not convertible without PROJ.
+    /// Image center `[lon, lat]` in WGS84 degrees, or empty if not georeferenced
+    /// or the CRS is not convertible.
     pub fn center_lonlat(&self) -> Vec<f64> {
         let b = match self.inner.bounding_box() { Some(b) => b, None => return Vec::new() };
         let cx = (b.min_x + b.max_x) / 2.0;
         let cy = (b.min_y + b.max_y) / 2.0;
-        match to_lonlat(self.inner.epsg(), cx, cy) {
+        match to_lonlat(self.inner.epsg(), self.inner.proj_string().as_deref(), cx, cy) {
             Some((lon, lat)) => vec![lon, lat],
             None => Vec::new(),
         }
     }
 
-    /// Bounds `[min_lon, min_lat, max_lon, max_lat]` in WGS84 degrees
-    /// (EPSG:4326/3857 only), or empty if not convertible.
+    /// Bounds `[min_lon, min_lat, max_lon, max_lat]` in WGS84 degrees, or empty
+    /// if not convertible.
     pub fn bounds_lonlat(&self) -> Vec<f64> {
         match self.inner.bounding_box() {
-            Some(b) => bounds_lonlat(self.inner.epsg(), [b.min_x, b.min_y, b.max_x, b.max_y]),
+            Some(b) => bounds_lonlat(self.inner.epsg(), self.inner.proj_string().as_deref(),
+                                     [b.min_x, b.min_y, b.max_x, b.max_y]),
             None => Vec::new(),
         }
     }
@@ -567,10 +598,11 @@ impl CogStream {
         }
     }
 
-    /// Image center `[lon, lat]` in WGS84 degrees (EPSG:4326/3857 only), or empty.
+    /// Image center `[lon, lat]` in WGS84 degrees, or empty if not convertible.
     pub fn center_lonlat(&self) -> Vec<f64> {
+        let ps = self.layout.proj_string.as_deref();
         match self.bbox() {
-            Some(b) => match to_lonlat(self.layout.epsg, (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0) {
+            Some(b) => match to_lonlat(self.layout.epsg, ps, (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0) {
                 Some((lon, lat)) => vec![lon, lat],
                 None => Vec::new(),
             },
@@ -578,10 +610,10 @@ impl CogStream {
         }
     }
 
-    /// Bounds `[min_lon, min_lat, max_lon, max_lat]` WGS84 (EPSG:4326/3857), or empty.
+    /// Bounds `[min_lon, min_lat, max_lon, max_lat]` in WGS84 degrees, or empty.
     pub fn bounds_lonlat(&self) -> Vec<f64> {
         match self.bbox() {
-            Some(b) => bounds_lonlat(self.layout.epsg, b),
+            Some(b) => bounds_lonlat(self.layout.epsg, self.layout.proj_string.as_deref(), b),
             None => Vec::new(),
         }
     }

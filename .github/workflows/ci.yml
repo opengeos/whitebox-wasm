@@ -20,7 +20,9 @@ jobs:
         with:
           node-version: 20
       - name: cargo test (host)
-        run: cargo test --workspace
+        # Scope to our crates; the vendored wbprojection ships an authoritative
+        # EPSG/datum fixture suite that needs data files we don't vendor.
+        run: cargo test -p wbgeotiff -p whitebox-wasm
       - name: wasm-pack build
         run: wasm-pack build crates/whitebox-wasm --release --target web --out-dir pkg
       - name: Node smoke test

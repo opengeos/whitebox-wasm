@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/wbgeotiff", "crates/whitebox-wasm"]
+members = ["crates/wbgeotiff", "crates/wbprojection", "crates/whitebox-wasm"]
 resolver = "2"
 
 [profile.release]

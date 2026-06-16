@@ -62,7 +62,8 @@ Runnable Node examples: [`examples/node-demo.mjs`](examples/node-demo.mjs) and
 
 **`GeoTiffReader(bytes)`** - parse once, then: `width`/`height`/`bands`/`epsg`/
 `nodata`/`sample_format`/`compression`/`bits_per_sample`/`is_bigtiff`;
-`geo_transform()`, `bounding_box()`, `value_transform()`; `info_json()`,
+`geo_transform()`, `bounding_box()`, `center()`, `center_lonlat()`,
+`bounds_lonlat()` (WGS84 for EPSG:4326/3857), `value_transform()`; `info_json()`,
 `stats_json()`; `read_band_f64(band)`, `read_all_f64()`, `read_band_bytes(band)`,
 and native typed reads `read_band_u8|i8|u16|i16|u32|i32|f32`.
 

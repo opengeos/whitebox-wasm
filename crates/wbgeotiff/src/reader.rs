@@ -86,6 +86,8 @@ pub struct GeoTiffMeta {
     pub is_bigtiff: bool,
     /// True if the image is tiled (vs stripped).
     pub tiled: bool,
+    /// Affine geo-transform, if the file is georeferenced.
+    pub geo_transform: Option<GeoTransform>,
 }
 
 /// A decoded GeoTIFF file, ready for data access.
@@ -169,6 +171,7 @@ impl GeoTiff {
             compression: info.compression,
             is_bigtiff,
             tiled,
+            geo_transform: Self::parse_geo_transform(&ifd),
         })
     }
 

@@ -62,7 +62,7 @@ await init({ module_or_path: readFileSync("node_modules/whitebox-wasm/whitebox_w
 
 | Function | Returns |
 |---|---|
-| `geotiff_info(bytes)` | JSON metadata, header-only (works on multi-GB files) |
+| `geotiff_info(bytes)` | JSON metadata, header-only (incl. `bbox`, `center`, `center_lonlat`) |
 | `geotiff_stats(bytes)` | JSON band-0 stats `{valid, min, max, mean, ...}` |
 | `geotiff_read_band_f64(bytes, band)` | `Float64Array` of band pixels |
 | `version()` | crate version string |
@@ -73,7 +73,9 @@ await init({ module_or_path: readFileSync("node_modules/whitebox-wasm/whitebox_w
 
 - Properties: `width`, `height`, `bands`, `bits_per_sample`, `sample_format`, `compression`, `is_bigtiff`, `epsg`, `nodata`
 - `geo_transform()` -> `[x_origin, pixel_width, row_rot, y_origin, col_rot, pixel_height]` (empty if none)
-- `bounding_box()` -> `[min_x, min_y, max_x, max_y]` (empty if not georeferenced)
+- `bounding_box()` -> `[min_x, min_y, max_x, max_y]` in the dataset CRS (empty if not georeferenced)
+- `center()` -> `[x, y]` center in the dataset CRS
+- `center_lonlat()` -> `[lon, lat]` WGS84 degrees; `bounds_lonlat()` -> `[min_lon, min_lat, max_lon, max_lat]` (EPSG:4326/3857 only; empty for CRS that need PROJ)
 - `value_transform()` -> `[scale, offset]` (GDAL scale/offset; empty if none)
 - `info_json()`, `stats_json()` -> JSON strings
 - `read_band_f64(band)` / `read_all_f64()` -> `Float64Array` (any on-disk type converted)
@@ -118,6 +120,7 @@ for (const t of tiles) {
 - `new CogStream(headerBytes)` - parse the IFD chain + tile index (throws if the
   prefix is too short; fetch more and retry).
 - `num_levels`, `epsg`, `nodata`, `geo_transform()`, `levels_json()`
+- `bounding_box()`, `center()`, `center_lonlat()`, `bounds_lonlat()` (same semantics as `GeoTiffReader`)
 - `tiles_for_window(level, x, y, w, h)` -> JSON `[{col,row,offset,length}]`
 - `tile_range(level, col, row)` -> `[offset, length]`
 - `decode_tile_f64(level, tileBytes)` -> `Float64Array` (one decoded tile)

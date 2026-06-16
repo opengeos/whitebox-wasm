@@ -6,6 +6,25 @@
 use wasm_bindgen::prelude::*;
 use wbgeotiff::GeoTiff;
 
+/// Install a panic hook so Rust panics surface as readable `console.error`
+/// messages instead of an opaque `RuntimeError: unreachable`.
+#[wasm_bindgen(start)]
+pub fn __start() {
+    console_error_panic_hook::set_once();
+}
+
+/// Format an `f64` as a JSON value: a finite number, or `null` for NaN /
+/// infinity (which are not representable in JSON). This mirrors the behaviour
+/// of `JSON.stringify`, which also serialises `NaN`/`Infinity` to `null`.
+fn json_f64(v: f64) -> String {
+    if v.is_finite() { v.to_string() } else { "null".to_string() }
+}
+
+/// Like [`json_f64`] but for an optional value (`None` -> `null`).
+fn json_opt_f64(v: Option<f64>) -> String {
+    v.map(json_f64).unwrap_or_else(|| "null".to_string())
+}
+
 /// Decode a GeoTIFF from raw bytes and return summary statistics as a JSON string.
 ///
 /// The returned JSON has the shape:
@@ -26,7 +45,7 @@ pub fn geotiff_info(data: &[u8]) -> String {
     match GeoTiff::from_bytes(data) {
         Ok(gt) => {
             let epsg = gt.epsg().map(|e| e.to_string()).unwrap_or_else(|| "null".into());
-            let nodata = gt.no_data().map(|v| v.to_string()).unwrap_or_else(|| "null".into());
+            let nodata = json_opt_f64(gt.no_data());
             format!(
                 "{{\"ok\":true,\"width\":{},\"height\":{},\"bands\":{},\"epsg\":{},\"nodata\":{}}}",
                 gt.width(), gt.height(), gt.band_count(), epsg, nodata
@@ -77,6 +96,7 @@ fn stats_json(data: &[u8]) -> String {
     let mean = sum / count as f64;
     format!(
         "{{\"ok\":true,\"width\":{w},\"height\":{h},\"bands\":{bands},\"epsg\":{epsg},\
-\"valid\":{count},\"min\":{min},\"max\":{max},\"mean\":{mean}}}"
+\"valid\":{count},\"min\":{},\"max\":{},\"mean\":{}}}",
+        json_f64(min), json_f64(max), json_f64(mean)
     )
 }

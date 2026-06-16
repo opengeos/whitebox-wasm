@@ -29,10 +29,15 @@
     out.textContent = `whitebox-wasm v${version()} ready. Choose a file.`;
 
     async function run(bytes) {
-      const u8 = new Uint8Array(bytes);
-      const info = JSON.parse(geotiff_info(u8));
-      const stats = JSON.parse(geotiff_stats(u8));
-      out.textContent = JSON.stringify({ info, stats }, null, 2);
+      try {
+        const u8 = new Uint8Array(bytes);
+        const info = JSON.parse(geotiff_info(u8));
+        const stats = JSON.parse(geotiff_stats(u8));
+        out.textContent = JSON.stringify({ info, stats }, null, 2);
+      } catch (e) {
+        out.textContent = "Error: " + (e && e.message ? e.message : String(e));
+        console.error(e);
+      }
     }
     document.getElementById("file").addEventListener("change", async (e) => {
       const f = e.target.files[0]; if (!f) return;

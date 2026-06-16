@@ -21,18 +21,31 @@ npm install whitebox-wasm
 ## Usage (browser / Deno / Node >= 20, ESM)
 
 ```js
-import init, { geotiff_stats, geotiff_info, version } from "whitebox-wasm";
+import init, { geotiff_info, GeoTiffReader, CogBuilder } from "whitebox-wasm";
 
 await init();                       // in Node, pass the .wasm bytes to init()
 const bytes = new Uint8Array(await (await fetch("dem.tif")).arrayBuffer());
 
-console.log(version());             // "0.1.0"
+// Metadata only - O(header) memory, works on multi-GB rasters:
 console.log(JSON.parse(geotiff_info(bytes)));
-// { ok:true, width:512, height:512, bands:1, epsg:32610, nodata:-9999 }
+// { ok:true, width, height, bands, epsg, nodata, bits_per_sample,
+//   sample_format, compression, tiled, bigtiff }
 
-console.log(JSON.parse(geotiff_stats(bytes)));
-// { ok:true, width:512, height:512, bands:1, epsg:32610,
-//   valid:262144, min:..., max:..., mean:... }
+// Parse once, read many times:
+const tif = new GeoTiffReader(bytes);
+console.log(tif.width, tif.height, tif.bands, tif.epsg, tif.nodata);
+console.log(Array.from(tif.geo_transform()));   // [ox, px, 0, oy, 0, -py]
+console.log(Array.from(tif.bounding_box()));    // [minx, miny, maxx, maxy]
+const band0 = tif.read_band_f64(0);             // Float64Array
+console.log(JSON.parse(tif.stats_json()));
+
+// Encode a Cloud Optimized GeoTIFF (also a valid plain GeoTIFF):
+const cb = new CogBuilder(width, height, 1);
+cb.set_epsg(32610);
+cb.set_origin(500000, 4000000, 30);             // x_min, y_max, pixel size
+cb.set_compression("deflate");
+cb.set_nodata(-9999);
+const cogBytes = cb.write_f64(new Float64Array(pixels));   // Uint8Array
 ```
 
 In Node the `web` target needs the wasm bytes handed to `init()`:
@@ -45,13 +58,46 @@ await init({ module_or_path: readFileSync("node_modules/whitebox-wasm/whitebox_w
 
 ## API
 
-| Function | Returns (JSON string) |
+### Convenience functions
+
+| Function | Returns |
 |---|---|
-| `geotiff_info(bytes)` | `{ok, width, height, bands, epsg, nodata}` |
-| `geotiff_stats(bytes)` | `{ok, width, height, bands, epsg, valid, min, max, mean}` (band 0, skips NaN/nodata) |
+| `geotiff_info(bytes)` | JSON metadata, header-only (works on multi-GB files) |
+| `geotiff_stats(bytes)` | JSON band-0 stats `{valid, min, max, mean, ...}` |
+| `geotiff_read_band_f64(bytes, band)` | `Float64Array` of band pixels |
 | `version()` | crate version string |
 
-On failure, functions return `{"ok":false,"error":"..."}`.
+### `GeoTiffReader` (parse once, read many)
+
+`new GeoTiffReader(bytes)`, then:
+
+- Properties: `width`, `height`, `bands`, `bits_per_sample`, `sample_format`, `compression`, `is_bigtiff`, `epsg`, `nodata`
+- `geo_transform()` -> `[x_origin, pixel_width, row_rot, y_origin, col_rot, pixel_height]` (empty if none)
+- `bounding_box()` -> `[min_x, min_y, max_x, max_y]` (empty if not georeferenced)
+- `value_transform()` -> `[scale, offset]` (GDAL scale/offset; empty if none)
+- `info_json()`, `stats_json()` -> JSON strings
+- `read_band_f64(band)` / `read_all_f64()` -> `Float64Array` (any on-disk type converted)
+- `read_band_bytes(band)` -> raw `Uint8Array`
+- Native typed reads (require matching on-disk type): `read_band_u8` / `i8` / `u16` / `i16` / `u32` / `i32` / `f32`
+
+### `CogBuilder` (write Cloud Optimized GeoTIFFs)
+
+`new CogBuilder(width, height, bands)`, configure, then `write_u8` / `write_f32` / `write_f64(data)` -> `Uint8Array`:
+
+- `set_epsg(code)`, `set_nodata(v)`, `set_compression("none|lzw|deflate|packbits|webp|jpeg|jpegxl")`
+- `set_geo_transform([6 values])` or `set_origin(x_min, y_max, pixel_size)`
+- `set_tile_size(px)`, `set_bigtiff(bool)`, `set_overview_levels([2,4,8])`
+
+Output is a tiled COG with overviews and GDAL ghost metadata - readable by GDAL, rasterio, QGIS, and `GeoTiffReader`.
+
+JSON-returning functions report failures as `{"ok":false,"error":"..."}`; class methods throw on error.
+
+## Limits
+
+WebAssembly is 32-bit, so linear memory is capped at ~4 GiB. `geotiff_info` is
+header-only and unaffected, but reads/writes that materialize a full raster are
+bounded by that ceiling (a national 1-billion-pixel raster cannot be fully
+decoded in-browser). For such data, read metadata only or process server-side.
 
 ## Links
 

@@ -225,6 +225,36 @@ impl CogWriter {
         self.write_cog(&mut f, bytes)
     }
 
+    // ── In-memory COG writers (return the encoded bytes) ───────────────────────
+    // These mirror the path-based writers but serialise to a `Vec<u8>` instead
+    // of a file, which is what browser/WASM hosts need (no filesystem).
+
+    /// Encode `u8` raster data as a Cloud Optimized GeoTIFF, returned as bytes.
+    pub fn write_u8_to_vec(mut self, data: &[u8]) -> Result<Vec<u8>> {
+        self.bits_per_sample = 8; self.sample_format = SampleFormat::Uint;
+        self.encode_to_vec(data.to_vec())
+    }
+
+    /// Encode `f32` raster data as a Cloud Optimized GeoTIFF, returned as bytes.
+    pub fn write_f32_to_vec(mut self, data: &[f32]) -> Result<Vec<u8>> {
+        self.bits_per_sample = 32; self.sample_format = SampleFormat::IeeeFloat;
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.encode_to_vec(bytes)
+    }
+
+    /// Encode `f64` raster data as a Cloud Optimized GeoTIFF, returned as bytes.
+    pub fn write_f64_to_vec(mut self, data: &[f64]) -> Result<Vec<u8>> {
+        self.bits_per_sample = 64; self.sample_format = SampleFormat::IeeeFloat;
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.encode_to_vec(bytes)
+    }
+
+    fn encode_to_vec(&self, pixel_bytes: Vec<u8>) -> Result<Vec<u8>> {
+        let mut cur = std::io::Cursor::new(Vec::new());
+        self.write_cog(&mut cur, pixel_bytes)?;
+        Ok(cur.into_inner())
+    }
+
     // ── Core COG writer ───────────────────────────────────────────────────────
 
     fn write_cog<W: Write + Seek>(&self, w: &mut W, pixel_bytes: Vec<u8>) -> Result<()> {

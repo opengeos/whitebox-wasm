@@ -28,31 +28,74 @@ npm install whitebox-wasm
 ## Usage (browser / Deno / Node ≥ 20, ESM)
 
 ```js
-import init, { geotiff_stats, geotiff_info, version } from "whitebox-wasm";
+import init, { geotiff_info, GeoTiffReader, CogBuilder } from "whitebox-wasm";
 
 await init();                       // in Node, pass the .wasm bytes to init()
-const bytes = new Uint8Array(await (await fetch("dem.tif")).arrayBuffer());
 
-console.log(version());             // "0.1.0"
-console.log(JSON.parse(geotiff_info(bytes)));
-// { ok:true, width:512, height:512, bands:1, epsg:32610, nodata:-9999 }
+// Read a GeoTIFF/COG straight from a URL (the fetch happens in JS; the
+// sandboxed wasm has no network of its own):
+const bytes = new Uint8Array(
+  await (await fetch("https://example.com/dem.tif")).arrayBuffer());
 
-console.log(JSON.parse(geotiff_stats(bytes)));
-// { ok:true, width:512, height:512, bands:1, epsg:32610,
-//   valid:262144, min:..., max:..., mean:... }
+console.log(JSON.parse(geotiff_info(bytes)));   // header-only, O(header) memory
+
+const tif = new GeoTiffReader(bytes);           // parse once, read many
+console.log(tif.width, tif.height, tif.epsg, tif.nodata);
+console.log(Array.from(tif.bounding_box()));
+const band0 = tif.read_band_f64(0);             // Float64Array
+console.log(JSON.parse(tif.stats_json()));
+
+// Write a Cloud Optimized GeoTIFF (valid plain GeoTIFF too):
+const cb = new CogBuilder(width, height, 1);
+cb.set_epsg(32610); cb.set_origin(500000, 4000000, 30); cb.set_compression("deflate");
+const cogBytes = cb.write_f64(new Float64Array(pixels));   // Uint8Array
 ```
 
-A runnable Node example lives in [`examples/node-demo.mjs`](examples/node-demo.mjs).
+Runnable Node examples: [`examples/node-demo.mjs`](examples/node-demo.mjs) and
+[`examples/read-from-url.mjs`](examples/read-from-url.mjs).
 
 ## API
 
-| Function | Returns (JSON string) |
-|---|---|
-| `geotiff_info(bytes)` | `{ok, width, height, bands, epsg, nodata}` |
-| `geotiff_stats(bytes)` | `{ok, width, height, bands, epsg, valid, min, max, mean}` (band 0, skips NaN/nodata) |
-| `version()` | crate version string |
+**Convenience:** `geotiff_info(bytes)` (header-only JSON, works on multi-GB files),
+`geotiff_stats(bytes)` (band-0 stats JSON), `geotiff_read_band_f64(bytes, band)`
+(`Float64Array`), `version()`.
 
-On failure functions return `{"ok":false,"error":"..."}`.
+**`GeoTiffReader(bytes)`** - parse once, then: `width`/`height`/`bands`/`epsg`/
+`nodata`/`sample_format`/`compression`/`bits_per_sample`/`is_bigtiff`;
+`geo_transform()`, `bounding_box()`, `value_transform()`; `info_json()`,
+`stats_json()`; `read_band_f64(band)`, `read_all_f64()`, `read_band_bytes(band)`,
+and native typed reads `read_band_u8|i8|u16|i16|u32|i32|f32`.
+
+**`CogBuilder(width, height, bands)`** - `set_epsg`, `set_nodata`,
+`set_compression`, `set_geo_transform`/`set_origin`, `set_tile_size`,
+`set_bigtiff`, `set_overview_levels`, then `write_u8|write_f32|write_f64(data)`
+-> `Uint8Array` (tiled COG with overviews and GDAL ghost metadata).
+
+JSON functions report errors as `{"ok":false,"error":"..."}`; class methods throw.
+
+### Reading from an HTTP URL
+
+The wasm module is sandboxed and does no network I/O itself (it imports nothing
+from the host). HTTP happens in JavaScript, which hands the bytes to wasm:
+
+```js
+const res = await fetch(url);                       // browser, Deno, Node >= 18
+const bytes = new Uint8Array(await res.arrayBuffer());
+const tif = new GeoTiffReader(bytes);
+```
+
+This downloads the whole file. True COG range-request streaming (fetch only the
+header + the overview/tiles you need) is a planned enhancement; see Limits.
+
+## Limits
+
+WebAssembly is 32-bit, so linear memory is capped at ~4 GiB. `geotiff_info` is
+header-only and works on multi-gigabyte rasters, but any operation that
+materializes a full raster (whole-band reads/writes, stats) is bounded by that
+ceiling. A national 1-billion-pixel raster cannot be fully decoded in-browser;
+read metadata only, or process server-side. Range-request COG streaming (read
+just the header + needed tiles, never the whole file) would lift this for remote
+COGs and is on the roadmap.
 
 ## Build from source
 

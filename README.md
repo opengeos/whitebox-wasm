@@ -70,6 +70,15 @@ Push a tag `vX.Y.Z`. CI then:
 
 Pushes to `main` redeploy the [live demo](https://opengeos.github.io/whitebox-wasm/) to GitHub Pages.
 
+## Credits
+
+The GeoTIFF engine comes from the original
+[**whitebox_next_gen**](https://github.com/jblindsay/whitebox_next_gen) project
+by John Lindsay (Whitebox Geospatial Inc.), the next-generation, pure-Rust
+rewrite of WhiteboxTools. This repository vendors its `wbgeotiff` crate and adds
+a thin WebAssembly binding. All credit for the underlying codec belongs to that
+project.
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your

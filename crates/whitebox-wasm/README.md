@@ -4,8 +4,10 @@
 native libraries, no server. Decode GeoTIFF / BigTIFF / COG entirely in the
 browser, Node, Deno, or any Wasm host.
 
-This wraps `wbgeotiff`, the shared GeoTIFF engine from the next-generation,
-pure-Rust WhiteboxTools, and exposes a tiny WebAssembly API. The entire codec
+This wraps `wbgeotiff`, the shared GeoTIFF engine from the original
+[**whitebox_next_gen**](https://github.com/jblindsay/whitebox_next_gen) project
+by John Lindsay (Whitebox Geospatial Inc.) - the next-generation, pure-Rust
+rewrite of WhiteboxTools - and exposes a tiny WebAssembly API. The entire codec
 stack (Deflate, LZW, PackBits, JPEG, WebP, JPEG-XL, PNG predictors, BigTIFF,
 tiling) is pure Rust with zero C dependencies, so the published module imports
 nothing from the host beyond its own linear memory.

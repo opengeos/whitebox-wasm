@@ -9,20 +9,20 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
           registry-url: 'https://registry.npmjs.org'
 
       # Trusted Publishing (OIDC) requires npm >= 11.5.1; the version bundled
-      # with Node 20 is older, so upgrade the CLI before publishing.
+      # bundled with the runner Node is older, so upgrade the CLI before publishing.
       - name: Upgrade npm for Trusted Publishing
         run: npm install -g npm@latest
 
@@ -50,7 +50,7 @@ jobs:
           (cd dist && sha256sum * > SHA256SUMS.txt)
 
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true

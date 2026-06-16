@@ -146,40 +146,41 @@ WASM (for `wbspatialstats`, which uses `rand`):
 getrandom = { version = "0.2", features = ["js"] }
 ```
 
-### `wbtools_oss` (the tools/algorithms crate)
+### `wbtools_oss` tools on real files (WASI)
 
-`wbtools_oss` does **not** compile to `wasm32-unknown-unknown` as-is, and is not
-yet included. The crate's own code is WASM-clean (it builds once the issues
-below are resolved) - every blocker is a *dependency packaging* problem:
+The full `wbtools_oss` algorithm suite (**733 tools** - slope, filters,
+hydrology, geomorphometry, ...) reads and writes rasters by **file path**, so it
+cannot run in the browser (no filesystem). It *can* run under
+[**WASI**](https://wasi.dev) (`wasm32-wasip1`), which provides a real filesystem,
+and the tools then work with regular files unchanged. This repo ships a WASI CLI
+(`crates/whitebox-cli`) for exactly that:
 
-1. **`getrandom`** - two versions are pulled in (`0.2` via `rand`, `0.4` via
-   `ring`). Enable `0.2`'s `js` feature and `0.4`'s `wasm_js` feature, and build
-   with `RUSTFLAGS='--cfg getrandom_backend="wasm_js"'`.
+```bash
+rustup target add wasm32-wasip1
+cargo build -p whitebox-cli --target wasm32-wasip1 --release
 
-2. **`ureq` -> `rustls` -> `ring`** (TLS/networking) - `ring` needs OS entropy
-   and `rustls` needs a wall clock, neither of which exists in the WASM sandbox
-   (`SystemRandom: SecureRandom` unsatisfied; `UnixTime::now` missing). `ureq` is
-   used by exactly one tool (`DownloadOsmVectorTool`). **Fix:** make `ureq`
-   optional and put it + that tool behind a `network` feature (off by default),
-   so the crate builds without it. Networking would then be done in JS, the same
-   way `CogStream` fetches remote COG tiles.
+# list all tools
+wasmtime run target/wasm32-wasip1/release/whitebox.wasm list
 
-3. **`kdtree 0.8.0` ships `criterion` as a normal dependency** (a packaging bug -
-   it belongs in `dev-dependencies`), and `criterion` has a `compile_error!` for
-   `wasm + rayon`. **Fix:** patch/replace `kdtree`, or get the upstream crate to
-   move `criterion` to `dev-dependencies`.
+# run a tool on regular files (map a host dir into the sandbox with --dir)
+wasmtime run --dir ./data::/work \
+  target/wasm32-wasip1/release/whitebox.wasm \
+  slope --input=/work/dem.tif --output=/work/slope.tif --units=degrees
+```
 
-With all three applied, `wbtools_oss` reaches a clean `Finished` build (verified
-locally). Fixes 2 and 3 are best made **upstream** in
-[`whitebox_next_gen`](https://github.com/jblindsay/whitebox_next_gen) and the
-`kdtree` crate.
+The only change needed to compile `wbtools_oss` to WASI is patching the
+`kdtree 0.8.0` dependency, which ships `criterion` as a *normal* dependency (a
+packaging bug - it belongs in `dev-dependencies`) and `criterion` has a
+`compile_error!` for `wasm + rayon`. The vendored `crates/kdtree-wasm` drops that
+dependency and the workspace `[patch.crates-io]` applies it. (`getrandom` and
+`ureq`/`rustls` - blockers on the browser `wasm32-unknown-unknown` target - are
+*not* blockers on WASI, which provides randomness and a clock natively.) This fix
+is best made **upstream** in the `kdtree` crate and
+[`whitebox_next_gen`](https://github.com/jblindsay/whitebox_next_gen).
 
-**Caveat - compiling is not the same as running in a browser.** Most
-`wbtools_oss` tools read and write rasters by **file path** (`std::fs`), which
-links on WASM but fails at runtime (no filesystem). Using them in the browser
-needs byte-based entry points (as added here for the vector/LiDAR readers), plus
-the usual notes that `rayon`/`std::thread` run single-threaded and
-`chrono`/`SystemTime::now` need WASM-aware features.
+These crates (`wbcore`, `wbraster`, `wbtools_oss`, `whitebox-cli`, `kdtree-wasm`)
+are a **separate WASI artifact** and are not part of the browser npm package -
+the npm `.wasm` does not include them.
 
 ## Releasing
 

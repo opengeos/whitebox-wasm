@@ -1,0 +1,34 @@
+[package]
+name = "wbtools_oss"
+version = "0.1.2"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+wbcore = { path = "../wbcore" }
+serde.workspace = true
+serde_json.workspace = true
+wbraster = { path = "../wbraster" }
+wbgeotiff = { path = "../wbgeotiff" }
+wbvector = { path = "../wbvector" }
+wbprojection = { path = "../wbprojection" }
+wbtopology = { path = "../wbtopology", features = ["parallel"] }
+wblidar = { path = "../wblidar", features = ["parallel"] }
+wbspatialstats = { path = "../wbspatialstats" }
+rayon = "1"
+rand = "0.10.0"
+wide = "1.2.0"
+chrono = { version = "0.4", default-features = true }
+image = "0.25"
+kdtree = "0.8.0"
+evalexpr = "13.1.0"
+nalgebra = "0.34.1"
+smartcore = { version = "0.4.9", features = ["serde"] }
+bincode = { version = "2", features = ["serde"] }
+rustfft = "6.2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+ureq = { version = "2.12.1", features = ["json"] }
+

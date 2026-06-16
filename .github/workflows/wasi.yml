@@ -1,0 +1,24 @@
+name: WASI CLI
+on:
+  push:
+    branches: [main]
+    paths: ['crates/wbtools_oss/**', 'crates/wbraster/**', 'crates/wbcore/**', 'crates/whitebox-cli/**', 'crates/kdtree-wasm/**', '.github/workflows/wasi.yml']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the WASI tool runner
+        run: cargo build -p whitebox-cli --target wasm32-wasip1 --release
+      - name: Install wasmtime
+        run: curl https://wasmtime.dev/install.sh -sSf | bash
+      - name: Smoke test (list tools)
+        run: ~/.wasmtime/bin/wasmtime run target/wasm32-wasip1/release/whitebox.wasm list | head -1

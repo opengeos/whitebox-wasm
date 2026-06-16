@@ -1,6 +1,33 @@
 [workspace]
-members = ["crates/wbgeotiff", "crates/wbprojection", "crates/wbhdf", "crates/wbvector", "crates/wblidar", "crates/wbtopology", "crates/wbspatialstats", "crates/whitebox-wasm"]
+members = [
+  "crates/wbgeotiff",
+  "crates/wbprojection",
+  "crates/wbhdf",
+  "crates/wbvector",
+  "crates/wblidar",
+  "crates/wbtopology",
+  "crates/wbspatialstats",
+  "crates/whitebox-wasm",
+  # WASI tool runner (separate artifact; not part of the browser npm package)
+  "crates/wbcore",
+  "crates/wbraster",
+  "crates/wbtools_oss",
+  "crates/whitebox-cli",
+]
 resolver = "2"
+
+# Shared dependency versions inherited via `serde.workspace = true` etc.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+
+# kdtree 0.8.0 ships `criterion` as a normal dependency (a packaging bug), and
+# criterion has a `compile_error!` for wasm+rayon. This vendored copy drops the
+# criterion dependency so wbtools_oss compiles to WebAssembly.
+[patch.crates-io]
+kdtree = { path = "crates/kdtree-wasm" }
 
 [profile.release]
 opt-level = "z"

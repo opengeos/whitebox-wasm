@@ -1,0 +1,15 @@
+[package]
+name = "whitebox-cli"
+version = "0.1.0"
+edition = "2021"
+description = "WASI command-line runner for whitebox_next_gen tools on regular files"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "whitebox"
+path = "src/main.rs"
+
+[dependencies]
+wbtools_oss = { path = "../wbtools_oss" }
+wbcore = { path = "../wbcore" }
+serde_json = "1"

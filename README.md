@@ -178,6 +178,8 @@ dependency and the workspace `[patch.crates-io]` applies it. (`getrandom` and
 is best made **upstream** in the `kdtree` crate and
 [`whitebox_next_gen`](https://github.com/jblindsay/whitebox_next_gen).
 
+See [MAINTAINING.md](MAINTAINING.md) for the full WASM fix set and how to re-sync vendored crates from upstream.
+
 These crates (`wbcore`, `wbraster`, `wbtools_oss`, `whitebox-cli`, `kdtree-wasm`)
 are a **separate WASI artifact** and are not part of the browser npm package -
 the npm `.wasm` does not include them.

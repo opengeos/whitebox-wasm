@@ -133,6 +133,54 @@ cargo install wasm-pack
 wasm-pack build crates/whitebox-wasm --release --target web --out-dir pkg
 ```
 
+## Compiling other Whitebox crates to WASM
+
+The crates vendored here all compile cleanly to `wasm32-unknown-unknown`:
+`wbgeotiff`, `wbprojection`, `wbhdf`, `wbvector`, `wblidar`, `wbtopology`, and
+`wbspatialstats`. The only change any of them needed was enabling the
+[`getrandom`](https://docs.rs/getrandom/#webassembly-support) `js` feature on
+WASM (for `wbspatialstats`, which uses `rand`):
+
+```toml
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+```
+
+### `wbtools_oss` (the tools/algorithms crate)
+
+`wbtools_oss` does **not** compile to `wasm32-unknown-unknown` as-is, and is not
+yet included. The crate's own code is WASM-clean (it builds once the issues
+below are resolved) - every blocker is a *dependency packaging* problem:
+
+1. **`getrandom`** - two versions are pulled in (`0.2` via `rand`, `0.4` via
+   `ring`). Enable `0.2`'s `js` feature and `0.4`'s `wasm_js` feature, and build
+   with `RUSTFLAGS='--cfg getrandom_backend="wasm_js"'`.
+
+2. **`ureq` -> `rustls` -> `ring`** (TLS/networking) - `ring` needs OS entropy
+   and `rustls` needs a wall clock, neither of which exists in the WASM sandbox
+   (`SystemRandom: SecureRandom` unsatisfied; `UnixTime::now` missing). `ureq` is
+   used by exactly one tool (`DownloadOsmVectorTool`). **Fix:** make `ureq`
+   optional and put it + that tool behind a `network` feature (off by default),
+   so the crate builds without it. Networking would then be done in JS, the same
+   way `CogStream` fetches remote COG tiles.
+
+3. **`kdtree 0.8.0` ships `criterion` as a normal dependency** (a packaging bug -
+   it belongs in `dev-dependencies`), and `criterion` has a `compile_error!` for
+   `wasm + rayon`. **Fix:** patch/replace `kdtree`, or get the upstream crate to
+   move `criterion` to `dev-dependencies`.
+
+With all three applied, `wbtools_oss` reaches a clean `Finished` build (verified
+locally). Fixes 2 and 3 are best made **upstream** in
+[`whitebox_next_gen`](https://github.com/jblindsay/whitebox_next_gen) and the
+`kdtree` crate.
+
+**Caveat - compiling is not the same as running in a browser.** Most
+`wbtools_oss` tools read and write rasters by **file path** (`std::fs`), which
+links on WASM but fails at runtime (no filesystem). Using them in the browser
+needs byte-based entry points (as added here for the vector/LiDAR readers), plus
+the usual notes that `rayon`/`std::thread` run single-threaded and
+`chrono`/`SystemTime::now` need WASM-aware features.
+
 ## Releasing
 
 Push a tag `vX.Y.Z`. CI then:

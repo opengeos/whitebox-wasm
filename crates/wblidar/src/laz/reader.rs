@@ -466,6 +466,11 @@ impl<R: Read + Seek> LazReader<R> {
         self.las.crs()
     }
 
+    /// The LAS header embedded in this LAZ stream (point count, bounds, scales).
+    pub fn header(&self) -> &crate::las::header::LasHeader {
+        self.las.header()
+    }
+
     /// Return aggregate Point14 partial-recovery counters for this reader.
     ///
     /// Tuple fields are `(events, decoded_points, expected_points)`.

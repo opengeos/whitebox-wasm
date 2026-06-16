@@ -1,8 +1,14 @@
 # whitebox-wasm
 
-**Pure-Rust GeoTIFF decoding compiled to WebAssembly.** No GDAL, no PROJ, no
-native libraries, no server. Decode GeoTIFF / BigTIFF / COG entirely in the
-browser, Node, Deno, or any Wasm host.
+**Pure-Rust geospatial toolkit compiled to WebAssembly.** No GDAL, no PROJ, no
+native libraries, no server. Work with raster, vector, and LiDAR data entirely
+in the browser, Node, Deno, or any Wasm host:
+
+- **Raster** - read/write GeoTIFF / BigTIFF / COG, stats, range-request streaming
+- **Projections** - full EPSG + user-defined CRS to WGS84 lon/lat
+- **Vector** - read GeoJSON, TopoJSON, GML, GPX, KML, FlatGeobuf, GeoPackage, KMZ -> GeoJSON, with reprojection
+- **LiDAR** - read LAS / LAZ / PLY point clouds (xyz, classification, intensity)
+- **Analysis** - convex hull, Moran's I spatial autocorrelation
 
 This wraps `wbgeotiff`, the shared GeoTIFF engine from the original
 [**whitebox_next_gen**](https://github.com/jblindsay/whitebox_next_gen) project
@@ -132,6 +138,40 @@ window). Requires a tiled COG on a server that supports HTTP range requests.
 
 JSON-returning functions report failures as `{"ok":false,"error":"..."}`; class methods throw on error.
 
+## Vector
+
+```js
+import init, { vector_to_geojson, vector_info, vector_to_geojson_reproject } from "whitebox-wasm";
+await init();
+const bytes = new Uint8Array(await (await fetch("data.fgb")).arrayBuffer());
+const geojson = JSON.parse(vector_to_geojson(bytes, "flatgeobuf"));
+const meta = JSON.parse(vector_info(bytes, "flatgeobuf")); // { features, geometry, epsg, fields, bbox }
+const wgs84 = vector_to_geojson_reproject(bytes, "flatgeobuf", 4326, 0); // dst, src(0=auto)
+```
+
+- `vector_formats()` -> supported formats (geojson, topojson, gml, gpx, kml, flatgeobuf, geopackage, kmz)
+- `vector_to_geojson(data, format)` -> GeoJSON string
+- `vector_to_geojson_reproject(data, format, dst_epsg, src_epsg)` -> reprojected GeoJSON (`src_epsg=0` uses the layer CRS, or 4326)
+- `vector_info(data, format)` -> JSON `{name, features, geometry, epsg, fields, bbox}`
+
+## LiDAR
+
+```js
+import init, { lidar_info, lidar_read_xyz } from "whitebox-wasm";
+await init();
+const las = new Uint8Array(await (await fetch("cloud.laz")).arrayBuffer());
+const meta = JSON.parse(lidar_info(las, "laz")); // { points, epsg, point_format, bounds }
+const xyz = lidar_read_xyz(las, "laz");          // Float64Array [x0,y0,z0, x1,y1,z1, ...]
+```
+
+- `lidar_formats()`, `lidar_info(data, format)` (header-only count/bounds for LAS/LAZ)
+- `lidar_read_xyz` -> `Float64Array`; `lidar_read_classification` -> `Uint8Array`; `lidar_read_intensity` -> `Uint16Array`
+
+## Analysis
+
+- `convex_hull(points_xy)` -> hull ring `Float64Array` (input `[x0,y0,x1,y1,...]`)
+- `morans_i(points_xy, values, distance_threshold)` -> JSON global spatial autocorrelation `{morans_i, expected, variance, z_score, p_value, n}`
+
 ## Limits
 
 WebAssembly is 32-bit, so linear memory is capped at ~4 GiB. `geotiff_info` is
@@ -147,5 +187,5 @@ decoded in-browser). For such data, read metadata only or process server-side.
 ## License
 
 Dual-licensed under MIT or Apache-2.0, at your option. Includes the vendored
-`wbgeotiff` and `wbprojection` crates (Copyright John Lindsay, Whitebox
+`wbgeotiff`, `wbprojection`, `wbvector`, `wblidar`, `wbtopology`, `wbspatialstats`, and `wbhdf` crates (Copyright John Lindsay, Whitebox
 Geospatial Inc.), used under the same dual license.

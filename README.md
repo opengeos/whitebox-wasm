@@ -4,13 +4,19 @@
 [![npm](https://img.shields.io/npm/v/whitebox-wasm.svg)](https://www.npmjs.com/package/whitebox-wasm)
 [![Live demo](https://img.shields.io/badge/demo-GitHub%20Pages-blue)](https://opengeos.github.io/whitebox-wasm/)
 
-**Pure-Rust GeoTIFF decoding compiled to WebAssembly.** No GDAL, no PROJ, no
-native libraries, no server. Decode GeoTIFF / BigTIFF / COG entirely in the
-browser, Node, Deno, or any Wasm host.
+**Pure-Rust geospatial toolkit compiled to WebAssembly.** No GDAL, no PROJ, no
+native libraries, no server. Work with raster, vector, and LiDAR data entirely
+in the browser, Node, Deno, or any Wasm host:
 
-This wraps [`wbgeotiff`](https://github.com/jblindsay/whitebox_next_gen) - the
-shared GeoTIFF engine from the next-generation, pure-Rust WhiteboxTools - and
-exposes a tiny WebAssembly API.
+- **Raster** - GeoTIFF / BigTIFF / COG read + write, stats, HTTP range-request streaming
+- **Projections** - full EPSG and user-defined CRS to WGS84 lon/lat
+- **Vector** - GeoJSON / TopoJSON / GML / GPX / KML / FlatGeobuf / GeoPackage / KMZ -> GeoJSON, with reprojection
+- **LiDAR** - LAS / LAZ / PLY point clouds (xyz, classification, intensity)
+- **Analysis** - convex hull, Moran's I spatial autocorrelation
+
+This vendors the pure-Rust geospatial crates from
+[**whitebox_next_gen**](https://github.com/jblindsay/whitebox_next_gen) (the
+next-generation WhiteboxTools) and exposes them through a WebAssembly API.
 
 ## Why this works
 

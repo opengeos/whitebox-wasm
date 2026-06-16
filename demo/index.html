@@ -32,12 +32,21 @@
     await init({ module_or_path: `./whitebox_wasm_bg.wasm?v=${V}` });
     out.textContent = `whitebox-wasm v${version()} ready. Choose a file.`;
 
+    // Whole-raster stats are bounded by WASM's ~4 GiB address space; skip them
+    // for gigapixel rasters and show metadata only.
+    const STATS_CELL_LIMIT = 150_000_000;
     async function run(bytes) {
       try {
         const u8 = new Uint8Array(bytes);
         const info = JSON.parse(geotiff_info(u8));
-        const stats = JSON.parse(geotiff_stats(u8));
-        out.textContent = JSON.stringify({ info, stats }, null, 2);
+        const cells = (info.width || 0) * (info.height || 0) * (info.bands || 1);
+        const result = { info };
+        if (info.ok && cells > 0 && cells <= STATS_CELL_LIMIT) {
+          result.stats = JSON.parse(geotiff_stats(u8));
+        } else if (info.ok) {
+          result.stats = `skipped: ${cells.toLocaleString()} cells too large for in-browser stats`;
+        }
+        out.textContent = JSON.stringify(result, null, 2);
       } catch (e) {
         out.textContent = "Error: " + (e && e.message ? e.message : String(e));
         console.error(e);

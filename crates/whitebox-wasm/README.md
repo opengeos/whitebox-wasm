@@ -90,6 +90,43 @@ await init({ module_or_path: readFileSync("node_modules/whitebox-wasm/whitebox_w
 
 Output is a tiled COG with overviews and GDAL ghost metadata - readable by GDAL, rasterio, QGIS, and `GeoTiffReader`.
 
+### `CogStream` (read remote COGs via HTTP range requests)
+
+Read a window or overview out of a large COG **without downloading the whole
+file**. The wasm parses the header and reports byte ranges; your JS does the
+range requests:
+
+```js
+import init, { CogStream } from "whitebox-wasm";
+await init();
+
+const url = "https://example.com/big-cog.tif";
+const range = (a, b) => fetch(url, { headers: { Range: `bytes=${a}-${b}` } })
+  .then(r => r.arrayBuffer()).then(b => new Uint8Array(b));
+
+const stream = new CogStream(await range(0, 65535));   // header prefix
+const lv = JSON.parse(stream.levels_json())[0];        // level 0 = full res
+const tiles = JSON.parse(stream.tiles_for_window(0, 1200, 800, 256, 256));
+
+for (const t of tiles) {
+  const bytes = await range(t.offset, t.offset + t.length - 1);  // one tile
+  const px = stream.decode_tile_f64(0, bytes);                   // Float64Array
+  // place px (tile_width x tile_height) into your output window...
+}
+```
+
+- `new CogStream(headerBytes)` - parse the IFD chain + tile index (throws if the
+  prefix is too short; fetch more and retry).
+- `num_levels`, `epsg`, `nodata`, `geo_transform()`, `levels_json()`
+- `tiles_for_window(level, x, y, w, h)` -> JSON `[{col,row,offset,length}]`
+- `tile_range(level, col, row)` -> `[offset, length]`
+- `decode_tile_f64(level, tileBytes)` -> `Float64Array` (one decoded tile)
+
+Use a higher `level` (overview) for zoomed-out views. See
+[`examples/cog-stream.mjs`](../../examples/cog-stream.mjs) for a full window read
+that fetches only the tiles it needs (about 13% of a 5.7 MiB file for a 256x256
+window). Requires a tiled COG on a server that supports HTTP range requests.
+
 JSON-returning functions report failures as `{"ok":false,"error":"..."}`; class methods throw on error.
 
 ## Limits

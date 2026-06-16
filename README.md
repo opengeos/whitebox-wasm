@@ -84,18 +84,38 @@ const bytes = new Uint8Array(await res.arrayBuffer());
 const tif = new GeoTiffReader(bytes);
 ```
 
-This downloads the whole file. True COG range-request streaming (fetch only the
-header + the overview/tiles you need) is a planned enhancement; see Limits.
+That downloads the whole file. To read a window or overview out of a large
+remote COG **without downloading all of it**, use `CogStream` with HTTP range
+requests - the wasm reports byte ranges, your JS fetches them:
+
+```js
+import init, { CogStream } from "whitebox-wasm";
+await init();
+const range = (a, b) => fetch(url, { headers: { Range: `bytes=${a}-${b}` } })
+  .then(r => r.arrayBuffer()).then(b => new Uint8Array(b));
+
+const stream = new CogStream(await range(0, 65535));         // header only
+const tiles = JSON.parse(stream.tiles_for_window(0, 1200, 800, 256, 256));
+for (const t of tiles) {
+  const px = stream.decode_tile_f64(0, await range(t.offset, t.offset + t.length - 1));
+  // ... place the decoded tile into your window
+}
+```
+
+See [`examples/cog-stream.mjs`](examples/cog-stream.mjs) - a 256x256 window read
+that fetches ~13% of a 5.7 MiB file. `CogStream` API: `num_levels`, `epsg`,
+`nodata`, `geo_transform()`, `levels_json()`, `tiles_for_window(level,x,y,w,h)`,
+`tile_range(level,col,row)`, `decode_tile_f64(level, bytes)`.
 
 ## Limits
 
 WebAssembly is 32-bit, so linear memory is capped at ~4 GiB. `geotiff_info` is
-header-only and works on multi-gigabyte rasters, but any operation that
-materializes a full raster (whole-band reads/writes, stats) is bounded by that
-ceiling. A national 1-billion-pixel raster cannot be fully decoded in-browser;
-read metadata only, or process server-side. Range-request COG streaming (read
-just the header + needed tiles, never the whole file) would lift this for remote
-COGs and is on the roadmap.
+header-only and works on multi-gigabyte rasters, and `CogStream` reads remote
+COGs tile-by-tile within that budget. But operations that materialize a *full*
+raster (whole-band reads/writes, `geotiff_stats`) are bounded by the ceiling and
+return a clean error (never a crash) when a raster is too large - a national
+billion-pixel raster cannot be fully decoded in one piece in-browser. Read
+metadata, stream a window/overview, or process server-side instead.
 
 ## Build from source
 

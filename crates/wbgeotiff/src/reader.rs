@@ -754,6 +754,131 @@ impl GeoTiff {
     }
 }
 
+// ── COG range-request streaming layout ────────────────────────────────────────
+
+/// One resolution level (IFD) of a tiled GeoTIFF / COG: its dimensions, tile
+/// grid, and the byte range of every tile within the file. Enough to issue HTTP
+/// range requests for individual tiles without downloading the whole file.
+#[derive(Debug, Clone)]
+pub struct CogLevel {
+    /// Level image width in pixels.
+    pub width: u32,
+    /// Level image height in pixels.
+    pub height: u32,
+    /// Tile width in pixels.
+    pub tile_width: u32,
+    /// Tile height in pixels.
+    pub tile_height: u32,
+    /// Number of tile columns.
+    pub tiles_x: u32,
+    /// Number of tile rows.
+    pub tiles_y: u32,
+    /// Byte offset of each tile (row-major: `row * tiles_x + col`).
+    pub tile_offsets: Vec<u64>,
+    /// Compressed byte length of each tile.
+    pub tile_byte_counts: Vec<u64>,
+    /// Samples per pixel (bands).
+    pub samples_per_pixel: u16,
+    /// Bits per sample.
+    pub bits_per_sample: u16,
+    /// Sample format.
+    pub sample_format: SampleFormat,
+    /// Compression codec.
+    pub compression: Compression,
+}
+
+impl CogLevel {
+    /// Flat tile index for a `(col, row)`, or `None` if out of range.
+    pub fn tile_index(&self, col: u32, row: u32) -> Option<usize> {
+        if col >= self.tiles_x || row >= self.tiles_y { return None; }
+        Some((row as usize) * (self.tiles_x as usize) + col as usize)
+    }
+
+    /// `(byte_offset, byte_length)` of the tile at `(col, row)`.
+    pub fn tile_range(&self, col: u32, row: u32) -> Option<(u64, u64)> {
+        let i = self.tile_index(col, row)?;
+        Some((self.tile_offsets[i], self.tile_byte_counts[i]))
+    }
+
+    /// Decode one tile's compressed bytes into `f64` samples, pixel-interleaved,
+    /// length `tile_width * tile_height * samples_per_pixel`. Edge tiles are
+    /// returned at full tile size; the caller clips to the image/window.
+    pub fn decode_tile_f64(&self, tile_bytes: &[u8]) -> Result<Vec<f64>> {
+        let bps = (self.bits_per_sample as usize + 7) / 8;
+        let spp = self.samples_per_pixel as usize;
+        let raw = self.tile_width as usize * self.tile_height as usize * spp * bps;
+        let decompressed = compression::decompress(self.compression, tile_bytes, raw)?;
+        let mut out = Vec::with_capacity(raw / bps.max(1));
+        for chunk in decompressed.chunks_exact(bps.max(1)) {
+            out.push(sample_to_f64(chunk, self.sample_format).unwrap_or(f64::NAN));
+        }
+        Ok(out)
+    }
+}
+
+/// Multi-resolution tile layout of a COG, parsed from front-of-file bytes only.
+#[derive(Debug, Clone)]
+pub struct CogLayout {
+    /// Resolution levels: index 0 is full resolution, the rest are overviews.
+    pub levels: Vec<CogLevel>,
+    /// EPSG code of level 0, if any.
+    pub epsg: Option<u16>,
+    /// No-data sentinel, if declared.
+    pub no_data: Option<f64>,
+    /// Affine geo-transform of level 0, if present.
+    pub geo_transform: Option<GeoTransform>,
+}
+
+impl GeoTiff {
+    /// Parse the IFD chain and tile layout of a tiled GeoTIFF / COG from the
+    /// front-of-file bytes, without the pixel data.
+    ///
+    /// Returns an error if `header_bytes` is too short to contain the IFDs and
+    /// their tile-offset arrays (fetch more bytes and retry), or if any level is
+    /// striped rather than tiled (tile-by-tile range streaming needs a tiled COG).
+    pub fn parse_cog_layout(header_bytes: &[u8]) -> Result<CogLayout> {
+        let mut tiff = TiffReader::new(std::io::Cursor::new(header_bytes))?;
+        let ifds = tiff.read_all_ifds()?;
+        if ifds.is_empty() {
+            return Err(GeoTiffError::CorruptData {
+                location: "ifd".into(), message: "no IFDs in header".into(),
+            });
+        }
+        let mut levels = Vec::with_capacity(ifds.len());
+        let mut no_data = None;
+        for (i, ifd) in ifds.iter().enumerate() {
+            let info = Self::parse_image_info(ifd)?;
+            if i == 0 { no_data = info.no_data; }
+            match &info.layout {
+                ImageLayout::Tiled { tile_width, tile_height, offsets, byte_counts } => {
+                    let tiles_x = (info.width + tile_width - 1) / tile_width;
+                    let tiles_y = (info.height + tile_height - 1) / tile_height;
+                    levels.push(CogLevel {
+                        width: info.width, height: info.height,
+                        tile_width: *tile_width, tile_height: *tile_height,
+                        tiles_x, tiles_y,
+                        tile_offsets: offsets.clone(),
+                        tile_byte_counts: byte_counts.clone(),
+                        samples_per_pixel: info.samples_per_pixel,
+                        bits_per_sample: info.bits_per_sample,
+                        sample_format: info.sample_format,
+                        compression: info.compression,
+                    });
+                }
+                ImageLayout::Stripped { .. } => {
+                    return Err(GeoTiffError::CorruptData {
+                        location: "layout".into(),
+                        message: "image is striped, not tiled; tile range streaming requires a tiled COG".into(),
+                    });
+                }
+            }
+        }
+        let epsg = Self::parse_geo_keys(&ifds[0])?.and_then(|gk| gk.epsg());
+        let geo_transform = Self::parse_geo_transform(&ifds[0]);
+        Ok(CogLayout { levels, epsg, no_data, geo_transform })
+    }
+}
+
 // ── Helper: sample byte → f64 ─────────────────────────────────────────────────
 
 fn sample_to_f64(bytes: &[u8], fmt: SampleFormat) -> Option<f64> {

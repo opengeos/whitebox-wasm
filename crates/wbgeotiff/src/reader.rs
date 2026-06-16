@@ -62,6 +62,32 @@ impl ImageInfo {
 
 // ── GeoTiff ───────────────────────────────────────────────────────────────────
 
+/// Lightweight header metadata produced by [`GeoTiff::peek_meta`] without
+/// loading any pixel data.
+#[derive(Debug, Clone)]
+pub struct GeoTiffMeta {
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels.
+    pub height: u32,
+    /// Samples per pixel (band count).
+    pub bands: u16,
+    /// EPSG code, if the GeoTIFF keys identify one.
+    pub epsg: Option<u16>,
+    /// No-data sentinel value, if declared.
+    pub no_data: Option<f64>,
+    /// Bits per sample.
+    pub bits_per_sample: u16,
+    /// Sample format (unsigned / signed / float).
+    pub sample_format: SampleFormat,
+    /// Compression codec.
+    pub compression: Compression,
+    /// True for BigTIFF (64-bit offsets).
+    pub is_bigtiff: bool,
+    /// True if the image is tiled (vs stripped).
+    pub tiled: bool,
+}
+
 /// A decoded GeoTIFF file, ready for data access.
 ///
 /// # Example
@@ -106,8 +132,44 @@ impl GeoTiff {
     }
 
     /// Parse a GeoTIFF from an in-memory byte slice.
+    ///
+    /// Metadata is parsed from a borrowed cursor (no copy); the bytes are then
+    /// retained once for random-access tile/strip reads. This holds at most two
+    /// copies in memory (the caller's slice plus one owned copy) rather than the
+    /// three that routing through `from_reader` would require.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Self::from_reader(std::io::Cursor::new(bytes.to_vec()))
+        let mut tiff = TiffReader::new(std::io::Cursor::new(bytes))?;
+        let is_bigtiff = tiff.variant.is_bigtiff();
+        let ifd = tiff.read_ifd(tiff.first_ifd_offset)?;
+        let info = Self::parse_image_info(&ifd)?;
+        let geo_transform = Self::parse_geo_transform(&ifd);
+        let geo_keys = Self::parse_geo_keys(&ifd)?;
+        let value_transform = Self::parse_value_transform(&ifd);
+        Ok(Self { info, geo_transform, geo_keys, value_transform, is_bigtiff, data: bytes.to_vec() })
+    }
+
+    /// Parse only the header metadata of a GeoTIFF without retaining any pixel
+    /// data. Memory use is O(header), so this works on multi-gigabyte rasters
+    /// that whole-image reads cannot fit in a 32-bit (4 GiB) address space.
+    pub fn peek_meta(bytes: &[u8]) -> Result<GeoTiffMeta> {
+        let mut tiff = TiffReader::new(std::io::Cursor::new(bytes))?;
+        let is_bigtiff = tiff.variant.is_bigtiff();
+        let ifd = tiff.read_ifd(tiff.first_ifd_offset)?;
+        let info = Self::parse_image_info(&ifd)?;
+        let geo_keys = Self::parse_geo_keys(&ifd)?;
+        let tiled = matches!(info.layout, ImageLayout::Tiled { .. });
+        Ok(GeoTiffMeta {
+            width: info.width,
+            height: info.height,
+            bands: info.samples_per_pixel,
+            epsg: geo_keys.as_ref().and_then(|gk| gk.epsg()),
+            no_data: info.no_data,
+            bits_per_sample: info.bits_per_sample,
+            sample_format: info.sample_format,
+            compression: info.compression,
+            is_bigtiff,
+            tiled,
+        })
     }
 
     /// Parse a GeoTIFF from any `Read + Seek` reader.

@@ -38,21 +38,53 @@ pub fn geotiff_stats(data: &[u8]) -> String {
     stats_json(data)
 }
 
-/// Decode a GeoTIFF and return only its georeferencing/shape metadata as JSON:
-/// `{"ok":true,"width":W,"height":H,"bands":B,"epsg":E|null,"nodata":V|null}`.
+/// Decode only a GeoTIFF's header and return its metadata as JSON:
+/// `{"ok":true,"width":W,"height":H,"bands":B,"epsg":E|null,"nodata":V|null,
+///   "bits_per_sample":N,"sample_format":"uint|int|float","compression":"...",
+///   "tiled":bool,"bigtiff":bool}`.
+///
+/// This is O(header) memory: it never loads pixel data, so it works on
+/// multi-gigabyte rasters that whole-image reads cannot fit in WASM's 4 GiB
+/// address space.
 #[wasm_bindgen]
 pub fn geotiff_info(data: &[u8]) -> String {
-    match GeoTiff::from_bytes(data) {
-        Ok(gt) => {
-            let epsg = gt.epsg().map(|e| e.to_string()).unwrap_or_else(|| "null".into());
-            let nodata = json_opt_f64(gt.no_data());
-            format!(
-                "{{\"ok\":true,\"width\":{},\"height\":{},\"bands\":{},\"epsg\":{},\"nodata\":{}}}",
-                gt.width(), gt.height(), gt.band_count(), epsg, nodata
-            )
-        }
-        Err(e) => err_json(&format!("decode: {e}")),
+    let m = match GeoTiff::peek_meta(data) {
+        Ok(m) => m,
+        Err(e) => return err_json(&format!("decode: {e}")),
+    };
+    let epsg = m.epsg.map(|e| e.to_string()).unwrap_or_else(|| "null".into());
+    let nodata = json_opt_f64(m.no_data);
+    let sf = format!("{:?}", m.sample_format).to_lowercase();
+    let comp = format!("{:?}", m.compression);
+    format!(
+        "{{\"ok\":true,\"width\":{},\"height\":{},\"bands\":{},\"epsg\":{},\"nodata\":{},\
+\"bits_per_sample\":{},\"sample_format\":\"{}\",\"compression\":\"{}\",\"tiled\":{},\"bigtiff\":{}}}",
+        m.width, m.height, m.bands, epsg, nodata,
+        m.bits_per_sample, sf, comp, m.tiled, m.is_bigtiff
+    )
+}
+
+/// Read a single band of pixel values as an `f64` array (any on-disk sample
+/// format is converted to `f64`). Returns a `Float64Array` in row-major order,
+/// length `width * height`.
+///
+/// This loads the whole band into memory, so it is bounded by WASM's 4 GiB
+/// address space. Use [`geotiff_read_window_f64`] for sub-regions of large
+/// rasters. On error (decode failure, bad band index, out of memory) the
+/// promise/return throws via `Result`.
+#[wasm_bindgen]
+pub fn geotiff_read_band_f64(data: &[u8], band: usize) -> Result<Vec<f64>, JsValue> {
+    let gt = GeoTiff::from_bytes(data).map_err(|e| JsValue::from_str(&format!("decode: {e}")))?;
+    let bands = gt.band_count();
+    if band >= bands {
+        return Err(JsValue::from_str(&format!("band {band} out of range (bands={bands})")));
     }
+    // read_all_f64 returns chunky/interleaved samples; de-interleave the band.
+    let all = gt.read_all_f64().map_err(|e| JsValue::from_str(&format!("read: {e}")))?;
+    if bands == 1 {
+        return Ok(all);
+    }
+    Ok(all.into_iter().skip(band).step_by(bands).collect())
 }
 
 /// Semantic version of this crate, exposed for runtime feature detection.

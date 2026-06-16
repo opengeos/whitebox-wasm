@@ -28,6 +28,9 @@ jobs:
           cp demo/index.html site/index.html
           cp examples/sample.tif site/sample.tif
           rm -f site/.gitignore
+          # cache-bust the glue + wasm together so returning visitors never
+          # mix an old cached loader with a freshly built module
+          sed -i "s/__BUILD__/${GITHUB_SHA}/g" site/index.html
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

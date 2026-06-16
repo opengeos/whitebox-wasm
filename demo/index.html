@@ -23,9 +23,13 @@
   <pre id="out">Loading WASM…</pre>
 
   <script type="module">
-    import init, { geotiff_stats, geotiff_info, version } from "./whitebox_wasm.js";
+    // __BUILD__ is replaced with the commit SHA at deploy time so the JS glue
+    // and the .wasm always update as a matched pair (avoids cached-glue +
+    // new-wasm LinkErrors).
+    const V = "__BUILD__";
+    import init, { geotiff_stats, geotiff_info, version } from "./whitebox_wasm.js?v=__BUILD__";
     const out = document.getElementById("out");
-    await init();
+    await init({ module_or_path: `./whitebox_wasm_bg.wasm?v=${V}` });
     out.textContent = `whitebox-wasm v${version()} ready. Choose a file.`;
 
     async function run(bytes) {

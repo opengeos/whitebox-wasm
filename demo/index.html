@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>whitebox-wasm · GeoTIFF in the browser</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 760px; margin: 3rem auto; padding: 0 1rem; }
+  h1 { margin-bottom: 0; }
+  .sub { color: #888; margin-top: .25rem; }
+  pre { background: #0001; padding: 1rem; border-radius: 8px; overflow:auto; }
+  input[type=file] { margin: 1rem 0; }
+  .pill { display:inline-block; background:#2563eb; color:#fff; border-radius:999px; padding:.1rem .6rem; font-size:.8rem;}
+</style>
+</head>
+<body>
+  <h1>whitebox-wasm</h1>
+  <p class="sub">Pure-Rust GeoTIFF decoding compiled to WebAssembly. No GDAL. No server. <span class="pill">runs in your browser</span></p>
+  <p>Drop a <code>.tif</code> / <code>.tiff</code> below - it is decoded entirely client-side.</p>
+  <input id="file" type="file" accept=".tif,.tiff,image/tiff" />
+  <button id="sample">Use bundled sample</button>
+  <pre id="out">Loading WASM…</pre>
+
+  <script type="module">
+    import init, { geotiff_stats, geotiff_info, version } from "./whitebox_wasm.js";
+    const out = document.getElementById("out");
+    await init();
+    out.textContent = `whitebox-wasm v${version()} ready. Choose a file.`;
+
+    async function run(bytes) {
+      const u8 = new Uint8Array(bytes);
+      const info = JSON.parse(geotiff_info(u8));
+      const stats = JSON.parse(geotiff_stats(u8));
+      out.textContent = JSON.stringify({ info, stats }, null, 2);
+    }
+    document.getElementById("file").addEventListener("change", async (e) => {
+      const f = e.target.files[0]; if (!f) return;
+      out.textContent = `Decoding ${f.name} (${f.size} bytes)…`;
+      run(await f.arrayBuffer());
+    });
+    document.getElementById("sample").addEventListener("click", async () => {
+      out.textContent = "Fetching bundled sample…";
+      run(await (await fetch("./sample.tif")).arrayBuffer());
+    });
+  </script>
+</body>
+</html>

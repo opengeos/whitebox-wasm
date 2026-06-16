@@ -1,0 +1,57 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write   # create releases / upload assets
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Build package
+        run: wasm-pack build crates/whitebox-wasm --release --target web --scope opengeos --out-dir pkg
+
+      - name: Sync package version to tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cd crates/whitebox-wasm/pkg
+          npm version --no-git-tag-version --allow-same-version "$VERSION"
+
+      - name: Publish to npm
+        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        working-directory: crates/whitebox-wasm/pkg
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: npm publish skipped
+        if: ${{ env.NODE_AUTH_TOKEN == '' }}
+        run: echo "::warning::NPM_TOKEN secret not set - skipping npm publish. Add it in repo Settings ▸ Secrets to enable."
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Stage release assets
+        run: |
+          mkdir -p dist
+          cp crates/whitebox-wasm/pkg/whitebox_wasm_bg.wasm dist/whitebox-wasm-${GITHUB_REF_NAME}.wasm
+          cp crates/whitebox-wasm/pkg/whitebox_wasm.js      dist/whitebox-wasm-${GITHUB_REF_NAME}.js
+          cp crates/whitebox-wasm/pkg/whitebox_wasm.d.ts    dist/whitebox-wasm-${GITHUB_REF_NAME}.d.ts
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

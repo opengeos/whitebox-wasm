@@ -1,0 +1,25 @@
+[package]
+name = "whitebox-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "WebAssembly bindings for the pure-Rust Whitebox GeoTIFF engine"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/opengeos/whitebox-wasm"
+homepage = "https://github.com/opengeos/whitebox-wasm"
+keywords = ["geotiff", "wasm", "gis", "raster", "webassembly"]
+categories = ["wasm", "science"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wbgeotiff = { path = "../wbgeotiff" }
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# The wasm-opt bundled with some wasm-pack versions predates bulk-memory being
+# on by default in LLVM output. Enable the features the toolchain now emits.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O', '--enable-bulk-memory', '--enable-nontrapping-float-to-int', '--enable-sign-ext', '--enable-mutable-globals']

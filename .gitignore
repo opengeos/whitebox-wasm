@@ -1,0 +1,5 @@
+/target
+**/target
+crates/whitebox-wasm/pkg
+node_modules
+*.wasm-opt.wasm

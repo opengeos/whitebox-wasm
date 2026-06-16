@@ -1,0 +1,31 @@
+[package]
+name        = "wbvector"
+version     = "0.1.4"
+edition     = "2021"
+authors = ["John Lindsay, Whitebox Geospatial Inc."]
+description = "Pure-Rust library for reading and writing vector GIS formats"
+license     = "MIT OR Apache-2.0"
+readme      = "README.md"
+repository  = "https://github.com/jblindsay/whitebox_next_gen"
+homepage    = "https://github.com/jblindsay/whitebox_next_gen"
+documentation = "https://docs.rs/wbvector"
+keywords    = ["gis", "geospatial", "shapefile", "geojson", "geopackage"]
+categories  = ["encoding", "science::geo"]
+exclude     = ["data/"]
+
+[features]
+default = []
+kmz = ["dep:zip"]
+osmpbf = ["dep:osmpbfreader"]
+geoparquet = ["dep:parquet", "dep:serde_json"]
+
+# ── Core dependencies ────────────────────────────────────────────────────────
+[dependencies]
+thiserror = "1"
+flatbuffers = "24.12.23"
+wbprojection = { path = "../wbprojection", version = "0.3.0" }
+zip = { version = "0.6", optional = true, default-features = false, features = ["deflate"] }
+osmpbfreader = { version = "0.16", optional = true }
+parquet = { version = "58.3", optional = true }
+serde_json = { version = "1", optional = true }
+

@@ -9,6 +9,7 @@
 //!   [`geotiff_read_band_f64`]) for one-shot use.
 //! - **Stateful classes** ([`GeoTiffReader`] parses once and serves many reads;
 //!   [`CogBuilder`] encodes Cloud Optimized GeoTIFFs to bytes).
+mod vector;
 use wasm_bindgen::prelude::*;
 use wbgeotiff::{CogLayout, CogWriter, Compression, GeoTiff, GeoTransform, SampleFormat};
 

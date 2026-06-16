@@ -1,0 +1,3792 @@
+//! Overlay face selection built on topology graph extraction.
+
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+#[cfg(feature = "parallel")]
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+#[cfg(feature = "parallel")]
+use rayon::join;
+
+use crate::algorithms::segment::{point_on_segment_eps, segments_intersect_eps};
+use crate::constructive::polygonize_closed_linestrings;
+use crate::algorithms::distance::geometry_distance;
+use crate::algorithms::point_in_ring::{classify_point_in_ring_eps, PointInRing};
+use crate::geom::{Coord, Envelope, Geometry, LineString, LinearRing, Polygon};
+use crate::graph::TopologyGraph;
+use crate::noding::{node_linestrings_with_options, NodingOptions, NodingStrategy};
+use crate::precision::PrecisionModel;
+use crate::spatial_index::SpatialIndex;
+
+const OVERLAY_ALL_TINY_VERTEX_THRESHOLD: usize = 24;
+const OVERLAY_ALL_HOLERICH_VERTEX_THRESHOLD: usize = 64;
+const OVERLAY_ALL_HOLERICH_HOLES_THRESHOLD: usize = 6;
+static HOLE_EDGE_CALL_SEQ: AtomicUsize = AtomicUsize::new(1);
+
+/// Polygon overlay operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayOp {
+    /// Keep faces inside both A and B.
+    Intersection,
+    /// Keep faces inside either A or B.
+    Union,
+    /// Keep faces inside A and outside B.
+    DifferenceAB,
+    /// Keep faces inside exactly one of A or B.
+    SymmetricDifference,
+}
+
+/// All dissolved overlay outputs for a polygon pair.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlayOutputs {
+    /// Dissolved intersection output.
+    pub intersection: Vec<Polygon>,
+    /// Dissolved union output.
+    pub union: Vec<Polygon>,
+    /// Dissolved difference `A \ B` output.
+    pub difference_ab: Vec<Polygon>,
+    /// Dissolved symmetric difference output.
+    pub sym_diff: Vec<Polygon>,
+}
+
+/// One dissolved polygon plus the contributing input polygon indices.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnaryDissolveGroup {
+    /// Dissolved polygon geometry.
+    pub poly: Polygon,
+    /// Indices of source polygons from the input slice.
+    pub source_indices: Vec<usize>,
+}
+
+/// Strategy used for unary polygon dissolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryDissolveStrategy {
+    /// Use graph/face assembly and source-classification.
+    GraphDriven,
+    /// Use spatially cascaded pairwise dissolve passes.
+    CascadedHeuristic,
+    /// Use legacy envelope-component pairwise merge heuristic.
+    PairwiseHeuristic,
+}
+
+/// Options for unary polygon dissolve.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UnaryDissolveOptions {
+    /// Predicate epsilon.
+    pub epsilon: f64,
+    /// Dissolve strategy.
+    pub strategy: UnaryDissolveStrategy,
+    /// Noding options used by graph-driven dissolve.
+    pub noding: NodingOptions,
+    /// Optional preferred precision model for pairwise/cascaded union attempts.
+    pub preferred_union_precision: Option<PrecisionModel>,
+}
+
+impl Default for UnaryDissolveOptions {
+    fn default() -> Self {
+        Self {
+            epsilon: 1.0e-9,
+            strategy: UnaryDissolveStrategy::GraphDriven,
+            noding: NodingOptions {
+                epsilon: 1.0e-9,
+                strategy: NodingStrategy::SnapRounding,
+                precision: None,
+            },
+            preferred_union_precision: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClassifiedFaces {
+    rings: Vec<LineString>,
+    in_a: Vec<bool>,
+    in_b: Vec<bool>,
+    state_a: Option<Vec<FaceMembershipState>>,
+    state_b: Option<Vec<FaceMembershipState>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaceMembershipState {
+    Inside,
+    Outside,
+    Boundary,
+    Unknown,
+}
+
+/// Select bounded arrangement faces for two polygons under `operation`.
+///
+/// Returns a face decomposition from the planar arrangement—a flat list of simple rings
+/// (exterior rings without holes). This is a low-level primitive useful for diagnostic
+/// purposes or advanced use cases that need raw face geometry.
+///
+/// **Important:** The returned polygons are FLAT (no holes). Adjacent faces have not
+/// been merged, and containment relationships between rings have not been resolved into
+/// shell/hole hierarchy.
+///
+/// **Recommendation:** For typical Boolean overlay operations, use [`polygon_overlay`]
+/// instead, which merges adjacent faces and properly reconstructs holes via hole nesting.
+///
+/// This function is primarily useful for:
+/// - Visualizing or debugging the underlying face decomposition
+/// - Computing intermediate results for custom overlay algorithms
+/// - Workflows that explicitly need flat face rings
+///
+/// To convert the flat output of this function to proper polygons with holes (if you
+/// need it), collect the rings and call `assemble_polygons_from_rings` (internal helper);
+/// however, `polygon_overlay` already does this and is the recommended path.
+pub fn polygon_overlay_faces(
+    a: &Polygon,
+    b: &Polygon,
+    operation: OverlayOp,
+    epsilon: f64,
+) -> Vec<Polygon> {
+    let eps = normalized_eps(epsilon);
+    let classified = classify_overlay_faces(a, b, eps);
+    select_classified_faces(&classified, operation)
+}
+
+fn classify_overlay_faces(a: &Polygon, b: &Polygon, eps: f64) -> ClassifiedFaces {
+    let mut boundaries = polygon_boundaries(a);
+    boundaries.extend(polygon_boundaries(b));
+    // Clamp to the topology-scale minimum so that ultra-fine caller epsilons
+    // (e.g., 1e-12 from Sibson interpolation) do not produce precision loss
+    // from excessively tight node-merge thresholds in the face graph.
+    let graph_eps = eps.max(1.0e-9);
+    let noded = node_linestrings_with_options(
+        &boundaries,
+        NodingOptions {
+            epsilon: graph_eps,
+            strategy: NodingStrategy::SnapRounding,
+            precision: None,
+        },
+    );
+    let noded_segments = segmentize_noded_lines(&noded, graph_eps);
+    let dedupe_for_shell_only = a.holes.is_empty() && b.holes.is_empty();
+    let noded = if dedupe_for_shell_only {
+        dedupe_noded_segments(&noded_segments, graph_eps)
+    } else {
+        noded_segments
+    };
+    let graph = TopologyGraph::from_noded_linestrings(&noded, graph_eps);
+
+    let hole_bearing = !a.holes.is_empty() || !b.holes.is_empty();
+
+    // For hole-bearing overlays, classify extracted arrangement faces by representative
+    // point containment. For shell-only overlays, keep BFS depth propagation for parity.
+    let (rings_with_edges, in_a, in_b) = if hole_bearing {
+        let rings_with_edges = extract_faces_without_exterior_cycle(&graph, eps);
+        let state_a = classify_hole_bearing_face_states(&graph, &rings_with_edges, a, eps);
+        let state_b = classify_hole_bearing_face_states(&graph, &rings_with_edges, b, eps);
+        let in_a: Vec<bool> = state_a.iter().map(|s| state_is_inside(*s)).collect();
+        let in_b: Vec<bool> = state_b.iter().map(|s| state_is_inside(*s)).collect();
+
+        let rings: Vec<LineString> = rings_with_edges.into_iter().map(|(ls, _)| ls).collect();
+        return ClassifiedFaces {
+            rings,
+            in_a,
+            in_b,
+            state_a: Some(state_a),
+            state_b: Some(state_b),
+        };
+    } else {
+        // Use bounded face rings only (positive signed area).  Edges in CW-winding
+        // rings (outer boundary / hole inner-boundary cycles) are NOT mapped, so
+        // their `sym` edges report `edge_to_face[sym] == MAX` — that is the signal
+        // used by the BFS to identify faces adjacent to the exterior.
+        let rings_with_edges = extract_bounded_faces_with_edges(&graph, eps);
+        let n_edges = graph.edges.len();
+
+        // Map edge id → face index.
+        let mut edge_to_face = vec![usize::MAX; n_edges];
+        for (face_id, (_, edge_ids)) in rings_with_edges.iter().enumerate() {
+            for &eid in edge_ids {
+                if eid < n_edges {
+                    edge_to_face[eid] = face_id;
+                }
+            }
+        }
+
+        // Compute per-source depth deltas and classify via BFS — one pass per polygon.
+        let depth_a = classify_overlay_faces_depth(
+            &graph,
+            &rings_with_edges,
+            &edge_to_face,
+            a,
+            n_edges,
+            eps,
+            false,
+        );
+        let depth_b = classify_overlay_faces_depth(
+            &graph,
+            &rings_with_edges,
+            &edge_to_face,
+            b,
+            n_edges,
+            eps,
+            false,
+        );
+
+        let in_a: Vec<bool> = depth_a.iter().map(|&d| d > 0).collect();
+        let in_b: Vec<bool> = depth_b.iter().map(|&d| d > 0).collect();
+        (rings_with_edges, in_a, in_b)
+    };
+    let rings: Vec<LineString> = rings_with_edges.into_iter().map(|(ls, _)| ls).collect();
+
+    ClassifiedFaces {
+        rings,
+        in_a,
+        in_b,
+        state_a: None,
+        state_b: None,
+    }
+}
+
+/// Compute depth labels for all faces relative to a single source polygon using BFS.
+/// Returns one i32 per face; depth > 0 means the face is inside the source polygon.
+fn classify_overlay_faces_depth(
+    graph: &TopologyGraph,
+    face_rings: &[(LineString, Vec<usize>)],
+    edge_to_face: &[usize],
+    source: &Polygon,
+    n_edges: usize,
+    eps: f64,
+    enable_rep_fallback: bool,
+) -> Vec<i32> {
+    // Compute per-directed-edge depth deltas from source ring segments.
+    let mut delta = vec![0i32; n_edges];
+    let src_slice = std::slice::from_ref(source);
+    compute_unary_edge_deltas(graph, src_slice, eps, &mut delta);
+
+    // BFS from exterior-adjacent faces, same as unary dissolve.
+    let mut face_depth = vec![i32::MIN; face_rings.len()];
+    let mut queue = VecDeque::<usize>::new();
+    let face_sign: Vec<i32> = face_rings
+        .iter()
+        .map(|(ring, _)| if ring_signed_area(&ring.coords) >= 0.0 { 1 } else { -1 })
+        .collect();
+
+    for face_id in 0..face_rings.len() {
+        let mut seed = i32::MIN;
+        let mut fallback_seed = i32::MIN;
+        for &eid in &face_rings[face_id].1 {
+            let sym = eid ^ 1;
+            if sym < n_edges && edge_to_face[sym] == usize::MAX {
+                let d = if eid < delta.len() { delta[eid] } else { 0 };
+                let signed_d = face_sign[face_id] * d;
+                if signed_d != 0 && seed == i32::MIN {
+                    seed = signed_d;
+                    break;
+                }
+                if fallback_seed == i32::MIN {
+                    fallback_seed = signed_d;
+                }
+            }
+        }
+        let chosen = if seed != i32::MIN { seed } else { fallback_seed };
+        if chosen != i32::MIN {
+            face_depth[face_id] = chosen;
+            queue.push_back(face_id);
+        }
+    }
+
+    while let Some(current_id) = queue.pop_front() {
+        let d = face_depth[current_id];
+        let sign = face_sign[current_id];
+        let edge_ids = face_rings[current_id].1.clone();
+        for eid in edge_ids {
+            let sym = eid ^ 1;
+            if sym >= n_edges {
+                continue;
+            }
+            let adj = edge_to_face[sym];
+            if adj == usize::MAX || face_depth[adj] != i32::MIN {
+                continue;
+            }
+            let e_delta = if eid < delta.len() { delta[eid] } else { 0 };
+            face_depth[adj] = d - sign * e_delta;
+            queue.push_back(adj);
+        }
+    }
+
+    // Unseeded faces (fully interior, not touching exterior) keep depth 0.
+    for d in face_depth.iter_mut() {
+        if *d == i32::MIN {
+            *d = 0;
+        }
+    }
+
+    // Some hole-touch arrangements do not get a stable BFS seed from exterior-adjacent
+    // edges. Fall back to a representative-point containment test so those faces still
+    // participate in binary overlay selection.
+    if enable_rep_fallback {
+        for (face_id, depth) in face_depth.iter_mut().enumerate() {
+            if *depth != 0 {
+                continue;
+            }
+            let ring = &face_rings[face_id].0;
+            let rep = ring_centroid(&ring.coords).or_else(|| {
+                ring.coords.get(0).copied().map(|p| {
+                    if ring.coords.len() > 1 {
+                        let q = ring.coords[ring.coords.len() / 2];
+                        Coord::xy((p.x + q.x) * 0.5, (p.y + q.y) * 0.5)
+                    } else {
+                        p
+                    }
+                })
+            });
+            if let Some(p) = rep {
+                if matches!(classify_point_in_polygon_eps(p, source, eps), PointInRing::Inside) {
+                    *depth = 1;
+                }
+            }
+        }
+    }
+
+    face_depth
+}
+
+/// Dedicated hole-bearing face resolver:
+/// 1) classify from edge-depth propagation,
+/// 2) use representative-point location only for unresolved depth==0 faces.
+fn classify_hole_bearing_face_states(
+    graph: &TopologyGraph,
+    face_rings: &[(LineString, Vec<usize>)],
+    source: &Polygon,
+    eps: f64,
+) -> Vec<FaceMembershipState> {
+    if face_rings.is_empty() {
+        return Vec::new();
+    }
+
+    let n_edges = graph.edges.len();
+    let mut edge_to_face = vec![usize::MAX; n_edges];
+    for (face_id, (_, edge_ids)) in face_rings.iter().enumerate() {
+        for &eid in edge_ids {
+            if eid < n_edges {
+                edge_to_face[eid] = face_id;
+            }
+        }
+    }
+
+    let depth = classify_hole_bearing_faces_depth(
+        graph,
+        face_rings,
+        &edge_to_face,
+        source,
+        n_edges,
+        eps,
+    );
+
+    let overlay_debug = std::env::var("WB_OVERLAY_DEBUG").is_ok();
+    let mut state = vec![FaceMembershipState::Unknown; face_rings.len()];
+    for (idx, d) in depth.iter().enumerate() {
+        if *d > 0 {
+            state[idx] = FaceMembershipState::Inside;
+            continue;
+        }
+        if *d < 0 {
+            state[idx] = FaceMembershipState::Outside;
+            continue;
+        }
+
+        let ring = &face_rings[idx].0;
+        if let Some(p) = representative_point_for_face_ring(&ring.coords, eps)
+            .or_else(|| ring_centroid(&ring.coords))
+            .or_else(|| ring.coords.first().copied())
+        {
+            state[idx] = match classify_point_in_polygon_eps(p, source, eps) {
+                PointInRing::Inside => FaceMembershipState::Inside,
+                PointInRing::Outside => FaceMembershipState::Outside,
+                PointInRing::Boundary => FaceMembershipState::Boundary,
+            };
+        } else {
+            state[idx] = FaceMembershipState::Outside;
+        }
+    }
+
+    if overlay_debug {
+        for (idx, (ring, _)) in face_rings.iter().enumerate() {
+            let mut min_x = f64::INFINITY;
+            let mut max_x = f64::NEG_INFINITY;
+            let mut min_y = f64::INFINITY;
+            let mut max_y = f64::NEG_INFINITY;
+            for c in &ring.coords {
+                min_x = min_x.min(c.x);
+                max_x = max_x.max(c.x);
+                min_y = min_y.min(c.y);
+                max_y = max_y.max(c.y);
+            }
+            let rep = representative_point_for_face_ring(&ring.coords, eps)
+                .or_else(|| ring_centroid(&ring.coords))
+                .or_else(|| ring.coords.first().copied());
+            if let Some(p) = rep {
+                let pip = classify_point_in_polygon_eps(p, source, eps);
+                eprintln!(
+                    "overlay_debug: face[{idx}] area={:.6} depth={} state={:?} pip={:?} rep=({:.6},{:.6}) bbox=({:.3},{:.3})-({:.3},{:.3}) n={}",
+                    ring_signed_area(&ring.coords),
+                    depth[idx],
+                    state[idx],
+                    pip,
+                    p.x,
+                    p.y,
+                    min_x,
+                    min_y,
+                    max_x,
+                    max_y,
+                    ring.coords.len()
+                );
+            } else {
+                eprintln!(
+                    "overlay_debug: face[{idx}] area={:.6} depth={} state={:?} rep=<none>",
+                    ring_signed_area(&ring.coords),
+                    depth[idx],
+                    state[idx]
+                );
+            }
+        }
+    }
+
+    state
+}
+
+fn classify_hole_bearing_faces_depth(
+    graph: &TopologyGraph,
+    face_rings: &[(LineString, Vec<usize>)],
+    edge_to_face: &[usize],
+    source: &Polygon,
+    n_edges: usize,
+    eps: f64,
+) -> Vec<i32> {
+    let mut delta = vec![0i32; n_edges];
+    let src_slice = std::slice::from_ref(source);
+    compute_unary_edge_deltas(graph, src_slice, eps, &mut delta);
+
+    let mut face_depth = vec![i32::MIN; face_rings.len()];
+    let mut queue = VecDeque::<usize>::new();
+
+    for face_id in 0..face_rings.len() {
+        let mut seed = i32::MIN;
+        let mut fallback_seed = i32::MIN;
+        for &eid in &face_rings[face_id].1 {
+            let sym = eid ^ 1;
+            if sym < n_edges && edge_to_face[sym] == usize::MAX {
+                let d = if eid < delta.len() { delta[eid] } else { 0 };
+                if d != 0 && seed == i32::MIN {
+                    seed = d;
+                    break;
+                }
+                if fallback_seed == i32::MIN {
+                    fallback_seed = d;
+                }
+            }
+        }
+        let chosen = if seed != i32::MIN { seed } else { fallback_seed };
+        if chosen != i32::MIN {
+            face_depth[face_id] = chosen;
+            queue.push_back(face_id);
+        }
+    }
+
+    while let Some(current_id) = queue.pop_front() {
+        let d = face_depth[current_id];
+        let edge_ids = face_rings[current_id].1.clone();
+        for eid in edge_ids {
+            let sym = eid ^ 1;
+            if sym >= n_edges {
+                continue;
+            }
+            let adj = edge_to_face[sym];
+            if adj == usize::MAX || face_depth[adj] != i32::MIN {
+                continue;
+            }
+            let e_delta = if eid < delta.len() { delta[eid] } else { 0 };
+            face_depth[adj] = d - e_delta;
+            queue.push_back(adj);
+        }
+    }
+
+    for d in face_depth.iter_mut() {
+        if *d == i32::MIN {
+            *d = 0;
+        }
+    }
+
+    face_depth
+}
+
+#[inline]
+fn state_is_inside(state: FaceMembershipState) -> bool {
+    matches!(state, FaceMembershipState::Inside | FaceMembershipState::Boundary)
+}
+
+fn keep_face_for_operation_state(
+    a: FaceMembershipState,
+    b: FaceMembershipState,
+    operation: OverlayOp,
+) -> bool {
+    let a_in = state_is_inside(a);
+    let b_in = state_is_inside(b);
+    match operation {
+        OverlayOp::Intersection => a_in && b_in,
+        OverlayOp::Union => a_in || b_in,
+        OverlayOp::DifferenceAB => a_in && !b_in,
+        OverlayOp::SymmetricDifference => a_in ^ b_in,
+    }
+}
+
+fn extract_faces_without_exterior_cycle(
+    graph: &TopologyGraph,
+    eps: f64,
+) -> Vec<(LineString, Vec<usize>)> {
+    let area_min = eps * eps;
+    let mut raw_faces: Vec<(LineString, Vec<usize>)> = graph
+        .extract_face_rings_with_edges(eps)
+        .into_iter()
+        .filter(|(ring, _)| ring_signed_area(&ring.coords).abs() > area_min)
+        .collect();
+
+    // Some arrangements can emit the same face cycle multiple times with
+    // different start vertices and/or opposite winding. Deduplicate by a
+    // canonical quantized ring key before selecting bounded faces.
+    let mut seen = HashSet::<String>::new();
+    let mut faces = Vec::<(LineString, Vec<usize>)>::new();
+    for (ring, edges) in raw_faces.drain(..) {
+        let key = canonical_oriented_ring_key(&ring.coords, eps);
+        if seen.insert(key) {
+            faces.push((ring, edges));
+        }
+    }
+
+    if faces.len() <= 1 {
+        return faces;
+    }
+
+    // Face extraction may produce bounded cycles with either winding direction.
+    // Remove the exterior cycle explicitly by dropping the maximum-|area| face.
+    let mut exterior_idx = 0usize;
+    let mut exterior_area = ring_signed_area(&faces[0].0.coords).abs();
+    for (idx, (ring, _)) in faces.iter().enumerate().skip(1) {
+        let a = ring_signed_area(&ring.coords).abs();
+        if a > exterior_area {
+            exterior_area = a;
+            exterior_idx = idx;
+        }
+    }
+    faces.remove(exterior_idx);
+    faces
+}
+
+fn extract_bounded_faces_with_edges(
+    graph: &TopologyGraph,
+    eps: f64,
+) -> Vec<(LineString, Vec<usize>)> {
+    let area_min = eps * eps;
+    let mut raw_faces: Vec<(LineString, Vec<usize>)> = graph
+        .extract_bounded_face_rings_with_edges(eps)
+        .into_iter()
+        .filter(|(ring, _)| ring_signed_area(&ring.coords).abs() > area_min)
+        .collect();
+
+    let mut seen = HashSet::<String>::new();
+    let mut faces = Vec::<(LineString, Vec<usize>)>::new();
+    for (ring, edges) in raw_faces.drain(..) {
+        let key = canonical_ring_key(&ring.coords, eps);
+        if seen.insert(key) {
+            faces.push((ring, edges));
+        }
+    }
+    faces
+}
+
+fn canonical_ring_key(coords: &[Coord], eps: f64) -> String {
+    if coords.len() < 2 {
+        return String::new();
+    }
+
+    let scale = eps.max(1.0e-12);
+    let mut pts = Vec::<(i64, i64)>::new();
+    for c in coords.iter().take(coords.len().saturating_sub(1)) {
+        let qx = (c.x / scale).round() as i64;
+        let qy = (c.y / scale).round() as i64;
+        pts.push((qx, qy));
+    }
+
+    if pts.is_empty() {
+        return String::new();
+    }
+
+    let fwd = min_lex_rotation(&pts);
+    let mut rev_src = pts.clone();
+    rev_src.reverse();
+    let rev = min_lex_rotation(&rev_src);
+    let best = if fwd <= rev { fwd } else { rev };
+
+    best
+        .into_iter()
+        .map(|(x, y)| format!("{x}:{y}"))
+        .collect::<Vec<String>>()
+        .join(";")
+}
+
+fn canonical_oriented_ring_key(coords: &[Coord], eps: f64) -> String {
+    if coords.len() < 2 {
+        return String::new();
+    }
+
+    let scale = eps.max(1.0e-12);
+    let mut pts = Vec::<(i64, i64)>::new();
+    for c in coords.iter().take(coords.len().saturating_sub(1)) {
+        let qx = (c.x / scale).round() as i64;
+        let qy = (c.y / scale).round() as i64;
+        pts.push((qx, qy));
+    }
+
+    if pts.is_empty() {
+        return String::new();
+    }
+
+    let best = min_lex_rotation(&pts);
+    best
+        .into_iter()
+        .map(|(x, y)| format!("{x}:{y}"))
+        .collect::<Vec<String>>()
+        .join(";")
+}
+
+fn dedupe_noded_segments(lines: &[LineString], eps: f64) -> Vec<LineString> {
+    let mut seen = HashSet::<String>::new();
+    let mut out = Vec::<LineString>::new();
+
+    for ls in lines {
+        if ls.coords.len() != 2 {
+            continue;
+        }
+        let a = ls.coords[0];
+        let b = ls.coords[1];
+        if nearly_eq(a, b, eps) {
+            continue;
+        }
+
+        let key = canonical_segment_key(a, b, eps);
+        if seen.insert(key) {
+            out.push(ls.clone());
+        }
+    }
+
+    out
+}
+
+fn segmentize_noded_lines(lines: &[LineString], eps: f64) -> Vec<LineString> {
+    let mut out = Vec::<LineString>::new();
+    for ls in lines {
+        if ls.coords.len() < 2 {
+            continue;
+        }
+        if ls.coords.len() == 2 {
+            if !nearly_eq(ls.coords[0], ls.coords[1], eps) {
+                out.push(ls.clone());
+            }
+            continue;
+        }
+
+        for i in 0..(ls.coords.len() - 1) {
+            let a = ls.coords[i];
+            let b = ls.coords[i + 1];
+            if nearly_eq(a, b, eps) {
+                continue;
+            }
+            out.push(LineString::new(vec![a, b]));
+        }
+    }
+    out
+}
+
+fn canonical_segment_key(a: Coord, b: Coord, eps: f64) -> String {
+    let scale = eps.max(1.0e-12);
+    let qa = ((a.x / scale).round() as i64, (a.y / scale).round() as i64);
+    let qb = ((b.x / scale).round() as i64, (b.y / scale).round() as i64);
+    let (u, v) = if qa <= qb { (qa, qb) } else { (qb, qa) };
+    format!("{}:{}|{}:{}", u.0, u.1, v.0, v.1)
+}
+
+fn min_lex_rotation(seq: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    if seq.is_empty() {
+        return Vec::new();
+    }
+    let n = seq.len();
+    let mut best_start = 0usize;
+    for start in 1..n {
+        let mut better = false;
+        let mut worse = false;
+        for k in 0..n {
+            let a = seq[(start + k) % n];
+            let b = seq[(best_start + k) % n];
+            if a < b {
+                better = true;
+                break;
+            }
+            if a > b {
+                worse = true;
+                break;
+            }
+        }
+        if better && !worse {
+            best_start = start;
+        }
+    }
+
+    let mut out = Vec::<(i64, i64)>::with_capacity(n);
+    for k in 0..n {
+        out.push(seq[(best_start + k) % n]);
+    }
+    out
+}
+
+fn select_classified_faces(classified: &ClassifiedFaces, operation: OverlayOp) -> Vec<Polygon> {
+    let n = classified.rings.len();
+    let mut out = Vec::<Polygon>::new();
+    out.reserve(n / 2);
+
+    let state_select = match (&classified.state_a, &classified.state_b) {
+        (Some(a), Some(b)) if a.len() == n && b.len() == n => Some((a, b)),
+        _ => None,
+    };
+
+    for idx in 0..n {
+        let keep = if let Some((state_a, state_b)) = state_select {
+            keep_face_for_operation_state(state_a[idx], state_b[idx], operation)
+        } else {
+            let a = classified.in_a[idx];
+            let b = classified.in_b[idx];
+            match operation {
+                OverlayOp::Intersection => a && b,
+                OverlayOp::Union => a || b,
+                OverlayOp::DifferenceAB => a && !b,
+                OverlayOp::SymmetricDifference => a ^ b,
+            }
+        };
+        if keep {
+            out.push(Polygon::new(
+                LinearRing::new(classified.rings[idx].coords.clone()),
+                vec![],
+            ));
+        }
+    }
+
+    out
+}
+
+/// Face-decomposed polygon intersection.
+#[inline]
+pub fn polygon_intersection_faces(a: &Polygon, b: &Polygon, epsilon: f64) -> Vec<Polygon> {
+    polygon_overlay_faces(a, b, OverlayOp::Intersection, epsilon)
+}
+
+/// Face-decomposed polygon union.
+#[inline]
+pub fn polygon_union_faces(a: &Polygon, b: &Polygon, epsilon: f64) -> Vec<Polygon> {
+    polygon_overlay_faces(a, b, OverlayOp::Union, epsilon)
+}
+
+/// Face-decomposed polygon difference `A \ B`.
+#[inline]
+pub fn polygon_difference_faces(a: &Polygon, b: &Polygon, epsilon: f64) -> Vec<Polygon> {
+    polygon_overlay_faces(a, b, OverlayOp::DifferenceAB, epsilon)
+}
+
+/// Face-decomposed polygon symmetric difference.
+#[inline]
+pub fn polygon_sym_diff_faces(a: &Polygon, b: &Polygon, epsilon: f64) -> Vec<Polygon> {
+    polygon_overlay_faces(a, b, OverlayOp::SymmetricDifference, epsilon)
+}
+
+/// Dissolved polygon overlay output for an operation.
+///
+/// This merges adjacent selected faces by canceling shared interior boundaries.
+pub fn polygon_overlay(a: &Polygon, b: &Polygon, operation: OverlayOp, epsilon: f64) -> Vec<Polygon> {
+    let eps = normalized_eps(epsilon);
+    if let Some(result) = containment_overlay(a, b, operation, eps) {
+        return normalize_polygons(result, eps);
+    }
+    if !a.holes.is_empty() || !b.holes.is_empty() {
+        if let Some(result) = overlay_hole_bearing_by_edge_labels(a, b, operation, eps) {
+            return normalize_polygons(result, eps);
+        }
+    }
+    let faces = polygon_overlay_faces(a, b, operation, eps);
+    let dissolved = dissolve_faces(&faces, eps);
+    normalize_polygons(dissolved, eps)
+}
+
+/// Precision-aware dissolved polygon overlay output for an operation.
+///
+/// Inputs are snapped to the provided precision model before overlay processing.
+pub fn polygon_overlay_with_precision(
+    a: &Polygon,
+    b: &Polygon,
+    operation: OverlayOp,
+    precision: PrecisionModel,
+) -> Vec<Polygon> {
+    let sa = precision.apply_polygon(a);
+    let sb = precision.apply_polygon(b);
+    polygon_overlay(&sa, &sb, operation, precision.epsilon())
+}
+
+/// Compute all dissolved polygon overlay outputs in one pass.
+///
+/// This reuses a single arrangement/face classification to derive all operations.
+pub fn polygon_overlay_all(a: &Polygon, b: &Polygon, epsilon: f64) -> OverlayOutputs {
+    let eps = normalized_eps(epsilon);
+    let overlay_debug = std::env::var("WB_OVERLAY_DEBUG").is_ok();
+
+    if !a.holes.is_empty() || !b.holes.is_empty() {
+        let out = OverlayOutputs {
+            intersection: polygon_intersection(a, b, eps),
+            union: polygon_union(a, b, eps),
+            difference_ab: polygon_difference(a, b, eps),
+            sym_diff: polygon_sym_diff(a, b, eps),
+        };
+        if overlay_debug {
+            let i: f64 = out.intersection.iter().map(polygon_abs_area).sum();
+            let u: f64 = out.union.iter().map(polygon_abs_area).sum();
+            let d: f64 = out.difference_ab.iter().map(polygon_abs_area).sum();
+            let x: f64 = out.sym_diff.iter().map(polygon_abs_area).sum();
+            let d_ba: f64 = polygon_difference(b, a, eps)
+                .iter()
+                .map(polygon_abs_area)
+                .sum();
+            let area_a = polygon_abs_area(a);
+            let area_b = polygon_abs_area(b);
+            eprintln!(
+                "overlay_debug: overlay_all(hole) i={i:.6} u={u:.6} d={d:.6} x={x:.6} d_ba={d_ba:.6} area_a={area_a:.6} area_b={area_b:.6}"
+            );
+        }
+        return out;
+    }
+
+    if prefer_separate_overlay_all(a, b) {
+        return OverlayOutputs {
+            intersection: polygon_intersection(a, b, eps),
+            union: polygon_union(a, b, eps),
+            difference_ab: polygon_difference(a, b, eps),
+            sym_diff: polygon_sym_diff(a, b, eps),
+        };
+    }
+
+    // Reuse containment fast path logic through existing per-op API.
+    if containment_overlay(a, b, OverlayOp::Intersection, eps).is_some()
+        || containment_overlay(a, b, OverlayOp::Union, eps).is_some()
+    {
+        return OverlayOutputs {
+            intersection: polygon_intersection(a, b, eps),
+            union: polygon_union(a, b, eps),
+            difference_ab: polygon_difference(a, b, eps),
+            sym_diff: polygon_sym_diff(a, b, eps),
+        };
+    }
+
+    // If boundaries do not cross, per-op paths are typically cheaper than
+    // constructing and classifying a full shared arrangement.
+    if !polygon_boundaries_cross(a, b, eps) {
+        return OverlayOutputs {
+            intersection: polygon_intersection(a, b, eps),
+            union: polygon_union(a, b, eps),
+            difference_ab: polygon_difference(a, b, eps),
+            sym_diff: polygon_sym_diff(a, b, eps),
+        };
+    }
+
+    let classified = classify_overlay_faces(a, b, eps);
+    let inter_faces = select_classified_faces(&classified, OverlayOp::Intersection);
+    let union_faces = select_classified_faces(&classified, OverlayOp::Union);
+    let diff_faces = select_classified_faces(&classified, OverlayOp::DifferenceAB);
+    let xor_faces = select_classified_faces(&classified, OverlayOp::SymmetricDifference);
+
+    OverlayOutputs {
+        intersection: normalize_polygons(dissolve_faces(&inter_faces, eps), eps),
+        union: normalize_polygons(dissolve_faces(&union_faces, eps), eps),
+        difference_ab: normalize_polygons(dissolve_faces(&diff_faces, eps), eps),
+        sym_diff: normalize_polygons(dissolve_faces(&xor_faces, eps), eps),
+    }
+}
+
+fn overlay_hole_bearing_by_edge_labels(
+    a: &Polygon,
+    b: &Polygon,
+    operation: OverlayOp,
+    eps: f64,
+) -> Option<Vec<Polygon>> {
+    let overlay_debug = std::env::var("WB_OVERLAY_DEBUG").is_ok();
+    let overlay_trace_faces = std::env::var("WB_OVERLAY_TRACE_FACES").is_ok();
+    let call_id = HOLE_EDGE_CALL_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+
+    if overlay_debug {
+        eprintln!(
+            "overlay_debug: edge_call id={} op={:?} area_a={:.6} area_b={:.6} holes_a={} holes_b={} eps={:.3e}",
+            call_id,
+            operation,
+            polygon_abs_area(a),
+            polygon_abs_area(b),
+            a.holes.len(),
+            b.holes.len(),
+            eps
+        );
+    }
+    let mut boundaries = polygon_boundaries(a);
+    boundaries.extend(polygon_boundaries(b));
+
+    let graph_eps = eps.max(1.0e-9);
+    let noded = node_linestrings_with_options(
+        &boundaries,
+        NodingOptions {
+            epsilon: graph_eps,
+            strategy: NodingStrategy::SnapRounding,
+            precision: None,
+        },
+    );
+    let noded_segments = segmentize_noded_lines(&noded, graph_eps);
+    let noded = dedupe_noded_segments(&noded_segments, graph_eps);
+    let graph = TopologyGraph::from_noded_linestrings(&noded, graph_eps);
+
+    let mut diag_face_count = 0usize;
+    let mut diag_keep_face_count = 0usize;
+    let mut diag_drop_face_count = 0usize;
+    let mut diag_total_face_area = 0.0f64;
+    let mut diag_keep_face_area = 0.0f64;
+    let mut diag_drop_face_area = 0.0f64;
+
+    let expected_sides = if overlay_debug {
+        let face_rings = extract_faces_without_exterior_cycle(&graph, graph_eps);
+        let state_a = classify_hole_bearing_face_states(&graph, &face_rings, a, graph_eps);
+        let state_b = classify_hole_bearing_face_states(&graph, &face_rings, b, graph_eps);
+        let face_keep: Vec<bool> = state_a
+            .iter()
+            .zip(state_b.iter())
+            .map(|(sa, sb)| keep_face_for_operation_state(*sa, *sb, operation))
+            .collect();
+
+        diag_face_count = face_rings.len();
+        for (face_id, ((ring, _), keep)) in face_rings.iter().zip(face_keep.iter()).enumerate() {
+            let area = ring_signed_area(&ring.coords).abs();
+            diag_total_face_area += area;
+            if *keep {
+                diag_keep_face_count += 1;
+                diag_keep_face_area += area;
+            } else {
+                diag_drop_face_count += 1;
+                diag_drop_face_area += area;
+            }
+            if overlay_trace_faces {
+                eprintln!(
+                    "overlay_debug: face_keep id={} op={:?} face={} keep={} area={:.6} state_a={:?} state_b={:?}",
+                    call_id,
+                    operation,
+                    face_id,
+                    keep,
+                    area,
+                    state_a[face_id],
+                    state_b[face_id]
+                );
+            }
+        }
+
+        let mut edge_to_face = vec![usize::MAX; graph.edges.len()];
+        for (face_id, (_, edge_ids)) in face_rings.iter().enumerate() {
+            for &eid in edge_ids {
+                if eid < edge_to_face.len() {
+                    edge_to_face[eid] = face_id;
+                }
+            }
+        }
+
+        let mut sides = vec![(false, false); graph.edges.len()];
+        for eid in 0..graph.edges.len() {
+            let left_face = edge_to_face[eid];
+            let right_face = edge_to_face[eid ^ 1];
+            let keep_left = left_face != usize::MAX && face_keep[left_face];
+            let keep_right = right_face != usize::MAX && face_keep[right_face];
+            sides[eid] = (keep_left, keep_right);
+        }
+        Some(sides)
+    } else {
+        None
+    };
+
+    let mut diag_pairs = 0usize;
+    let mut diag_probe_transitions = 0usize;
+    let mut diag_face_transitions = 0usize;
+    let mut diag_transition_mismatch = 0usize;
+    let mut diag_orientation_mismatch = 0usize;
+
+    let mut selected = Vec::<LineString>::new();
+    for eid in 0..graph.edges.len() {
+        let edge = &graph.edges[eid];
+        if eid > edge.sym {
+            continue;
+        }
+
+        let p0 = graph.nodes[edge.from].coord;
+        let p1 = graph.nodes[edge.to].coord;
+        let dx = p1.x - p0.x;
+        let dy = p1.y - p0.y;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= graph_eps {
+            continue;
+        }
+
+        let mx = (p0.x + p1.x) * 0.5;
+        let my = (p0.y + p1.y) * 0.5;
+        let nx = -dy / len;
+        let ny = dx / len;
+        let probe = (graph_eps * 64.0).max(len * 1.0e-6);
+
+        let boundary_as_inside = matches!(operation, OverlayOp::Intersection);
+
+        let Some(a_left) = probe_side_membership(
+            mx,
+            my,
+            nx,
+            ny,
+            1.0,
+            a,
+            probe,
+            graph_eps,
+            boundary_as_inside,
+        )
+        else {
+            continue;
+        };
+        let Some(b_left) = probe_side_membership(
+            mx,
+            my,
+            nx,
+            ny,
+            1.0,
+            b,
+            probe,
+            graph_eps,
+            boundary_as_inside,
+        )
+        else {
+            continue;
+        };
+        let Some(a_right) = probe_side_membership(
+            mx,
+            my,
+            nx,
+            ny,
+            -1.0,
+            a,
+            probe,
+            graph_eps,
+            boundary_as_inside,
+        )
+        else {
+            continue;
+        };
+        let Some(b_right) = probe_side_membership(
+            mx,
+            my,
+            nx,
+            ny,
+            -1.0,
+            b,
+            probe,
+            graph_eps,
+            boundary_as_inside,
+        )
+        else {
+            continue;
+        };
+
+        let keep_left = overlay_membership(a_left, b_left, operation);
+        let keep_right = overlay_membership(a_right, b_right, operation);
+
+        if let Some(expected) = &expected_sides {
+            let (exp_left, exp_right) = expected[eid];
+            let probe_transition = keep_left != keep_right;
+            let face_transition = exp_left != exp_right;
+            diag_pairs += 1;
+            if probe_transition {
+                diag_probe_transitions += 1;
+            }
+            if face_transition {
+                diag_face_transitions += 1;
+            }
+            if probe_transition != face_transition {
+                diag_transition_mismatch += 1;
+            } else if probe_transition && keep_left != exp_left {
+                diag_orientation_mismatch += 1;
+            }
+        }
+
+        if keep_left == keep_right {
+            continue;
+        }
+
+        if keep_left {
+            selected.push(LineString::new(vec![p0, p1]));
+        } else {
+            selected.push(LineString::new(vec![p1, p0]));
+        }
+    }
+
+    if overlay_debug {
+        eprintln!(
+            "overlay_debug: face_area_diag id={} op={:?} faces={} keep_faces={} drop_faces={} total_face_area={:.6} keep_face_area={:.6} drop_face_area={:.6}",
+            call_id,
+            operation,
+            diag_face_count,
+            diag_keep_face_count,
+            diag_drop_face_count,
+            diag_total_face_area,
+            diag_keep_face_area,
+            diag_drop_face_area
+        );
+    }
+
+    if selected.is_empty() {
+        if overlay_debug {
+            eprintln!(
+                "overlay_debug: edge_diag id={} op={:?} pairs={} probe_transitions={} face_transitions={} transition_mismatch={} orientation_mismatch={} selected_edges=0 rings=0 keep_faces={} keep_face_area={:.6} ring_area=0.000000",
+                call_id,
+                operation,
+                diag_pairs,
+                diag_probe_transitions,
+                diag_face_transitions,
+                diag_transition_mismatch,
+                diag_orientation_mismatch,
+                diag_keep_face_count,
+                diag_keep_face_area
+            );
+        }
+        return Some(Vec::new());
+    }
+
+    let boundary_graph = TopologyGraph::from_noded_linestrings(&selected, graph_eps);
+    let rings = boundary_graph.extract_bounded_face_rings(graph_eps);
+    let rings_area: f64 = rings
+        .iter()
+        .map(|r| ring_signed_area(&r.coords).abs())
+        .sum();
+
+    if overlay_debug {
+        eprintln!(
+            "overlay_debug: edge_diag id={} op={:?} pairs={} probe_transitions={} face_transitions={} transition_mismatch={} orientation_mismatch={} selected_edges={} rings={} keep_faces={} keep_face_area={:.6} ring_area={:.6}",
+            call_id,
+            operation,
+            diag_pairs,
+            diag_probe_transitions,
+            diag_face_transitions,
+            diag_transition_mismatch,
+            diag_orientation_mismatch,
+            selected.len(),
+            rings.len(),
+            diag_keep_face_count,
+            diag_keep_face_area,
+            rings_area
+        );
+    }
+    if rings.is_empty() {
+        return Some(Vec::new());
+    }
+
+    Some(polygonize_closed_linestrings(&rings, graph_eps))
+}
+
+#[inline]
+fn probe_side_membership(
+    mx: f64,
+    my: f64,
+    nx: f64,
+    ny: f64,
+    side_sign: f64,
+    poly: &Polygon,
+    base_probe: f64,
+    eps: f64,
+    boundary_as_inside: bool,
+) -> Option<bool> {
+    let mut saw_boundary = false;
+    for scale in [1.0, 4.0, 16.0, 64.0] {
+        let d = base_probe * scale * side_sign;
+        let p = Coord::xy(mx + nx * d, my + ny * d);
+        match classify_point_in_polygon_eps(p, poly, eps) {
+            PointInRing::Inside => return Some(true),
+            PointInRing::Outside => return Some(false),
+            PointInRing::Boundary => saw_boundary = true,
+        }
+    }
+    if saw_boundary {
+        return Some(boundary_as_inside);
+    }
+    None
+}
+
+#[inline]
+fn overlay_membership(a_in: bool, b_in: bool, operation: OverlayOp) -> bool {
+    match operation {
+        OverlayOp::Intersection => a_in && b_in,
+        OverlayOp::Union => a_in || b_in,
+        OverlayOp::DifferenceAB => a_in && !b_in,
+        OverlayOp::SymmetricDifference => a_in ^ b_in,
+    }
+}
+
+/// Precision-aware one-pass dissolved polygon overlay outputs.
+///
+/// Inputs are snapped to the provided precision model before overlay processing.
+pub fn polygon_overlay_all_with_precision(
+    a: &Polygon,
+    b: &Polygon,
+    precision: PrecisionModel,
+) -> OverlayOutputs {
+    let sa = precision.apply_polygon(a);
+    let sb = precision.apply_polygon(b);
+    polygon_overlay_all(&sa, &sb, precision.epsilon())
+}
+
+/// Dissolved polygon intersection.
+#[inline]
+pub fn polygon_intersection(a: &Polygon, b: &Polygon, epsilon: f64) -> Vec<Polygon> {
+    let eps = normalized_eps(epsilon);
+    let overlay_debug = std::env::var("WB_OVERLAY_DEBUG").is_ok();
+    if a.holes.len() + b.holes.len() == 4 {
+        if overlay_debug {
+            eprintln!(
+                "overlay_debug: intersection4h enter area_a={:.6} area_b={:.6} holes_a={} holes_b={} eps={:.3e}",
+                polygon_abs_area(a),
+                polygon_abs_area(b),
+                a.holes.len(),
+                b.holes.len(),
+                eps
+            );
+        }
+        let classified = classify_overlay_faces(a, b, eps);
+        let mut strict_faces = Vec::<Polygon>::new();
+        for idx in 0..classified.rings.len() {
+            let keep = match (&classified.state_a, &classified.state_b) {
+                (Some(sa), Some(sb)) if idx < sa.len() && idx < sb.len() => {
+                    sa[idx] == FaceMembershipState::Inside && sb[idx] == FaceMembershipState::Inside
+                }
+                _ => classified.in_a[idx] && classified.in_b[idx],
+            };
+            if keep {
+                strict_faces.push(Polygon::new(
+                    LinearRing::new(classified.rings[idx].coords.clone()),
+                    vec![],
+                ));
+            }
+        }
+        if overlay_debug {
+            let strict_face_area: f64 = strict_faces.iter().map(polygon_abs_area).sum();
+            eprintln!(
+                "overlay_debug: intersection4h strict_faces={} strict_face_area={:.6} classified_faces={}",
+                strict_faces.len(),
+                strict_face_area,
+                classified.rings.len()
+            );
+        }
+        let base = normalize_polygons(dissolve_faces(&strict_faces, eps), eps);
+        if overlay_debug {
+            let base_area: f64 = base.iter().map(polygon_abs_area).sum();
+            eprintln!(
+                "overlay_debug: intersection4h base_polys={} base_area={:.6}",
+                base.len(),
+                base_area
+            );
+        }
+        // Representative-point filtering in this branch can reject valid overlap
+        // fragments when the chosen point lands on unstable local configurations.
+        // Keep dissolved candidates and let the clipping stage enforce I subset A/B.
+        let out = base;
+        if overlay_debug {
+            let out_area: f64 = out.iter().map(polygon_abs_area).sum();
+            eprintln!(
+                "overlay_debug: intersection4h rep_filter_polys={} rep_filter_area={:.6}",
+                out.len(),
+                out_area
+            );
+        }
+
+        // Enforce I subset A and I subset B by clipping candidates against
+        // outside-of-A / outside-of-B fragments.
+        let clip_intersection_candidates =
+            |candidates: Vec<Polygon>, label: &str| -> Vec<Polygon> {
+                let mut clipped = Vec::<Polygon>::new();
+                for (poly_idx, poly) in candidates.into_iter().enumerate() {
+                    let cuts_a = polygon_overlay(&poly, a, OverlayOp::DifferenceAB, eps);
+                    let cuts_b = polygon_overlay(&poly, b, OverlayOp::DifferenceAB, eps);
+                    let cuts_a_count = cuts_a.len();
+                    let cuts_b_count = cuts_b.len();
+                    let cuts_a_area: f64 = cuts_a.iter().map(polygon_abs_area).sum();
+                    let cuts_b_area: f64 = cuts_b.iter().map(polygon_abs_area).sum();
+                    let mut cuts = cuts_a;
+                    cuts.extend(cuts_b);
+                    let mut kept =
+                        subtract_many_from_polygons(std::slice::from_ref(&poly), &cuts, eps);
+                    if overlay_debug {
+                        let poly_area = polygon_abs_area(&poly);
+                        let kept_area: f64 = kept.iter().map(polygon_abs_area).sum();
+                        eprintln!(
+                            "overlay_debug: intersection4h clip label={} poly={} area={:.6} cuts_a={} cuts_a_area={:.6} cuts_b={} cuts_b_area={:.6} kept_parts={} kept_area={:.6}",
+                            label,
+                            poly_idx,
+                            poly_area,
+                            cuts_a_count,
+                            cuts_a_area,
+                            cuts_b_count,
+                            cuts_b_area,
+                            kept.len(),
+                            kept_area
+                        );
+                    }
+                    clipped.append(&mut kept);
+                }
+                let clipped = normalize_polygons(clipped, eps);
+                if overlay_debug {
+                    let clipped_area: f64 = clipped.iter().map(polygon_abs_area).sum();
+                    eprintln!(
+                        "overlay_debug: intersection4h clipped label={} polys={} area={:.6}",
+                        label,
+                        clipped.len(),
+                        clipped_area
+                    );
+                }
+                clipped
+            };
+
+        let special_clipped = clip_intersection_candidates(out, "special");
+        let direct_raw = polygon_overlay(a, b, OverlayOp::Intersection, eps);
+        let direct_clipped = clip_intersection_candidates(direct_raw, "direct");
+
+        let special_area: f64 = special_clipped.iter().map(polygon_abs_area).sum();
+        let direct_area: f64 = direct_clipped.iter().map(polygon_abs_area).sum();
+        let area_tol = 1.0e-6_f64.max((special_area.abs().max(direct_area.abs())) * 1.0e-12);
+
+        if overlay_debug {
+            eprintln!(
+                "overlay_debug: intersection4h select special_area={:.6} direct_area={:.6} area_tol={:.6e}",
+                special_area,
+                direct_area,
+                area_tol
+            );
+        }
+
+        if direct_area > special_area + area_tol {
+            return direct_clipped;
+        }
+        return special_clipped;
+    }
+    polygon_overlay(a, b, OverlayOp::Intersection, epsilon)
+}
+
+/// Precision-aware dissolved polygon intersection.
+#[inline]
+pub fn polygon_intersection_with_precision(
+    a: &Polygon,
+    b: &Polygon,
+    precision: PrecisionModel,
+) -> Vec<Polygon> {
+    polygon_overlay_with_precision(a, b, OverlayOp::Intersection, precision)
+}
+
+/// Dissolved polygon union.
+#[inline]
+pub fn polygon_union(a: &Polygon, b: &Polygon, epsilon: f64) -> Vec<Polygon> {
+    let eps = normalized_eps(epsilon);
+    if shell_strictly_inside(a, b, eps) {
+        return vec![a.clone()];
+    }
+    if shell_strictly_inside(b, a, eps) {
+        return vec![b.clone()];
+    }
+    polygon_overlay(a, b, OverlayOp::Union, epsilon)
+}
+
+/// Unary union of many polygons without source-membership tracking.
+pub fn polygon_unary_union(polys: &[Polygon], epsilon: f64) -> Vec<Polygon> {
+    polygon_unary_union_with_options(
+        polys,
+        UnaryDissolveOptions {
+            epsilon,
+            ..UnaryDissolveOptions::default()
+        },
+    )
+}
+
+/// Unary union of many polygons with explicit strategy options and no membership tracking.
+pub fn polygon_unary_union_with_options(
+    polys: &[Polygon],
+    options: UnaryDissolveOptions,
+) -> Vec<Polygon> {
+    if polys.is_empty() {
+        return Vec::new();
+    }
+
+    if polys.len() == 1 {
+        return vec![polys[0].clone()];
+    }
+
+    let eps = normalized_eps(options.epsilon);
+    if polys.len() == 2 {
+        if shell_strictly_inside(&polys[0], &polys[1], eps) {
+            return vec![polys[0].clone()];
+        }
+        if shell_strictly_inside(&polys[1], &polys[0], eps) {
+            return vec![polys[1].clone()];
+        }
+    }
+
+    match options.strategy {
+        UnaryDissolveStrategy::GraphDriven => unary_union_graph(
+            polys,
+            eps,
+            options.noding,
+            options.preferred_union_precision,
+        ),
+        UnaryDissolveStrategy::CascadedHeuristic => unary_union_componentized(
+            polys,
+            eps,
+            true,
+            options.preferred_union_precision,
+        ),
+        UnaryDissolveStrategy::PairwiseHeuristic => unary_union_componentized(
+            polys,
+            eps,
+            false,
+            options.preferred_union_precision,
+        ),
+    }
+}
+
+/// Dissolve many polygons into non-overlapping groups.
+///
+/// The result includes both dissolved geometry and source membership so callers
+/// can aggregate attributes at the application layer.
+pub fn polygon_unary_dissolve(polys: &[Polygon], epsilon: f64) -> Vec<UnaryDissolveGroup> {
+    polygon_unary_dissolve_with_options(
+        polys,
+        UnaryDissolveOptions {
+            epsilon,
+            ..UnaryDissolveOptions::default()
+        },
+    )
+}
+
+/// Dissolve many polygons into non-overlapping groups with explicit strategy options.
+pub fn polygon_unary_dissolve_with_options(
+    polys: &[Polygon],
+    options: UnaryDissolveOptions,
+) -> Vec<UnaryDissolveGroup> {
+    if polys.is_empty() {
+        return Vec::new();
+    }
+
+    if polys.len() == 1 {
+        return vec![UnaryDissolveGroup {
+            poly: polys[0].clone(),
+            source_indices: vec![0],
+        }];
+    }
+
+    let eps = normalized_eps(options.epsilon);
+
+    match options.strategy {
+        UnaryDissolveStrategy::GraphDriven => unary_dissolve_graph(
+            polys,
+            eps,
+            options.noding,
+            options.preferred_union_precision,
+        ),
+        UnaryDissolveStrategy::CascadedHeuristic => unary_dissolve_componentized(
+            polys,
+            eps,
+            true,
+            options.preferred_union_precision,
+        ),
+        UnaryDissolveStrategy::PairwiseHeuristic => unary_dissolve_componentized(
+            polys,
+            eps,
+            false,
+            options.preferred_union_precision,
+        ),
+    }
+}
+
+fn unary_dissolve_componentized(
+    polys: &[Polygon],
+    eps: f64,
+    cascaded: bool,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<UnaryDissolveGroup> {
+    let components = source_components_by_non_point_connectivity(polys, eps);
+
+    #[cfg(feature = "parallel")]
+    {
+        if components.len() >= 4 {
+            return components
+                .par_iter()
+                .map(|comp| {
+                    if cascaded {
+                        dissolve_component_cascaded(polys, comp, eps, preferred_precision)
+                    } else {
+                        dissolve_component(polys, comp, eps, preferred_precision)
+                    }
+                })
+                .flatten()
+                .collect();
+        }
+    }
+
+    let mut out = Vec::<UnaryDissolveGroup>::new();
+    for comp in components {
+        if cascaded {
+            out.extend(dissolve_component_cascaded(polys, &comp, eps, preferred_precision));
+        } else {
+            out.extend(dissolve_component(polys, &comp, eps, preferred_precision));
+        }
+    }
+    out
+}
+
+fn unary_union_componentized(
+    polys: &[Polygon],
+    eps: f64,
+    cascaded: bool,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<Polygon> {
+    let components = source_components_by_non_point_connectivity(polys, eps);
+
+    #[cfg(feature = "parallel")]
+    {
+        if components.len() >= 4 {
+            return components
+                .par_iter()
+                .map(|comp| {
+                    if cascaded {
+                        union_component_cascaded(polys, comp, eps, preferred_precision)
+                    } else {
+                        union_component(polys, comp, eps, preferred_precision)
+                    }
+                })
+                .flatten()
+                .collect();
+        }
+    }
+
+    let mut out = Vec::<Polygon>::new();
+    for comp in components {
+        if cascaded {
+            out.extend(union_component_cascaded(polys, &comp, eps, preferred_precision));
+        } else {
+            out.extend(union_component(polys, &comp, eps, preferred_precision));
+        }
+    }
+    out
+}
+
+fn unary_dissolve_graph(
+    polys: &[Polygon],
+    eps: f64,
+    noding: NodingOptions,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<UnaryDissolveGroup> {
+    let partitions = source_components_by_non_point_connectivity(polys, eps);
+    if partitions.len() > 1 {
+        let mut out = Vec::<UnaryDissolveGroup>::new();
+        for part in partitions {
+            let subset: Vec<Polygon> = part.iter().map(|&idx| polys[idx].clone()).collect();
+            let mut groups = unary_dissolve_graph_component(&subset, eps, noding, preferred_precision);
+            for g in &mut groups {
+                for idx in &mut g.source_indices {
+                    *idx = part[*idx];
+                }
+                g.source_indices.sort_unstable();
+                g.source_indices.dedup();
+            }
+            out.extend(groups);
+        }
+        return out;
+    }
+
+    unary_dissolve_graph_component(polys, eps, noding, preferred_precision)
+}
+
+fn unary_union_graph(
+    polys: &[Polygon],
+    eps: f64,
+    noding: NodingOptions,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<Polygon> {
+    let partitions = source_components_by_non_point_connectivity(polys, eps);
+    if partitions.len() > 1 {
+        let mut out = Vec::<Polygon>::new();
+        for part in partitions {
+            let subset: Vec<Polygon> = part.iter().map(|&idx| polys[idx].clone()).collect();
+            out.extend(unary_union_graph_component(
+                &subset,
+                eps,
+                noding,
+                preferred_precision,
+            ));
+        }
+        return out;
+    }
+
+    unary_union_graph_component(polys, eps, noding, preferred_precision)
+}
+
+fn unary_dissolve_graph_component(
+    polys: &[Polygon],
+    eps: f64,
+    noding: NodingOptions,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<UnaryDissolveGroup> {
+    let mut boundaries = Vec::<LineString>::new();
+    for poly in polys {
+        boundaries.extend(polygon_boundaries(poly));
+    }
+
+    let graph = TopologyGraph::from_linestrings_with_options(
+        &boundaries,
+        NodingOptions {
+            epsilon: eps,
+            ..noding
+        },
+    );
+
+    // Extract bounded face rings together with the directed edge ids on each boundary.
+    let face_rings = extract_faces_without_exterior_cycle(&graph, eps);
+    if face_rings.is_empty() {
+        return Vec::new();
+    }
+
+    // Assign a depth delta to every directed edge from source ring membership.
+    // delta[e] = depth(left face of e) – depth(right face of e).
+    // This is a purely topological computation — no point-in-polygon probing.
+    let mut edge_delta = vec![0i32; graph.edges.len()];
+    compute_unary_edge_deltas(&graph, polys, eps, &mut edge_delta);
+
+    // BFS from the exterior region to classify each face as depth > 0 (include) or not.
+    let included = classify_faces_by_depth(&graph, &face_rings, &edge_delta);
+
+    let source_geoms: Vec<Geometry> = polys.iter().cloned().map(Geometry::Polygon).collect();
+    let source_index = SpatialIndex::from_geometries(&source_geoms);
+
+    // Assign source membership at face granularity, then propagate memberships
+    // through cascaded dissolve merges instead of rescanning all dissolved outputs.
+    let mut candidate_groups = Vec::<UnaryDissolveGroup>::new();
+    for ((ring, _), &inc) in face_rings.iter().zip(included.iter()) {
+        if !inc {
+            continue;
+        }
+
+        let poly = Polygon::new(LinearRing::new(ring.coords.clone()), vec![]);
+        let mut source_indices = Vec::<usize>::new();
+        let poly_geom = Geometry::Polygon(poly.clone());
+        let candidates = source_index.query_geometry(&poly_geom);
+        for idx in candidates {
+            if idx >= polys.len() {
+                continue;
+            }
+            if polygons_overlap_fast(&poly, &polys[idx], eps) {
+                source_indices.push(idx);
+            }
+        }
+        source_indices.sort_unstable();
+        source_indices.dedup();
+        candidate_groups.push(UnaryDissolveGroup { poly, source_indices });
+    }
+
+    dissolve_pre_grouped_cascaded(candidate_groups, eps, preferred_precision)
+}
+
+fn unary_union_graph_component(
+    polys: &[Polygon],
+    eps: f64,
+    noding: NodingOptions,
+    _preferred_precision: Option<PrecisionModel>,
+) -> Vec<Polygon> {
+    let mut boundaries = Vec::<LineString>::new();
+    for poly in polys {
+        boundaries.extend(polygon_boundaries(poly));
+    }
+
+    let graph = TopologyGraph::from_linestrings_with_options(
+        &boundaries,
+        NodingOptions {
+            epsilon: eps,
+            ..noding
+        },
+    );
+
+    let face_rings = extract_faces_without_exterior_cycle(&graph, eps);
+    if face_rings.is_empty() {
+        return Vec::new();
+    }
+
+    let mut edge_delta = vec![0i32; graph.edges.len()];
+    compute_unary_edge_deltas(&graph, polys, eps, &mut edge_delta);
+    let included = classify_faces_by_depth(&graph, &face_rings, &edge_delta);
+
+    let candidate_rings: Vec<Vec<Coord>> = face_rings
+        .iter()
+        .zip(included.iter())
+        .filter_map(|((ring, _), &inc)| if inc { Some(ring.coords.clone()) } else { None })
+        .collect();
+
+    if candidate_rings.is_empty() {
+        return Vec::new();
+    }
+
+    // Graph-driven union already computes included bounded faces from a single
+    // noded arrangement. Assemble shells/holes directly from these rings to
+    // avoid an additional pairwise overlay-union stage.
+    assemble_polygons_from_rings(candidate_rings, eps)
+}
+
+/// Compute depth deltas for every directed edge in `graph` based on which source
+/// polygon ring segments contain each edge's midpoint.
+///
+/// `delta[e]` = depth(left face of e) − depth(right face of e).
+/// For a CCW exterior ring segment whose direction matches the edge direction: delta = +1.
+/// Twin edges always satisfy `delta[e ^ 1] = −delta[e]`.
+fn compute_unary_edge_deltas(
+    graph: &TopologyGraph,
+    polys: &[Polygon],
+    eps: f64,
+    delta: &mut [i32],
+) {
+    // Build a spatial index on source polygons so we only check candidates
+    // near each edge midpoint rather than all N polygons.
+    let geoms: Vec<Geometry> = polys.iter().cloned().map(Geometry::Polygon).collect();
+    let index = SpatialIndex::from_geometries(&geoms);
+
+    // Edges are stored in pairs (e, sym(e)) = (even_id, even_id+1).
+    let mut i = 0;
+    while i < graph.edges.len() {
+        let e = &graph.edges[i];
+        let a = graph.nodes[e.from].coord;
+        let b = graph.nodes[e.to].coord;
+        let mx = (a.x + b.x) * 0.5;
+        let my = (a.y + b.y) * 0.5;
+        let m = Coord::xy(mx, my);
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+
+        // Query index for polygons whose envelopes contain the midpoint.
+        let candidates = index.query_point(m);
+
+        let mut d = 0i32;
+        for poly_idx in candidates {
+            if poly_idx >= polys.len() {
+                continue;
+            }
+            let poly = &polys[poly_idx];
+            let ext_ccw = unary_ring_signed_area(&poly.exterior.coords) >= 0.0;
+            d += unary_ring_segment_delta(&poly.exterior.coords, m, dx, dy, ext_ccw, eps);
+            for hole in &poly.holes {
+                let hole_ccw = unary_ring_signed_area(&hole.coords) >= 0.0;
+                d += unary_ring_segment_delta(&hole.coords, m, dx, dy, hole_ccw, eps);
+            }
+        }
+
+        delta[i] = d;
+        if i + 1 < delta.len() {
+            delta[i + 1] = -d;
+        }
+        i += 2;
+    }
+}
+
+/// Returns the delta contribution (+1, −1, or 0) from one ring to the directed
+/// edge whose midpoint is `m` and whose direction vector is `(dx, dy)`.
+///
+/// `ring_ccw`: true if the ring winds counter-clockwise (positive signed area),
+/// which is the convention for exterior rings.
+fn unary_ring_segment_delta(
+    ring: &[Coord],
+    m: Coord,
+    dx: f64,
+    dy: f64,
+    ring_ccw: bool,
+    eps: f64,
+) -> i32 {
+    let ring_sign: i32 = if ring_ccw { 1 } else { -1 };
+    let n = ring.len();
+    if n < 2 {
+        return 0;
+    }
+    for i in 0..(n - 1) {
+        let c = ring[i];
+        let d = ring[i + 1];
+        if !point_on_segment_eps(m, c, d, eps) {
+            continue;
+        }
+        let cd_x = d.x - c.x;
+        let cd_y = d.y - c.y;
+        // dot > 0 means same general direction as the ring segment.
+        let dot = dx * cd_x + dy * cd_y;
+        let dir_sign: i32 = if dot >= 0.0 { 1 } else { -1 };
+        return ring_sign * dir_sign;
+    }
+    0
+}
+
+/// Shoelace signed area of a ring (positive = CCW, negative = CW).
+fn unary_ring_signed_area(coords: &[Coord]) -> f64 {
+    if coords.len() < 4 {
+        return 0.0;
+    }
+    let mut s = 0.0f64;
+    for i in 0..(coords.len() - 1) {
+        let a = coords[i];
+        let b = coords[i + 1];
+        s += a.x * b.y - b.x * a.y;
+    }
+    0.5 * s
+}
+
+/// Classify bounded faces by depth using BFS from the unbounded exterior region.
+///
+/// Returns one bool per face (in the same order as `face_rings`): true when
+/// `depth > 0`, meaning the face is inside at least one source polygon and
+/// should be included in the union result.
+///
+/// This replaces point-in-polygon probing entirely: face membership is derived
+/// from the edge depth deltas alone, which makes it immune to boundary-zone
+/// misclassifications near short source polygon segments.
+fn classify_faces_by_depth(
+    graph: &TopologyGraph,
+    face_rings: &[(LineString, Vec<usize>)],
+    delta: &[i32],
+) -> Vec<bool> {
+    let n_faces = face_rings.len();
+    let n_edges = graph.edges.len();
+
+    // Map each directed edge id to the bounded face ring that contains it.
+    // Edges not in this map belong to the unbounded exterior face (depth 0).
+    let mut edge_to_face = vec![usize::MAX; n_edges];
+    for (face_id, (_, edge_ids)) in face_rings.iter().enumerate() {
+        for &eid in edge_ids {
+            if eid < n_edges {
+                edge_to_face[eid] = face_id;
+            }
+        }
+    }
+
+    // BFS depth propagation.
+    // Seed: for each bounded face, find edges whose twin is in the exterior (unbounded
+    // face, depth 0).  Crossing from the exterior through sym(eid) into the face gives:
+    //   depth(face) = depth(exterior) − delta[sym(eid)]
+    //               = 0 − (−delta[eid]) = delta[eid]
+    let mut face_depth = vec![i32::MIN; n_faces];
+    let mut queue = VecDeque::<usize>::new();
+    let face_sign: Vec<i32> = face_rings
+        .iter()
+        .map(|(ring, _)| {
+            // CCW ring traversal means the face lies on the left side of edge ids.
+            // CW means the face lies on the right side and depth transitions invert.
+            if ring_signed_area(&ring.coords) >= 0.0 { 1 } else { -1 }
+        })
+        .collect();
+
+    for face_id in 0..n_faces {
+        // Find the first exterior-adjacent edge that provides a non-zero seed,
+        // falling back to any exterior-adjacent edge if none gives a non-zero delta.
+        let mut seed = i32::MIN;
+        let mut fallback_seed = i32::MIN;
+        for &eid in &face_rings[face_id].1 {
+            let sym = eid ^ 1;
+            if sym < n_edges && edge_to_face[sym] == usize::MAX {
+                let d = if eid < delta.len() { delta[eid] } else { 0 };
+                let signed_d = face_sign[face_id] * d;
+                if signed_d != 0 && seed == i32::MIN {
+                    seed = signed_d;
+                    break;
+                }
+                if fallback_seed == i32::MIN {
+                    fallback_seed = signed_d;
+                }
+            }
+        }
+        let chosen = if seed != i32::MIN { seed } else { fallback_seed };
+        if chosen != i32::MIN {
+            face_depth[face_id] = chosen;
+            queue.push_back(face_id);
+        }
+    }
+
+    // BFS: propagate from seeded faces.
+    // Crossing edge `eid` (in current face's boundary) into the adjacent face gives:
+    //   depth(adjacent) = depth(current) − delta[eid]
+    while let Some(current_id) = queue.pop_front() {
+        let d = face_depth[current_id];
+        let sign = face_sign[current_id];
+        let edge_ids = face_rings[current_id].1.clone();
+        for eid in edge_ids {
+            let sym = eid ^ 1;
+            if sym >= n_edges {
+                continue;
+            }
+            let adj = edge_to_face[sym];
+            if adj == usize::MAX || face_depth[adj] != i32::MIN {
+                continue; // exterior or already visited
+            }
+            let e_delta = if eid < delta.len() { delta[eid] } else { 0 };
+            face_depth[adj] = d - sign * e_delta;
+            queue.push_back(adj);
+        }
+    }
+
+    // Some arrangements can form bounded-face islands disconnected from exterior-adjacent
+    // seeds. Reseed each unreached island from one face-local edge delta, then run the
+    // same BFS propagation over that component before using conservative per-face fallback.
+    let mut reseeded_components = 0usize;
+    for face_id in 0..n_faces {
+        if face_depth[face_id] != i32::MIN {
+            continue;
+        }
+
+        let seed = face_sign[face_id]
+            * face_rings[face_id]
+                .1
+                .first()
+                .and_then(|&eid| delta.get(eid).copied())
+                .unwrap_or(0);
+        face_depth[face_id] = seed;
+        queue.push_back(face_id);
+        reseeded_components += 1;
+
+        while let Some(current_id) = queue.pop_front() {
+            let d = face_depth[current_id];
+            let sign = face_sign[current_id];
+            let edge_ids = face_rings[current_id].1.clone();
+            for eid in edge_ids {
+                let sym = eid ^ 1;
+                if sym >= n_edges {
+                    continue;
+                }
+                let adj = edge_to_face[sym];
+                if adj == usize::MAX || face_depth[adj] != i32::MIN {
+                    continue;
+                }
+                let e_delta = if eid < delta.len() { delta[eid] } else { 0 };
+                face_depth[adj] = d - sign * e_delta;
+                queue.push_back(adj);
+            }
+        }
+    }
+
+    // Final conservative fallback should now be rare and indicates atypical topology.
+    let mut fallback_count = 0usize;
+    for face_id in 0..n_faces {
+        if face_depth[face_id] == i32::MIN {
+            fallback_count += 1;
+            face_depth[face_id] = face_sign[face_id]
+                * face_rings[face_id]
+                    .1
+                    .first()
+                    .and_then(|&eid| delta.get(eid).copied())
+                    .unwrap_or(0);
+        }
+    }
+
+    if fallback_count > 0 {
+        eprintln!(
+            "WARNING: classify_faces_by_depth: {} face(s) required conservative fallback after reseeding {} isolated component(s)",
+            fallback_count,
+            reseeded_components
+        );
+    }
+
+    face_depth.iter().map(|&d| d > 0).collect()
+}
+
+fn polygons_overlap_fast(a: &Polygon, b: &Polygon, eps: f64) -> bool {
+    if let (Some(ea), Some(eb)) = (a.envelope(), b.envelope()) {
+        if !ea.intersects(&eb) {
+            return false;
+        }
+    }
+
+    if polygon_boundaries_cross(a, b, eps) {
+        return true;
+    }
+
+    if let Some(p) = a.exterior.coords.first().copied() {
+        if matches!(classify_point_in_polygon_eps(p, b, eps), PointInRing::Inside | PointInRing::Boundary) {
+            return true;
+        }
+    }
+
+    if let Some(p) = b.exterior.coords.first().copied() {
+        if matches!(classify_point_in_polygon_eps(p, a, eps), PointInRing::Inside | PointInRing::Boundary) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn source_components_by_non_point_connectivity(polys: &[Polygon], eps: f64) -> Vec<Vec<usize>> {
+    if polys.is_empty() {
+        return Vec::new();
+    }
+
+    let mut visited = vec![false; polys.len()];
+    let mut comps = Vec::<Vec<usize>>::new();
+
+    for start in 0..polys.len() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut stack = vec![start];
+        let mut comp = Vec::<usize>::new();
+
+        while let Some(i) = stack.pop() {
+            comp.push(i);
+            for j in 0..polys.len() {
+                if visited[j] || i == j {
+                    continue;
+                }
+                if sources_have_non_point_connection(&polys[i], &polys[j], eps) {
+                    visited[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+
+        comp.sort_unstable();
+        comps.push(comp);
+    }
+
+    comps.sort();
+    comps
+}
+
+fn sources_have_non_point_connection(a: &Polygon, b: &Polygon, eps: f64) -> bool {
+    if let (Some(ea), Some(eb)) = (a.envelope(), b.envelope()) {
+        if !ea.intersects(&eb) {
+            let gap = geometry_distance(&Geometry::Polygon(a.clone()), &Geometry::Polygon(b.clone()));
+            if !(gap.is_finite() && gap > 0.0 && gap <= eps) {
+                return false;
+            }
+        }
+    }
+
+    if polygon_boundaries_have_nontrivial_contact(a, b, eps) {
+        return true;
+    }
+
+    if let Some(p) = a.exterior.coords.first().copied() {
+        if matches!(classify_point_in_polygon_eps(p, b, eps), PointInRing::Inside) {
+            return true;
+        }
+    }
+
+    if let Some(p) = b.exterior.coords.first().copied() {
+        if matches!(classify_point_in_polygon_eps(p, a, eps), PointInRing::Inside) {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[derive(Debug, Clone)]
+struct DissolveWork {
+    poly: Polygon,
+    envelope: Option<Envelope>,
+    area: f64,
+    members: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct UnionWork {
+    poly: Polygon,
+    envelope: Option<Envelope>,
+    area: f64,
+}
+
+fn init_component_work(polys: &[Polygon], component: &[usize]) -> Vec<DissolveWork> {
+    component
+        .iter()
+        .copied()
+        .map(|idx| DissolveWork {
+            poly: polys[idx].clone(),
+            envelope: polys[idx].envelope(),
+            area: polygon_abs_area(&polys[idx]),
+            members: vec![idx],
+        })
+        .collect()
+}
+
+fn init_union_component_work(polys: &[Polygon], component: &[usize]) -> Vec<UnionWork> {
+    component
+        .iter()
+        .copied()
+        .map(|idx| UnionWork {
+            poly: polys[idx].clone(),
+            envelope: polys[idx].envelope(),
+            area: polygon_abs_area(&polys[idx]),
+        })
+        .collect()
+}
+
+fn finalize_component_work(groups: Vec<DissolveWork>) -> Vec<UnaryDissolveGroup> {
+    groups
+        .into_iter()
+        .map(|mut g| {
+            g.members.sort_unstable();
+            g.members.dedup();
+            UnaryDissolveGroup {
+                poly: g.poly,
+                source_indices: g.members,
+            }
+        })
+        .collect()
+}
+
+fn finalize_union_work(groups: Vec<UnionWork>) -> Vec<Polygon> {
+    groups.into_iter().map(|g| g.poly).collect()
+}
+
+fn dissolve_pre_grouped_cascaded(
+    groups: Vec<UnaryDissolveGroup>,
+    eps: f64,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<UnaryDissolveGroup> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+
+    let work: Vec<DissolveWork> = groups
+        .into_iter()
+        .map(|g| DissolveWork {
+            area: polygon_abs_area(&g.poly),
+            envelope: g.poly.envelope(),
+            poly: g.poly,
+            members: g.source_indices,
+        })
+        .collect();
+
+    finalize_component_work(dissolve_work_cascaded(work, eps, 0, preferred_precision))
+}
+
+#[allow(dead_code)]
+fn union_pre_grouped_cascaded(
+    polys: Vec<Polygon>,
+    eps: f64,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<Polygon> {
+    if polys.is_empty() {
+        return Vec::new();
+    }
+
+    let work: Vec<UnionWork> = polys
+        .into_iter()
+        .map(|poly| UnionWork {
+            area: polygon_abs_area(&poly),
+            envelope: poly.envelope(),
+            poly,
+        })
+        .collect();
+
+    finalize_union_work(union_work_cascaded(work, eps, 0, preferred_precision))
+}
+
+fn dissolve_component_cascaded(
+    polys: &[Polygon],
+    component: &[usize],
+    eps: f64,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<UnaryDissolveGroup> {
+    if component.is_empty() {
+        return Vec::new();
+    }
+
+    let groups = init_component_work(polys, component);
+    let dissolved = dissolve_work_cascaded(groups, eps, 0, preferred_precision);
+    finalize_component_work(dissolved)
+}
+
+fn union_component_cascaded(
+    polys: &[Polygon],
+    component: &[usize],
+    eps: f64,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<Polygon> {
+    if component.is_empty() {
+        return Vec::new();
+    }
+
+    let groups = init_union_component_work(polys, component);
+    let dissolved = union_work_cascaded(groups, eps, 0, preferred_precision);
+    finalize_union_work(dissolved)
+}
+
+fn dissolve_work_cascaded(
+    groups: Vec<DissolveWork>,
+    eps: f64,
+    depth: usize,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<DissolveWork> {
+    const LEAF_SIZE: usize = 16;
+
+    if groups.len() <= 1 {
+        return groups;
+    }
+
+    if groups.len() <= LEAF_SIZE {
+        return dissolve_work_pairwise(groups, eps, preferred_precision);
+    }
+
+    let axis_x = depth % 2 == 0;
+    let mut ordered = groups;
+    ordered.sort_by(|a, b| dissolve_work_axis_value(a, axis_x)
+        .partial_cmp(&dissolve_work_axis_value(b, axis_x))
+        .unwrap_or(Ordering::Equal));
+
+    let mid = ordered.len() / 2;
+    let right = ordered.split_off(mid);
+    let left = ordered;
+
+    #[cfg(feature = "parallel")]
+    if left.len() >= 64 && right.len() >= 64 {
+        let (mut left_out, mut right_out) = join(
+            || dissolve_work_cascaded(left, eps, depth + 1, preferred_precision),
+            || dissolve_work_cascaded(right, eps, depth + 1, preferred_precision),
+        );
+        left_out.append(&mut right_out);
+        return dissolve_work_pairwise(left_out, eps, preferred_precision);
+    }
+
+    let mut left_out = dissolve_work_cascaded(left, eps, depth + 1, preferred_precision);
+    let mut right_out = dissolve_work_cascaded(right, eps, depth + 1, preferred_precision);
+    left_out.append(&mut right_out);
+    dissolve_work_pairwise(left_out, eps, preferred_precision)
+}
+
+fn dissolve_work_axis_value(work: &DissolveWork, axis_x: bool) -> f64 {
+    if let Some(env) = work.envelope {
+        if axis_x {
+            (env.min_x + env.max_x) * 0.5
+        } else {
+            (env.min_y + env.max_y) * 0.5
+        }
+    } else {
+        0.0
+    }
+}
+
+fn union_work_axis_value(work: &UnionWork, axis_x: bool) -> f64 {
+    if let Some(env) = work.envelope {
+        if axis_x {
+            (env.min_x + env.max_x) * 0.5
+        } else {
+            (env.min_y + env.max_y) * 0.5
+        }
+    } else {
+        0.0
+    }
+}
+
+fn dissolve_work_pairwise(
+    mut groups: Vec<DissolveWork>,
+    eps: f64,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<DissolveWork> {
+    if groups.len() < 2 {
+        return groups;
+    }
+
+    loop {
+        let mut merged_any = false;
+
+        'scan: for i in 0..groups.len() {
+            let env_i = groups[i].envelope;
+
+            #[cfg(feature = "parallel")]
+            {
+                if groups.len() >= 64 {
+                    let best = ((i + 1)..groups.len())
+                        .into_par_iter()
+                        .filter_map(|j: usize| {
+                            if let (Some(a), Some(b)) = (env_i, groups[j].envelope) {
+                                if !a.intersects(&b) {
+                                    return None;
+                                }
+                            }
+
+                            safe_dissolve_union(
+                                &groups[i].poly,
+                                groups[i].area,
+                                &groups[j].poly,
+                                groups[j].area,
+                                eps,
+                                preferred_precision,
+                            )
+                            .map(|poly| (j, poly))
+                        })
+                        .reduce_with(|a, b| if a.0 < b.0 { a } else { b });
+
+                    if let Some((j, merged_poly)) = best {
+                        groups[i].poly = merged_poly;
+                        groups[i].envelope = groups[i].poly.envelope();
+                        groups[i].area = polygon_abs_area(&groups[i].poly);
+                        let mut other = groups.remove(j);
+                        groups[i].members.append(&mut other.members);
+                        merged_any = true;
+                        break 'scan;
+                    }
+                    continue;
+                }
+            }
+
+            for j in (i + 1)..groups.len() {
+                if let (Some(a), Some(b)) = (env_i, groups[j].envelope) {
+                    if !a.intersects(&b) {
+                        continue;
+                    }
+                }
+
+                if let Some(merged_poly) = safe_dissolve_union(
+                    &groups[i].poly,
+                    groups[i].area,
+                    &groups[j].poly,
+                    groups[j].area,
+                    eps,
+                    preferred_precision,
+                ) {
+                    groups[i].poly = merged_poly;
+                    groups[i].envelope = groups[i].poly.envelope();
+                    groups[i].area = polygon_abs_area(&groups[i].poly);
+                    let mut other = groups.remove(j);
+                    groups[i].members.append(&mut other.members);
+                    merged_any = true;
+                    break 'scan;
+                }
+            }
+        }
+
+        if !merged_any {
+            break;
+        }
+    }
+
+    groups
+}
+
+fn union_work_cascaded(
+    groups: Vec<UnionWork>,
+    eps: f64,
+    depth: usize,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<UnionWork> {
+    const LEAF_SIZE: usize = 16;
+
+    if groups.len() <= 1 {
+        return groups;
+    }
+
+    if groups.len() <= LEAF_SIZE {
+        return union_work_pairwise(groups, eps, preferred_precision);
+    }
+
+    let axis_x = depth % 2 == 0;
+    let mut ordered = groups;
+    ordered.sort_by(|a, b| union_work_axis_value(a, axis_x)
+        .partial_cmp(&union_work_axis_value(b, axis_x))
+        .unwrap_or(Ordering::Equal));
+
+    let mid = ordered.len() / 2;
+    let right = ordered.split_off(mid);
+    let left = ordered;
+
+    #[cfg(feature = "parallel")]
+    if left.len() >= 64 && right.len() >= 64 {
+        let (mut left_out, mut right_out) = join(
+            || union_work_cascaded(left, eps, depth + 1, preferred_precision),
+            || union_work_cascaded(right, eps, depth + 1, preferred_precision),
+        );
+        left_out.append(&mut right_out);
+        return union_work_pairwise(left_out, eps, preferred_precision);
+    }
+
+    let mut left_out = union_work_cascaded(left, eps, depth + 1, preferred_precision);
+    let mut right_out = union_work_cascaded(right, eps, depth + 1, preferred_precision);
+    left_out.append(&mut right_out);
+    union_work_pairwise(left_out, eps, preferred_precision)
+}
+
+fn union_work_pairwise(
+    mut groups: Vec<UnionWork>,
+    eps: f64,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<UnionWork> {
+    if groups.len() < 2 {
+        return groups;
+    }
+
+    loop {
+        let mut merged_any = false;
+
+        'scan: for i in 0..groups.len() {
+            let env_i = groups[i].envelope;
+
+            #[cfg(feature = "parallel")]
+            {
+                if groups.len() >= 64 {
+                    let best = ((i + 1)..groups.len())
+                        .into_par_iter()
+                        .filter_map(|j: usize| {
+                            if let (Some(a), Some(b)) = (env_i, groups[j].envelope) {
+                                if !a.intersects(&b) {
+                                    return None;
+                                }
+                            }
+
+                            safe_dissolve_union(
+                                &groups[i].poly,
+                                groups[i].area,
+                                &groups[j].poly,
+                                groups[j].area,
+                                eps,
+                                preferred_precision,
+                            )
+                            .map(|poly| (j, poly))
+                        })
+                        .reduce_with(|a, b| if a.0 < b.0 { a } else { b });
+
+                    if let Some((j, merged_poly)) = best {
+                        groups[i].poly = merged_poly;
+                        groups[i].envelope = groups[i].poly.envelope();
+                        groups[i].area = polygon_abs_area(&groups[i].poly);
+                        groups.remove(j);
+                        merged_any = true;
+                        break 'scan;
+                    }
+                    continue;
+                }
+            }
+
+            for j in (i + 1)..groups.len() {
+                if let (Some(a), Some(b)) = (env_i, groups[j].envelope) {
+                    if !a.intersects(&b) {
+                        continue;
+                    }
+                }
+
+                if let Some(merged_poly) = safe_dissolve_union(
+                    &groups[i].poly,
+                    groups[i].area,
+                    &groups[j].poly,
+                    groups[j].area,
+                    eps,
+                    preferred_precision,
+                ) {
+                    groups[i].poly = merged_poly;
+                    groups[i].envelope = groups[i].poly.envelope();
+                    groups[i].area = polygon_abs_area(&groups[i].poly);
+                    groups.remove(j);
+                    merged_any = true;
+                    break 'scan;
+                }
+            }
+        }
+
+        if !merged_any {
+            break;
+        }
+    }
+
+    groups
+}
+
+fn dissolve_component(
+    polys: &[Polygon],
+    component: &[usize],
+    eps: f64,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<UnaryDissolveGroup> {
+    if component.is_empty() {
+        return Vec::new();
+    }
+
+    let groups = init_component_work(polys, component);
+
+    if groups.len() < 2 {
+        return finalize_component_work(groups);
+    }
+
+    finalize_component_work(dissolve_work_pairwise(groups, eps, preferred_precision))
+}
+
+fn union_component(
+    polys: &[Polygon],
+    component: &[usize],
+    eps: f64,
+    preferred_precision: Option<PrecisionModel>,
+) -> Vec<Polygon> {
+    if component.is_empty() {
+        return Vec::new();
+    }
+
+    let groups = init_union_component_work(polys, component);
+
+    if groups.len() < 2 {
+        return finalize_union_work(groups);
+    }
+
+    finalize_union_work(union_work_pairwise(groups, eps, preferred_precision))
+}
+
+fn safe_dissolve_union(
+    a: &Polygon,
+    area_a: f64,
+    b: &Polygon,
+    area_b: f64,
+    eps: f64,
+    preferred_precision: Option<PrecisionModel>,
+) -> Option<Polygon> {
+    let quick_eps = eps.max(1.0e-9);
+    if !polygon_boundaries_cross(a, b, quick_eps)
+        && !shell_strictly_inside(a, b, quick_eps)
+        && !shell_strictly_inside(b, a, quick_eps)
+    {
+        return None;
+    }
+
+    let min_expected = area_a.max(area_b);
+    let area_tol = eps.max(1.0e-9) * 10.0;
+
+    if let Some(precision) = preferred_precision {
+        let union = polygon_union_with_precision(a, b, precision);
+        if union.len() == 1 {
+            let poly = union[0].clone();
+            let tol = match precision {
+                PrecisionModel::Fixed { scale } if scale > 0.0 && scale.is_finite() => {
+                    area_tol.max(1.0 / scale)
+                }
+                _ => area_tol,
+            };
+            if union_candidate_is_valid_with_precision(&poly, a, b, eps, precision, tol, min_expected) {
+                return Some(poly);
+            }
+        }
+    }
+
+    let union = polygon_union(a, b, eps);
+    if union.len() == 1 {
+        let poly = union[0].clone();
+        if union_candidate_is_valid(&poly, a, b, eps, area_tol, min_expected) {
+            return Some(poly);
+        }
+    }
+
+    for scale in [10_000.0, 1_000.0, 100.0] {
+        let precision = PrecisionModel::Fixed { scale };
+        let union = polygon_union_with_precision(a, b, precision);
+        if union.len() != 1 {
+            continue;
+        }
+
+        let poly = union[0].clone();
+        let tol = area_tol.max(1.0 / scale);
+        if union_candidate_is_valid_with_precision(&poly, a, b, eps, precision, tol, min_expected) {
+            return Some(poly);
+        }
+    }
+
+    None
+}
+
+fn union_candidate_is_valid(
+    candidate: &Polygon,
+    a: &Polygon,
+    b: &Polygon,
+    eps: f64,
+    area_tol: f64,
+    min_expected: f64,
+) -> bool {
+    if polygon_abs_area(candidate) + area_tol < min_expected {
+        return false;
+    }
+
+    let validate_eps = eps.max(1.0e-7);
+    polygon_shell_is_covered(candidate, a, validate_eps)
+        && polygon_shell_is_covered(candidate, b, validate_eps)
+}
+
+fn union_candidate_is_valid_with_precision(
+    candidate: &Polygon,
+    a: &Polygon,
+    b: &Polygon,
+    eps: f64,
+    precision: PrecisionModel,
+    area_tol: f64,
+    min_expected: f64,
+) -> bool {
+    if polygon_abs_area(candidate) + area_tol < min_expected {
+        return false;
+    }
+
+    let validate_eps = match precision {
+        PrecisionModel::Fixed { scale } => eps.max(0.5 / scale),
+        _ => eps.max(1.0e-7),
+    };
+    polygon_shell_is_covered(candidate, a, validate_eps)
+        && polygon_shell_is_covered(candidate, b, validate_eps)
+}
+
+fn polygon_shell_is_covered(container: &Polygon, source: &Polygon, eps: f64) -> bool {
+    let coords = &source.exterior.coords;
+    if coords.len() < 2 {
+        return false;
+    }
+
+    for i in 0..(coords.len() - 1) {
+        let a = coords[i];
+        let b = coords[i + 1];
+        let mid = Coord::xy((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+
+        if matches!(classify_point_in_polygon_eps(a, container, eps), PointInRing::Outside) {
+            return false;
+        }
+        if matches!(classify_point_in_polygon_eps(mid, container, eps), PointInRing::Outside) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Precision-aware dissolved polygon union.
+#[inline]
+pub fn polygon_union_with_precision(
+    a: &Polygon,
+    b: &Polygon,
+    precision: PrecisionModel,
+) -> Vec<Polygon> {
+    polygon_overlay_with_precision(a, b, OverlayOp::Union, precision)
+}
+
+/// Dissolved polygon difference `A \ B`.
+#[inline]
+pub fn polygon_difference(a: &Polygon, b: &Polygon, epsilon: f64) -> Vec<Polygon> {
+    polygon_overlay(a, b, OverlayOp::DifferenceAB, epsilon)
+}
+
+/// Precision-aware dissolved polygon difference `A \ B`.
+#[inline]
+pub fn polygon_difference_with_precision(
+    a: &Polygon,
+    b: &Polygon,
+    precision: PrecisionModel,
+) -> Vec<Polygon> {
+    polygon_overlay_with_precision(a, b, OverlayOp::DifferenceAB, precision)
+}
+
+/// Dissolved polygon symmetric difference.
+#[inline]
+pub fn polygon_sym_diff(a: &Polygon, b: &Polygon, epsilon: f64) -> Vec<Polygon> {
+    let eps = normalized_eps(epsilon);
+    if a.holes.len() + b.holes.len() == 4 {
+        let mut parts = polygon_difference(a, b, eps);
+        parts.extend(polygon_difference(b, a, eps));
+        return normalize_polygons(dissolve_faces(&parts, eps), eps);
+    }
+    polygon_overlay(a, b, OverlayOp::SymmetricDifference, epsilon)
+}
+
+fn subtract_many_from_polygons(base: &[Polygon], cuts: &[Polygon], eps: f64) -> Vec<Polygon> {
+    if cuts.is_empty() {
+        return normalize_polygons(base.to_vec(), eps);
+    }
+
+    let mut current = base.to_vec();
+    for cut in cuts {
+        if current.is_empty() {
+            break;
+        }
+        let mut next = Vec::<Polygon>::new();
+        for poly in current {
+            next.extend(polygon_difference(&poly, cut, eps));
+        }
+        current = next;
+    }
+    normalize_polygons(current, eps)
+}
+
+/// Precision-aware dissolved polygon symmetric difference.
+#[inline]
+pub fn polygon_sym_diff_with_precision(
+    a: &Polygon,
+    b: &Polygon,
+    precision: PrecisionModel,
+) -> Vec<Polygon> {
+    polygon_overlay_with_precision(a, b, OverlayOp::SymmetricDifference, precision)
+}
+
+fn containment_overlay(a: &Polygon, b: &Polygon, operation: OverlayOp, eps: f64) -> Option<Vec<Polygon>> {
+    let a_contains_b = shell_strictly_inside(a, b, eps);
+    let b_contains_a = shell_strictly_inside(b, a, eps);
+
+    if !a_contains_b && !b_contains_a {
+        return None;
+    }
+
+    let result = match operation {
+        OverlayOp::Intersection => {
+            if a_contains_b {
+                vec![b.clone()]
+            } else {
+                vec![a.clone()]
+            }
+        }
+        OverlayOp::Union => {
+            if a_contains_b {
+                vec![a.clone()]
+            } else {
+                vec![b.clone()]
+            }
+        }
+        OverlayOp::DifferenceAB => {
+            if a_contains_b {
+                subtract_contained(a, b)
+            } else {
+                Vec::new()
+            }
+        }
+        OverlayOp::SymmetricDifference => {
+            if a_contains_b {
+                subtract_contained(a, b)
+            } else {
+                subtract_contained(b, a)
+            }
+        }
+    };
+
+    Some(result)
+}
+
+fn shell_strictly_inside(container: &Polygon, candidate: &Polygon, eps: f64) -> bool {
+    let mut container_rings: Vec<&[Coord]> = Vec::with_capacity(1 + container.holes.len());
+    container_rings.push(&container.exterior.coords);
+    for h in &container.holes {
+        container_rings.push(&h.coords);
+    }
+
+    // Any boundary crossing/touching with candidate shell invalidates strict containment.
+    for ring in &container_rings {
+        if ring_boundary_intersects_eps(ring, &candidate.exterior.coords, eps) {
+            return false;
+        }
+    }
+
+    // Candidate shell vertices and segment midpoints must lie strictly inside container set.
+    let c = &candidate.exterior.coords;
+    if c.len() < 4 {
+        return false;
+    }
+
+    for i in 0..(c.len() - 1) {
+        let p = c[i];
+        if !matches!(classify_point_in_polygon_eps(p, container, eps), PointInRing::Inside) {
+            return false;
+        }
+
+        let q = c[i + 1];
+        let m = Coord::xy((p.x + q.x) * 0.5, (p.y + q.y) * 0.5);
+        if !matches!(classify_point_in_polygon_eps(m, container, eps), PointInRing::Inside) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn ring_boundary_intersects_eps(a: &[Coord], b: &[Coord], eps: f64) -> bool {
+    if a.len() < 2 || b.len() < 2 {
+        return false;
+    }
+
+    for i in 0..(a.len() - 1) {
+        let a1 = a[i];
+        let a2 = a[i + 1];
+        for j in 0..(b.len() - 1) {
+            let b1 = b[j];
+            let b2 = b[j + 1];
+            if segments_intersect_eps(a1, a2, b1, b2, eps) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn ring_boundary_has_nontrivial_contact_eps(a: &[Coord], b: &[Coord], eps: f64) -> bool {
+    if a.len() < 2 || b.len() < 2 {
+        return false;
+    }
+
+    for i in 0..(a.len() - 1) {
+        let a1 = a[i];
+        let a2 = a[i + 1];
+        for j in 0..(b.len() - 1) {
+            let b1 = b[j];
+            let b2 = b[j + 1];
+            if !segments_intersect_eps(a1, a2, b1, b2, eps) {
+                continue;
+            }
+
+            if collinear_segment_overlap_gt_eps(a1, a2, b1, b2, eps) {
+                return true;
+            }
+
+            let shares_endpoint = nearly_eq(a1, b1, eps)
+                || nearly_eq(a1, b2, eps)
+                || nearly_eq(a2, b1, eps)
+                || nearly_eq(a2, b2, eps);
+            if !shares_endpoint {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn polygon_boundaries_have_nontrivial_contact(a: &Polygon, b: &Polygon, eps: f64) -> bool {
+    let mut a_rings: Vec<&[Coord]> = Vec::with_capacity(1 + a.holes.len());
+    a_rings.push(&a.exterior.coords);
+    for h in &a.holes {
+        a_rings.push(&h.coords);
+    }
+
+    let mut b_rings: Vec<&[Coord]> = Vec::with_capacity(1 + b.holes.len());
+    b_rings.push(&b.exterior.coords);
+    for h in &b.holes {
+        b_rings.push(&h.coords);
+    }
+
+    for ra in &a_rings {
+        for rb in &b_rings {
+            if ring_boundary_has_nontrivial_contact_eps(ra, rb, eps) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn collinear_segment_overlap_gt_eps(a1: Coord, a2: Coord, b1: Coord, b2: Coord, eps: f64) -> bool {
+    let ax = a2.x - a1.x;
+    let ay = a2.y - a1.y;
+    let seg_len = (ax * ax + ay * ay).sqrt();
+    if seg_len <= eps {
+        return false;
+    }
+
+    let cross1 = ax * (b1.y - a1.y) - ay * (b1.x - a1.x);
+    let cross2 = ax * (b2.y - a1.y) - ay * (b2.x - a1.x);
+    if cross1.abs() > eps || cross2.abs() > eps {
+        return false;
+    }
+
+    let ux = ax / seg_len;
+    let uy = ay / seg_len;
+    let a0 = 0.0f64;
+    let a1p = seg_len;
+    let b0 = (b1.x - a1.x) * ux + (b1.y - a1.y) * uy;
+    let b1p = (b2.x - a1.x) * ux + (b2.y - a1.y) * uy;
+
+    let amin = a0.min(a1p);
+    let amax = a0.max(a1p);
+    let bmin = b0.min(b1p);
+    let bmax = b0.max(b1p);
+
+    let overlap = amax.min(bmax) - amin.max(bmin);
+    overlap > eps
+}
+
+fn polygon_boundaries_cross(a: &Polygon, b: &Polygon, eps: f64) -> bool {
+    let mut a_rings: Vec<&[Coord]> = Vec::with_capacity(1 + a.holes.len());
+    a_rings.push(&a.exterior.coords);
+    for h in &a.holes {
+        a_rings.push(&h.coords);
+    }
+
+    let mut b_rings: Vec<&[Coord]> = Vec::with_capacity(1 + b.holes.len());
+    b_rings.push(&b.exterior.coords);
+    for h in &b.holes {
+        b_rings.push(&h.coords);
+    }
+
+    for ra in &a_rings {
+        for rb in &b_rings {
+            if ring_boundary_intersects_eps(ra, rb, eps) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn prefer_separate_overlay_all(a: &Polygon, b: &Polygon) -> bool {
+    let vertices = boundary_vertex_count(a) + boundary_vertex_count(b);
+    if vertices <= OVERLAY_ALL_TINY_VERTEX_THRESHOLD {
+        return true;
+    }
+
+    let holes = a.holes.len() + b.holes.len();
+    holes >= OVERLAY_ALL_HOLERICH_HOLES_THRESHOLD
+        && vertices <= OVERLAY_ALL_HOLERICH_VERTEX_THRESHOLD
+}
+
+fn boundary_vertex_count(poly: &Polygon) -> usize {
+    let mut n = poly.exterior.coords.len();
+    for h in &poly.holes {
+        n += h.coords.len();
+    }
+    n
+}
+
+fn subtract_contained(container: &Polygon, contained: &Polygon) -> Vec<Polygon> {
+    let mut out = Vec::<Polygon>::new();
+
+    // Main shell: container shell minus contained shell.
+    let mut holes = container.holes.clone();
+    holes.push(contained.exterior.clone());
+    out.push(Polygon::new(container.exterior.clone(), holes));
+
+    // Holes inside the contained polygon represent additive islands.
+    for h in &contained.holes {
+        out.push(Polygon::new(h.clone(), vec![]));
+    }
+
+    out
+}
+
+fn normalized_eps(epsilon: f64) -> f64 {
+    if epsilon.is_finite() {
+        epsilon.abs().max(1.0e-12)
+    } else {
+        1.0e-12
+    }
+}
+
+fn polygon_abs_area(poly: &Polygon) -> f64 {
+    let mut area = ring_signed_area(&poly.exterior.coords).abs();
+    for h in &poly.holes {
+        area -= ring_signed_area(&h.coords).abs();
+    }
+    area.max(0.0)
+}
+
+fn polygon_boundaries(poly: &Polygon) -> Vec<LineString> {
+    let mut out = Vec::with_capacity(1 + poly.holes.len());
+    out.push(LineString::new(poly.exterior.coords.clone()));
+    for hole in &poly.holes {
+        out.push(LineString::new(hole.coords.clone()));
+    }
+    out
+}
+
+fn classify_point_in_polygon_eps(p: Coord, poly: &Polygon, eps: f64) -> PointInRing {
+    let exterior = classify_point_in_ring_eps(p, &poly.exterior.coords, eps);
+    if matches!(exterior, PointInRing::Outside) {
+        return PointInRing::Outside;
+    }
+
+    let mut boundary_hits = if matches!(exterior, PointInRing::Boundary) {
+        1usize
+    } else {
+        0usize
+    };
+    let mut in_hole = false;
+    for hole in &poly.holes {
+        match classify_point_in_ring_eps(p, &hole.coords, eps) {
+            PointInRing::Inside => in_hole = true,
+            PointInRing::Boundary => boundary_hits += 1,
+            PointInRing::Outside => {}
+        }
+    }
+
+    if boundary_hits % 2 == 1 {
+        return PointInRing::Boundary;
+    }
+    if in_hole {
+        return PointInRing::Outside;
+    }
+    PointInRing::Inside
+}
+
+fn ring_centroid(coords: &[Coord]) -> Option<Coord> {
+    if coords.len() < 4 {
+        return None;
+    }
+
+    let mut a2 = 0.0;
+    let mut cx = 0.0;
+    let mut cy = 0.0;
+
+    for i in 0..(coords.len() - 1) {
+        let p = coords[i];
+        let q = coords[i + 1];
+        let cross = p.x * q.y - q.x * p.y;
+        a2 += cross;
+        cx += (p.x + q.x) * cross;
+        cy += (p.y + q.y) * cross;
+    }
+
+    if a2.abs() <= 1.0e-18 {
+        return None;
+    }
+
+    let inv = 1.0 / (3.0 * a2);
+    Some(Coord::xy(cx * inv, cy * inv))
+}
+
+fn representative_point_for_face_ring(coords: &[Coord], eps: f64) -> Option<Coord> {
+    if coords.len() < 4 {
+        return None;
+    }
+
+    // Prefer a true interior point (centroid / scanline span midpoint) over
+    // edge-normal probes, which can land too close to boundaries for strip-like faces.
+    if let Some(c) = ring_centroid(coords) {
+        if classify_point_in_ring_eps(c, coords, eps) == PointInRing::Inside {
+            return Some(c);
+        }
+    }
+
+    let mut min_x = coords[0].x;
+    let mut max_x = coords[0].x;
+    let mut min_y = coords[0].y;
+    let mut max_y = coords[0].y;
+    for &p in &coords[1..] {
+        min_x = min_x.min(p.x);
+        max_x = max_x.max(p.x);
+        min_y = min_y.min(p.y);
+        max_y = max_y.max(p.y);
+    }
+
+    let h = (max_y - min_y).abs();
+    let y_candidates = [
+        (min_y + max_y) * 0.5,
+        min_y + h * 0.37,
+        min_y + h * 0.63,
+        min_y + h * 0.23,
+        min_y + h * 0.77,
+    ];
+
+    for mut y in y_candidates {
+        if y <= min_y {
+            y = min_y + (eps * 16.0).max(h * 1.0e-6);
+        }
+        if y >= max_y {
+            y = max_y - (eps * 16.0).max(h * 1.0e-6);
+        }
+
+        let mut xs = Vec::new();
+        for i in 0..(coords.len() - 1) {
+            let a = coords[i];
+            let b = coords[i + 1];
+            let y0 = a.y;
+            let y1 = b.y;
+
+            if (y1 - y0).abs() <= eps {
+                continue;
+            }
+
+            let lo = y0.min(y1);
+            let hi = y0.max(y1);
+            if y < lo || y >= hi {
+                continue;
+            }
+
+            let t = (y - y0) / (y1 - y0);
+            xs.push(a.x + t * (b.x - a.x));
+        }
+
+        if xs.len() < 2 {
+            continue;
+        }
+        xs.sort_by(|a, b| a.total_cmp(b));
+
+        for pair in xs.chunks_exact(2) {
+            let x0 = pair[0];
+            let x1 = pair[1];
+            let span = x1 - x0;
+            if span <= eps * 4.0 {
+                continue;
+            }
+            let x = (x0 + x1) * 0.5;
+            let p = Coord::xy(x, y);
+            if classify_point_in_ring_eps(p, coords, eps) == PointInRing::Inside {
+                return Some(p);
+            }
+        }
+    }
+
+    let mut best_i = None;
+    let mut best_len2 = 0.0f64;
+    for i in 0..(coords.len() - 1) {
+        let a = coords[i];
+        let b = coords[i + 1];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let l2 = dx * dx + dy * dy;
+        if l2 > best_len2 {
+            best_len2 = l2;
+            best_i = Some(i);
+        }
+    }
+
+    let i = best_i?;
+    let a = coords[i];
+    let b = coords[i + 1];
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= eps {
+        return None;
+    }
+
+    let mid = Coord::xy((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+    let left_nx = -dy / len;
+    let left_ny = dx / len;
+    let sign = if ring_signed_area(coords) >= 0.0 { 1.0 } else { -1.0 };
+    let nx = left_nx * sign;
+    let ny = left_ny * sign;
+
+    let probe_dist = (eps * 256.0).max(len * 1.0e-4);
+    let p1 = Coord::xy(mid.x + nx * probe_dist, mid.y + ny * probe_dist);
+    match classify_point_in_ring_eps(p1, coords, eps) {
+        PointInRing::Inside => return Some(p1),
+        _ => {}
+    }
+
+    let p2 = Coord::xy(mid.x - nx * probe_dist, mid.y - ny * probe_dist);
+    match classify_point_in_ring_eps(p2, coords, eps) {
+        PointInRing::Inside => Some(p2),
+        _ => None,
+    }
+}
+
+/// Compute the envelope (bounding box) of a coordinate slice (ring).
+fn linestring_envelope(coords: &[Coord]) -> Option<Envelope> {
+    if coords.is_empty() {
+        return None;
+    }
+    let mut min_x = coords[0].x;
+    let mut max_x = coords[0].x;
+    let mut min_y = coords[0].y;
+    let mut max_y = coords[0].y;
+
+    for &c in &coords[1..] {
+        if c.x < min_x {
+            min_x = c.x;
+        }
+        if c.x > max_x {
+            max_x = c.x;
+        }
+        if c.y < min_y {
+            min_y = c.y;
+        }
+        if c.y > max_y {
+            max_y = c.y;
+        }
+    }
+
+    Some(Envelope {
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct QCoord(i64, i64);
+
+#[derive(Debug, Clone, Copy)]
+struct SegState {
+    count: usize,
+}
+
+fn dissolve_faces(faces: &[Polygon], eps: f64) -> Vec<Polygon> {
+    let mut seg_counts = HashMap::<(QCoord, QCoord), SegState>::new();
+    let mut coord_map = HashMap::<QCoord, Coord>::new();
+
+    for poly in faces {
+        let c = &poly.exterior.coords;
+        if c.len() < 2 {
+            continue;
+        }
+        for i in 0..(c.len() - 1) {
+            let a = c[i];
+            let b = c[i + 1];
+            let qa = quantize_coord(a, eps);
+            let qb = quantize_coord(b, eps);
+            if qa == qb {
+                continue;
+            }
+
+            update_quantized_coord_map(&mut coord_map, qa, a);
+            update_quantized_coord_map(&mut coord_map, qb, b);
+            let key = ordered_pair(qa, qb);
+            seg_counts
+                .entry(key)
+
+                .and_modify(|s| s.count += 1)
+                .or_insert(SegState { count: 1 });
+        }
+    }
+
+    let mut adjacency = HashMap::<QCoord, Vec<QCoord>>::new();
+    let mut boundary_edges = HashSet::<(QCoord, QCoord)>::new();
+
+    for (key, state) in seg_counts {
+        if state.count % 2 == 0 {
+            continue;
+        }
+        let (a, b) = key;
+        adjacency.entry(a).or_default().push(b);
+        adjacency.entry(b).or_default().push(a);
+        boundary_edges.insert(key);
+    }
+
+    for (node, neighbors) in &mut adjacency {
+        neighbors.sort_by(|na, nb| {
+            let aa = edge_angle_q(*node, *na, &coord_map);
+            let ab = edge_angle_q(*node, *nb, &coord_map);
+            aa.total_cmp(&ab).then_with(|| na.cmp(nb))
+        });
+    }
+
+    let mut rings = Vec::<Vec<Coord>>::new();
+
+    while let Some((a, b)) = boundary_edges.iter().copied().min() {
+        let mut ring_keys = vec![a, b];
+        boundary_edges.remove(&(a, b));
+
+        let start = a;
+        let mut prev = a;
+        let mut curr = b;
+        let mut closed = false;
+
+        for _ in 0..(adjacency.len() * 4).max(16) {
+            if curr == start {
+                closed = true;
+                break;
+            }
+
+            let Some(next) = choose_next_boundary_neighbor(
+                curr,
+                prev,
+                &adjacency,
+                &boundary_edges,
+            ) else {
+                break;
+            };
+
+            ring_keys.push(next);
+            boundary_edges.remove(&ordered_pair(curr, next));
+            prev = curr;
+            curr = next;
+        }
+
+        if !closed || ring_keys.len() < 4 {
+            continue;
+        }
+
+        let mut coords: Vec<Coord> = ring_keys
+            .iter()
+            .filter_map(|k| coord_map.get(k).copied())
+            .collect();
+
+        if coords.len() < 4 {
+            continue;
+        }
+
+        if !nearly_eq(coords[0], *coords.last().unwrap_or(&coords[0]), eps) {
+            coords.push(coords[0]);
+        }
+
+        if ring_signed_area(&coords).abs() <= eps * eps {
+            continue;
+        }
+
+        rings.push(coords);
+    }
+
+    assemble_polygons_from_rings(rings, eps)
+}
+
+fn assemble_polygons_from_rings(rings: Vec<Vec<Coord>>, eps: f64) -> Vec<Polygon> {
+    if rings.is_empty() {
+        return Vec::new();
+    }
+
+    let n = rings.len();
+    let areas: Vec<f64> = rings.iter().map(|r| ring_signed_area(r).abs()).collect();
+
+    // Build spatial index over ring envelopes for fast candidate filtering.
+    // For large ring sets (1000+ rings), the spatial index avoids O(n²) containment tests.
+    let mut spatial_index = SpatialIndex::new();
+    for ring in rings.iter() {
+        spatial_index.insert(Geometry::LineString(LineString::new(ring.clone())));
+    }
+
+    let mut parent: Vec<Option<usize>> = vec![None; n];
+    for i in 0..n {
+        let mut best_parent: Option<usize> = None;
+        let mut best_area = f64::INFINITY;
+
+        // Use spatial index to find only rings whose envelope could potentially contain ring i.
+        if let Some(env_i) = linestring_envelope(&rings[i]) {
+            let candidates = spatial_index.query_envelope(env_i);
+            for &j in &candidates {
+                if i == j {
+                    continue;
+                }
+                if areas[j] <= areas[i] + eps * eps {
+                    continue;
+                }
+                if ring_contains_ring(&rings[j], &rings[i], eps) && areas[j] < best_area {
+                    best_parent = Some(j);
+                    best_area = areas[j];
+                }
+            }
+        }
+
+        parent[i] = best_parent;
+    }
+
+    let mut depth = vec![0usize; n];
+    for i in 0..n {
+        let mut d = 0usize;
+        let mut p = parent[i];
+        while let Some(pi) = p {
+            d += 1;
+            p = parent[pi];
+            if d > n {
+                break;
+            }
+        }
+        depth[i] = d;
+    }
+
+    let mut shell_indices = Vec::<usize>::new();
+    for i in 0..n {
+        if depth[i] % 2 == 0 {
+            shell_indices.push(i);
+        }
+    }
+
+    let mut holes_by_shell: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        if depth[i] % 2 == 0 {
+            continue;
+        }
+        let mut p = parent[i];
+        while let Some(pi) = p {
+            if depth[pi] % 2 == 0 {
+                holes_by_shell.entry(pi).or_default().push(i);
+                break;
+            }
+            p = parent[pi];
+        }
+    }
+
+    let mut polygons = Vec::<Polygon>::new();
+    for shell_idx in shell_indices {
+        let mut shell_coords = rings[shell_idx].clone();
+        if ring_signed_area(&shell_coords) < 0.0 {
+            shell_coords.reverse();
+        }
+
+        let exterior = LinearRing::new(shell_coords);
+        let mut holes = Vec::<LinearRing>::new();
+
+        if let Some(hole_idxs) = holes_by_shell.get(&shell_idx) {
+            for hi in hole_idxs {
+                let mut hole_coords = rings[*hi].clone();
+                if ring_signed_area(&hole_coords) > 0.0 {
+                    hole_coords.reverse();
+                }
+                holes.push(LinearRing::new(hole_coords));
+            }
+        }
+
+        polygons.push(Polygon::new(exterior, holes));
+    }
+
+    polygons
+}
+
+fn ring_contains_ring(container: &[Coord], candidate: &[Coord], eps: f64) -> bool {
+    if container.len() < 4 || candidate.len() < 4 {
+        return false;
+    }
+
+    // Primary test: check if the candidate ring's centroid is inside the container.
+    // This is more robust than vertex iteration for boundary-coincident rings.
+    if let Some(centroid) = ring_centroid(candidate) {
+        match classify_point_in_ring_eps(centroid, container, eps) {
+            PointInRing::Inside => return true,
+            PointInRing::Outside => return false,
+            PointInRing::Boundary => {
+                // Centroid is on the container boundary (rare but possible).
+                // Fall through to secondary vertex check.
+            }
+        }
+    }
+
+    // Secondary test: iterate through candidate vertices, skipping boundary points.
+    // If any interior point is clearly Inside or Outside, use that result.
+    let mut saw_inside = false;
+    let mut saw_outside = false;
+    for p in &candidate[..candidate.len() - 1] {
+        match classify_point_in_ring_eps(*p, container, eps) {
+            PointInRing::Inside => saw_inside = true,
+            PointInRing::Outside => saw_outside = true,
+            PointInRing::Boundary => {
+                // Skip boundary points; they don't help distinguish containment.
+            }
+        }
+
+        if saw_outside {
+            return false;
+        }
+    }
+
+    saw_inside
+}
+
+fn ordered_pair(a: QCoord, b: QCoord) -> (QCoord, QCoord) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn quantize_coord(c: Coord, eps: f64) -> QCoord {
+    let qx = (c.x / eps).round() as i64;
+    let qy = (c.y / eps).round() as i64;
+    QCoord(qx, qy)
+}
+
+fn update_quantized_coord_map(coord_map: &mut HashMap<QCoord, Coord>, key: QCoord, candidate: Coord) {
+    match coord_map.get_mut(&key) {
+        Some(existing) => {
+            if coord_lex_lt(candidate, *existing) {
+                *existing = candidate;
+            }
+        }
+        None => {
+            coord_map.insert(key, candidate);
+        }
+    }
+}
+
+fn nearly_eq(a: Coord, b: Coord, eps: f64) -> bool {
+    (a.x - b.x).abs() <= eps && (a.y - b.y).abs() <= eps
+}
+
+fn ring_signed_area(coords: &[Coord]) -> f64 {
+    if coords.len() < 4 {
+        return 0.0;
+    }
+    let mut s = 0.0;
+    for i in 0..(coords.len() - 1) {
+        s += coords[i].x * coords[i + 1].y - coords[i + 1].x * coords[i].y;
+    }
+    0.5 * s
+}
+
+fn normalize_polygons(mut polys: Vec<Polygon>, eps: f64) -> Vec<Polygon> {
+    for p in &mut polys {
+        normalize_polygon(p, eps);
+    }
+
+    polys.sort_by(|a, b| polygon_sort_key(a).cmp(&polygon_sort_key(b)));
+    polys
+}
+
+fn normalize_polygon(poly: &mut Polygon, eps: f64) {
+    normalize_exterior_ring(&mut poly.exterior, eps);
+    for h in &mut poly.holes {
+        normalize_hole_ring(h, eps);
+    }
+    poly.holes
+        .sort_by(|a, b| ring_sort_key(&a.coords).cmp(&ring_sort_key(&b.coords)));
+}
+
+fn normalize_exterior_ring(ring: &mut LinearRing, eps: f64) {
+    if ring.coords.len() < 4 {
+        return;
+    }
+    if ring_signed_area(&ring.coords) < -eps * eps {
+        ring.coords.reverse();
+    }
+    canonicalize_ring_start(&mut ring.coords);
+}
+
+fn normalize_hole_ring(ring: &mut LinearRing, eps: f64) {
+    if ring.coords.len() < 4 {
+        return;
+    }
+    if ring_signed_area(&ring.coords) > eps * eps {
+        ring.coords.reverse();
+    }
+    canonicalize_ring_start(&mut ring.coords);
+}
+
+fn canonicalize_ring_start(coords: &mut Vec<Coord>) {
+    if coords.len() < 4 {
+        return;
+    }
+    let n = coords.len() - 1;
+
+    let mut min_idx = 0usize;
+    for i in 1..n {
+        if coord_lex_lt(coords[i], coords[min_idx]) {
+            min_idx = i;
+        }
+    }
+
+    if min_idx == 0 {
+        return;
+    }
+
+    let mut out = Vec::with_capacity(coords.len());
+    for k in 0..n {
+        out.push(coords[(min_idx + k) % n]);
+    }
+    out.push(out[0]);
+    *coords = out;
+}
+
+fn coord_lex_lt(a: Coord, b: Coord) -> bool {
+    if a.x < b.x {
+        true
+    } else if a.x > b.x {
+        false
+    } else {
+        a.y < b.y
+    }
+}
+
+fn ring_sort_key(coords: &[Coord]) -> (u64, u64, usize) {
+    let c0 = coords.first().copied().unwrap_or(Coord::xy(0.0, 0.0));
+    (c0.x.to_bits(), c0.y.to_bits(), coords.len())
+}
+
+fn polygon_sort_key(poly: &Polygon) -> (u64, u64, usize, usize) {
+    let c0 = poly
+        .exterior
+        .coords
+        .first()
+        .copied()
+        .unwrap_or(Coord::xy(0.0, 0.0));
+    (
+        c0.x.to_bits(),
+        c0.y.to_bits(),
+        poly.exterior.coords.len(),
+        poly.holes.len(),
+    )
+}
+
+fn choose_next_boundary_neighbor(
+    curr: QCoord,
+    prev: QCoord,
+    adjacency: &HashMap<QCoord, Vec<QCoord>>,
+    boundary_edges: &HashSet<(QCoord, QCoord)>,
+) -> Option<QCoord> {
+    let neighbors = adjacency.get(&curr)?;
+    if neighbors.is_empty() {
+        return None;
+    }
+
+    if let Some(pos_back) = neighbors.iter().position(|n| *n == prev) {
+        // Mirror the graph left-face rule: predecessor of back-edge in CCW order.
+        for k in 1..=neighbors.len() {
+            let idx = (pos_back + neighbors.len() - k) % neighbors.len();
+            let cand = neighbors[idx];
+            if boundary_edges.contains(&ordered_pair(curr, cand)) {
+                return Some(cand);
+            }
+        }
+    }
+
+    neighbors
+        .iter()
+        .copied()
+        .find(|n| boundary_edges.contains(&ordered_pair(curr, *n)))
+}
+
+fn edge_angle_q(from: QCoord, to: QCoord, coord_map: &HashMap<QCoord, Coord>) -> f64 {
+    let Some(a) = coord_map.get(&from).copied() else {
+        return 0.0;
+    };
+    let Some(b) = coord_map.get(&to).copied() else {
+        return 0.0;
+    };
+    (b.y - a.y).atan2(b.x - a.x)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::algorithms::measurements::polygon_area;
+    use crate::graph::{DirectedEdge, GraphNode};
+
+    fn dummy_ring() -> LineString {
+        LineString::new(vec![
+            Coord::xy(0.0, 0.0),
+            Coord::xy(1.0, 0.0),
+            Coord::xy(1.0, 1.0),
+            Coord::xy(0.0, 0.0),
+        ])
+    }
+
+    fn dummy_graph_with_edge_count(n_edges: usize) -> TopologyGraph {
+        let node = GraphNode {
+            id: 0,
+            coord: Coord::xy(0.0, 0.0),
+            outgoing: Vec::new(),
+        };
+        let mut edges = Vec::with_capacity(n_edges);
+        for id in 0..n_edges {
+            let sym = if id % 2 == 0 { id + 1 } else { id - 1 };
+            edges.push(DirectedEdge {
+                id,
+                from: 0,
+                to: 0,
+                sym,
+                angle: 0.0,
+            });
+        }
+        TopologyGraph {
+            nodes: vec![node],
+            edges,
+        }
+    }
+
+    #[test]
+    fn face_depth_propagation_marks_nested_face_outside_when_delta_cancels() {
+        // Face 0 has an exterior-adjacent seed edge (0; sym=1 is exterior), so depth=delta[0]=1.
+        // Crossing edge 2 into face 1 gives depth(face1)=1-delta[2]=0, thus excluded.
+        let graph = dummy_graph_with_edge_count(4);
+        let face_rings = vec![(dummy_ring(), vec![0, 2]), (dummy_ring(), vec![3])];
+        let delta = vec![1, -1, 1, -1];
+
+        let included = classify_faces_by_depth(&graph, &face_rings, &delta);
+        assert_eq!(included, vec![true, false]);
+    }
+
+    #[test]
+    fn unary_union_of_touching_squares_is_single_polygon() {
+        let a = Polygon::new(
+            LinearRing::new(vec![
+                Coord::xy(0.0, 0.0),
+                Coord::xy(1.0, 0.0),
+                Coord::xy(1.0, 1.0),
+                Coord::xy(0.0, 1.0),
+                Coord::xy(0.0, 0.0),
+            ]),
+            vec![],
+        );
+        let b = Polygon::new(
+            LinearRing::new(vec![
+                Coord::xy(1.0, 0.0),
+                Coord::xy(2.0, 0.0),
+                Coord::xy(2.0, 1.0),
+                Coord::xy(1.0, 1.0),
+                Coord::xy(1.0, 0.0),
+            ]),
+            vec![],
+        );
+
+        let out = polygon_unary_union(&[a, b], 1.0e-9);
+        assert_eq!(out.len(), 1, "touching squares should dissolve into one polygon");
+        let area = polygon_area(&out[0]);
+        assert!((area - 2.0).abs() <= 1.0e-9, "unexpected dissolved area: {area}");
+    }
+
+    #[derive(Debug)]
+    struct GeosParityFixture {
+        name: &'static str,
+        // WKT left intentionally string-based so future GEOS/JTS export/import can plug in directly.
+        a_wkt: &'static str,
+        b_wkt: &'static str,
+        expected_union_area: f64,
+    }
+
+    #[test]
+    fn geos_parity_fixture_runner_scaffold() {
+        let fixtures = vec![
+            GeosParityFixture {
+                name: "touching_unit_squares",
+                a_wkt: "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))",
+                b_wkt: "POLYGON ((1 0, 2 0, 2 1, 1 1, 1 0))",
+                expected_union_area: 2.0,
+            },
+            GeosParityFixture {
+                name: "disjoint_unit_squares",
+                a_wkt: "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))",
+                b_wkt: "POLYGON ((3 0, 4 0, 4 1, 3 1, 3 0))",
+                expected_union_area: 2.0,
+            },
+            GeosParityFixture {
+                name: "overlapping_unit_squares_half_overlap",
+                a_wkt: "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))",
+                b_wkt: "POLYGON ((0.5 0, 1.5 0, 1.5 1, 0.5 1, 0.5 0))",
+                expected_union_area: 1.5,
+            },
+            GeosParityFixture {
+                name: "contained_square",
+                a_wkt: "POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))",
+                b_wkt: "POLYGON ((1 1, 2 1, 2 2, 1 2, 1 1))",
+                expected_union_area: 16.0,
+            },
+            GeosParityFixture {
+                name: "partial_overlap_rectangles",
+                a_wkt: "POLYGON ((0 0, 3 0, 3 2, 0 2, 0 0))",
+                b_wkt: "POLYGON ((2 1, 5 1, 5 3, 2 3, 2 1))",
+                expected_union_area: 11.0,
+            },
+        ];
+
+        for fx in fixtures {
+            let ga = crate::io::from_wkt(fx.a_wkt).expect("failed parsing fixture A WKT");
+            let gb = crate::io::from_wkt(fx.b_wkt).expect("failed parsing fixture B WKT");
+            let pa = match ga {
+                Geometry::Polygon(p) => p,
+                _ => panic!("fixture '{}' A is not a polygon", fx.name),
+            };
+            let pb = match gb {
+                Geometry::Polygon(p) => p,
+                _ => panic!("fixture '{}' B is not a polygon", fx.name),
+            };
+            let out = polygon_unary_union(&[pa.clone(), pb.clone()], 1.0e-9);
+            let area: f64 = out.iter().map(polygon_area).sum();
+            assert!(
+                (area - fx.expected_union_area).abs() <= 1.0e-9,
+                "fixture '{}' area mismatch: got {area}, expected {}",
+                fx.name,
+                fx.expected_union_area
+            );
+        }
+    }
+}

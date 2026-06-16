@@ -1,0 +1,30 @@
+[package]
+name = "wbspatialstats"
+version = "0.1.0"
+edition = "2021"
+authors = ["John Lindsay", "Whitebox Geospatial Inc."]
+description = "Unified spatial statistics library: kriging, spatial autocorrelation, spatial regression, point process analysis"
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+repository = "https://github.com/jblindsay/whitebox_next_gen"
+homepage = "https://github.com/jblindsay/whitebox_next_gen"
+documentation = "https://docs.rs/wbspatialstats"
+keywords = ["kriging", "geostatistics", "spatial-statistics", "autocorrelation", "gis"]
+categories = ["science", "algorithms", "rust-patterns"]
+
+[lib]
+name = "wbspatialstats"
+crate-type = ["rlib"]
+
+[dependencies]
+nalgebra = { version = "0.34", features = ["serde"] }
+ndarray = { version = "0.15", features = ["serde"] }
+rayon = "1.7"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+log = "0.4"
+
+[features]
+default = []

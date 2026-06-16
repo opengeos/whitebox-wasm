@@ -16,6 +16,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 wbgeotiff = { path = "../wbgeotiff" }
 wbprojection = { path = "../wbprojection", default-features = false }
+wbvector = { path = "../wbvector", features = ["geoparquet", "kmz", "osmpbf"] }
+wblidar = { path = "../wblidar" }
+wbtopology = { path = "../wbtopology" }
+wbspatialstats = { path = "../wbspatialstats" }
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
 
@@ -26,3 +30,6 @@ wasm-bindgen-test = "0.3"
 # on by default in LLVM output. Enable the features the toolchain now emits.
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ['-O', '--enable-bulk-memory', '--enable-nontrapping-float-to-int', '--enable-sign-ext', '--enable-mutable-globals']
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

@@ -1,0 +1,9 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {"type":"Feature","properties":{"name":"San Francisco","pop":873965},"geometry":{"type":"Point","coordinates":[-122.4194,37.7749]}},
+    {"type":"Feature","properties":{"name":"Los Angeles","pop":3898747},"geometry":{"type":"Point","coordinates":[-118.2437,34.0522]}},
+    {"type":"Feature","properties":{"name":"Sacramento","pop":524943},"geometry":{"type":"Point","coordinates":[-121.4944,38.5816]}},
+    {"type":"Feature","properties":{"name":"Fresno","pop":542107},"geometry":{"type":"Point","coordinates":[-119.7726,36.7468]}}
+  ]
+}

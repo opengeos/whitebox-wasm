@@ -3,64 +3,170 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>whitebox-wasm · GeoTIFF in the browser</title>
+<title>whitebox-wasm · geospatial in the browser</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font: 16px/1.5 system-ui, sans-serif; max-width: 760px; margin: 3rem auto; padding: 0 1rem; }
+  :root { color-scheme: light dark; --accent:#2563eb; --bd:#8884; }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.55 system-ui, sans-serif; max-width: 860px; margin: 2.5rem auto; padding: 0 1rem; }
   h1 { margin-bottom: 0; }
   .sub { color: #888; margin-top: .25rem; }
-  pre { background: #0001; padding: 1rem; border-radius: 8px; overflow:auto; }
-  input[type=file] { margin: 1rem 0; }
-  .pill { display:inline-block; background:#2563eb; color:#fff; border-radius:999px; padding:.1rem .6rem; font-size:.8rem;}
+  .pill { display:inline-block; background:var(--accent); color:#fff; border-radius:999px; padding:.1rem .6rem; font-size:.78rem; }
+  nav { display:flex; gap:.4rem; flex-wrap:wrap; margin:1.5rem 0 1rem; border-bottom:1px solid var(--bd); }
+  nav button { font:inherit; background:none; border:none; padding:.5rem .9rem; cursor:pointer; color:inherit; border-bottom:2px solid transparent; opacity:.7; }
+  nav button.active { border-bottom-color:var(--accent); opacity:1; font-weight:600; }
+  section { display:none; }
+  section.active { display:block; }
+  .row { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; margin:.8rem 0; }
+  button.act { font:inherit; background:var(--accent); color:#fff; border:none; border-radius:7px; padding:.45rem .8rem; cursor:pointer; }
+  input[type=file] { font:inherit; }
+  input[type=number] { font:inherit; width:7rem; padding:.3rem; border-radius:6px; border:1px solid var(--bd); background:transparent; color:inherit; }
+  pre { background:#0001; padding:1rem; border-radius:8px; overflow:auto; max-height:340px; font-size:13px; }
+  svg { background:#0001; border-radius:8px; width:100%; max-width:420px; height:auto; }
+  code { background:#0001; padding:.05rem .3rem; border-radius:4px; }
+  .muted { color:#888; font-size:.9rem; }
 </style>
 </head>
 <body>
   <h1>whitebox-wasm</h1>
-  <p class="sub">Pure-Rust GeoTIFF decoding compiled to WebAssembly. No GDAL. No server. <span class="pill">runs in your browser</span></p>
-  <p>Drop a <code>.tif</code> / <code>.tiff</code> below - it is decoded entirely client-side.</p>
-  <input id="file" type="file" accept=".tif,.tiff,image/tiff" />
-  <button id="sample">Use bundled sample</button>
-  <pre id="out">Loading WASM…</pre>
+  <p class="sub">Pure-Rust geospatial toolkit compiled to WebAssembly. No GDAL. No server. <span class="pill" id="ver">runs in your browser</span></p>
+
+  <nav>
+    <button data-tab="raster" class="active">Raster</button>
+    <button data-tab="vector">Vector</button>
+    <button data-tab="lidar">LiDAR</button>
+    <button data-tab="analysis">Analysis</button>
+  </nav>
+
+  <!-- RASTER -->
+  <section id="raster" class="active">
+    <p>Read a <code>GeoTIFF</code> / <code>COG</code> entirely client-side: metadata, bbox, center (WGS84), and band statistics.</p>
+    <div class="row">
+      <input id="rfile" type="file" accept=".tif,.tiff,image/tiff" />
+      <button class="act" id="rsample">Use sample DEM</button>
+    </div>
+    <pre id="rout">Loading WASM…</pre>
+  </section>
+
+  <!-- VECTOR -->
+  <section id="vector">
+    <p>Read <code>GeoJSON</code>, <code>FlatGeobuf</code>, <code>GeoPackage</code>, <code>KML/KMZ</code>, <code>GPX</code>, <code>GML</code>, <code>TopoJSON</code> -> GeoJSON, with metadata and reprojection.</p>
+    <div class="row">
+      <input id="vfile" type="file" accept=".geojson,.json,.fgb,.gpkg,.kml,.kmz,.gpx,.gml,.topojson" />
+      <button class="act" id="vsample">Use sample GeoJSON</button>
+      <label class="muted">reproject to EPSG <input id="vepsg" type="number" value="3857" /></label>
+    </div>
+    <pre id="vout">Choose a vector file.</pre>
+  </section>
+
+  <!-- LIDAR -->
+  <section id="lidar">
+    <p>Read <code>LAS</code> / <code>LAZ</code> / <code>PLY</code> point clouds: header (count, bounds, CRS) and per-point coordinates / classification / intensity.</p>
+    <div class="row">
+      <input id="lfile" type="file" accept=".las,.laz,.ply" />
+      <button class="act" id="lsample">Use sample LAS</button>
+    </div>
+    <pre id="lout">Choose a point cloud.</pre>
+  </section>
+
+  <!-- ANALYSIS -->
+  <section id="analysis">
+    <p>Computational geometry and geostatistics on a random point set: <code>convex_hull</code> and global <code>Moran's I</code> spatial autocorrelation.</p>
+    <div class="row">
+      <label class="muted">points <input id="anum" type="number" value="60" /></label>
+      <button class="act" id="agen">Generate &amp; analyze</button>
+    </div>
+    <div class="row" style="align-items:flex-start;">
+      <svg id="aplot" viewBox="0 0 400 400" aria-label="points and convex hull"></svg>
+      <pre id="aout" style="flex:1; min-width:220px;">Click "Generate &amp; analyze".</pre>
+    </div>
+  </section>
 
   <script type="module">
-    // __BUILD__ is replaced with the commit SHA at deploy time so the JS glue
-    // and the .wasm always update as a matched pair (avoids cached-glue +
-    // new-wasm LinkErrors).
+    // __BUILD__ is replaced with the commit SHA at deploy time so the JS glue and
+    // the .wasm always update as a matched pair (avoids cached-glue LinkErrors).
     const V = "__BUILD__";
-    import init, { geotiff_stats, geotiff_info, version } from "./whitebox_wasm.js?v=__BUILD__";
-    const out = document.getElementById("out");
+    import init, * as wb from "./whitebox_wasm.js?v=__BUILD__";
     await init({ module_or_path: `./whitebox_wasm_bg.wasm?v=${V}` });
-    out.textContent = `whitebox-wasm v${version()} ready. Choose a file.`;
+    document.getElementById("ver").textContent = "v" + wb.version();
 
-    // Whole-raster stats are bounded by WASM's ~4 GiB address space; skip them
-    // for gigapixel rasters and show metadata only.
-    const STATS_CELL_LIMIT = 150_000_000;
-    async function run(bytes) {
-      try {
-        const u8 = new Uint8Array(bytes);
-        const info = JSON.parse(geotiff_info(u8));
-        const cells = (info.width || 0) * (info.height || 0) * (info.bands || 1);
-        const result = { info };
-        if (info.ok && cells > 0 && cells <= STATS_CELL_LIMIT) {
-          result.stats = JSON.parse(geotiff_stats(u8));
-        } else if (info.ok) {
-          result.stats = `skipped: ${cells.toLocaleString()} cells too large for in-browser stats`;
-        }
-        out.textContent = JSON.stringify(result, null, 2);
-      } catch (e) {
-        out.textContent = "Error: " + (e && e.message ? e.message : String(e));
-        console.error(e);
-      }
+    // tab switching
+    document.querySelectorAll("nav button").forEach(b => b.addEventListener("click", () => {
+      document.querySelectorAll("nav button").forEach(x => x.classList.remove("active"));
+      document.querySelectorAll("section").forEach(x => x.classList.remove("active"));
+      b.classList.add("active");
+      document.getElementById(b.dataset.tab).classList.add("active");
+    }));
+
+    const show = (el, v) => el.textContent = typeof v === "string" ? v : JSON.stringify(v, null, 2);
+    const guard = (el, fn) => fn().catch(e => { show(el, "Error: " + (e?.message || e)); console.error(e); });
+
+    // ---------- Raster ----------
+    const rout = document.getElementById("rout");
+    rout.textContent = `whitebox-wasm v${wb.version()} ready. Choose a GeoTIFF.`;
+    const CELL_LIMIT = 150_000_000;
+    async function runRaster(buf) {
+      const u8 = new Uint8Array(buf);
+      const info = JSON.parse(wb.geotiff_info(u8));
+      const cells = (info.width||0)*(info.height||0)*(info.bands||1);
+      const res = { info };
+      if (info.ok && cells > 0 && cells <= CELL_LIMIT) res.stats = JSON.parse(wb.geotiff_stats(u8));
+      else if (info.ok) res.stats = `skipped: ${cells.toLocaleString()} cells too large for in-browser stats`;
+      show(rout, res);
     }
-    document.getElementById("file").addEventListener("change", async (e) => {
-      const f = e.target.files[0]; if (!f) return;
-      out.textContent = `Decoding ${f.name} (${f.size} bytes)…`;
-      run(await f.arrayBuffer());
-    });
-    document.getElementById("sample").addEventListener("click", async () => {
-      out.textContent = "Fetching bundled sample…";
-      run(await (await fetch("./sample.tif")).arrayBuffer());
-    });
+    document.getElementById("rfile").onchange = e => { const f=e.target.files[0]; if(f){ rout.textContent=`Decoding ${f.name}…`; guard(rout, async()=>runRaster(await f.arrayBuffer())); } };
+    document.getElementById("rsample").onclick = () => guard(rout, async()=>{ rout.textContent="Fetching sample DEM…"; runRaster(await (await fetch("./sample.tif")).arrayBuffer()); });
+
+    // ---------- Vector ----------
+    const vout = document.getElementById("vout");
+    const fmtFromName = n => {
+      const e = n.toLowerCase().split(".").pop();
+      return ({geojson:"geojson",json:"geojson",fgb:"flatgeobuf",gpkg:"geopackage",kml:"kml",kmz:"kmz",gpx:"gpx",gml:"gml",topojson:"topojson"})[e] || "geojson";
+    };
+    async function runVector(buf, fmt) {
+      const u8 = new Uint8Array(buf);
+      const info = JSON.parse(wb.vector_info(u8, fmt));
+      const dst = parseInt(document.getElementById("vepsg").value, 10) || 4326;
+      const reproj = JSON.parse(wb.vector_to_geojson_reproject(u8, fmt, dst, 0));
+      const first = reproj.features?.[0]?.geometry?.coordinates;
+      show(vout, { format: fmt, info, [`reprojected_to_${dst}`]: { features: reproj.features.length, first_coords: first } });
+    }
+    document.getElementById("vfile").onchange = e => { const f=e.target.files[0]; if(f){ vout.textContent=`Reading ${f.name}…`; guard(vout, async()=>runVector(await f.arrayBuffer(), fmtFromName(f.name))); } };
+    document.getElementById("vsample").onclick = () => guard(vout, async()=>{ vout.textContent="Fetching sample GeoJSON…"; runVector(await (await fetch("./sample.geojson")).arrayBuffer(), "geojson"); });
+
+    // ---------- LiDAR ----------
+    const lout = document.getElementById("lout");
+    async function runLidar(buf, fmt) {
+      const u8 = new Uint8Array(buf);
+      const info = JSON.parse(wb.lidar_info(u8, fmt));
+      const xyz = wb.lidar_read_xyz(u8, fmt);
+      const cls = wb.lidar_read_classification(u8, fmt);
+      const pts = [];
+      for (let i=0;i<Math.min(5, xyz.length/3);i++) pts.push([xyz[i*3], xyz[i*3+1], xyz[i*3+2]]);
+      show(lout, { format: fmt, info, first_points_xyz: pts, classification_first5: Array.from(cls.slice(0,5)) });
+    }
+    document.getElementById("lfile").onchange = e => { const f=e.target.files[0]; if(f){ lout.textContent=`Reading ${f.name}…`; guard(lout, async()=>runLidar(await f.arrayBuffer(), f.name.toLowerCase().split(".").pop())); } };
+    document.getElementById("lsample").onclick = () => guard(lout, async()=>{ lout.textContent="Fetching sample LAS…"; runLidar(await (await fetch("./sample.las")).arrayBuffer(), "las"); });
+
+    // ---------- Analysis ----------
+    const aout = document.getElementById("aout"), aplot = document.getElementById("aplot");
+    function analyze() {
+      const n = Math.max(3, Math.min(2000, parseInt(document.getElementById("anum").value,10) || 60));
+      // points clustered toward the center so Moran's I is meaningfully positive
+      const xy = [], vals = [];
+      for (let i=0;i<n;i++){ const x=Math.random()*380+10, y=Math.random()*380+10; xy.push(x,y); vals.push(400-Math.hypot(x-200,y-200)); }
+      const pts = new Float64Array(xy);
+      const hull = wb.convex_hull(pts);
+      const mi = JSON.parse(wb.morans_i(pts, new Float64Array(vals), 60));
+      // draw
+      let svg = "";
+      for (let i=0;i<n;i++) svg += `<circle cx="${xy[i*2].toFixed(1)}" cy="${(400-xy[i*2+1]).toFixed(1)}" r="2.5" fill="#2563eb"/>`;
+      let d = "";
+      for (let i=0;i<hull.length;i+=2) d += (i?"L":"M") + hull[i].toFixed(1) + "," + (400-hull[i+1]).toFixed(1) + " ";
+      svg += `<path d="${d}Z" fill="#2563eb22" stroke="#2563eb" stroke-width="1.5"/>`;
+      aplot.innerHTML = svg;
+      show(aout, { points: n, convex_hull_vertices: hull.length/2, morans_i: mi });
+    }
+    document.getElementById("agen").onclick = () => guard(aout, async()=>analyze());
   </script>
 </body>
 </html>

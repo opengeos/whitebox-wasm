@@ -65,7 +65,7 @@ wasm-pack build crates/whitebox-wasm --release --target web --out-dir pkg
 ## Releasing
 
 Push a tag `vX.Y.Z`. CI then:
-1. publishes `whitebox-wasm@X.Y.Z` to npm (requires the `NPM_TOKEN` repo secret),
+1. publishes `whitebox-wasm@X.Y.Z` to npm via Trusted Publishing (OIDC, with provenance, no secret required),
 2. attaches the raw `.wasm` + JS loader to the GitHub Release.
 
 Pushes to `main` redeploy the [live demo](https://opengeos.github.io/whitebox-wasm/) to GitHub Pages.

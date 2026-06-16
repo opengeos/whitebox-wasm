@@ -1,7 +1,7 @@
 # whitebox-wasm
 
 [![CI](https://github.com/opengeos/whitebox-wasm/actions/workflows/ci.yml/badge.svg)](https://github.com/opengeos/whitebox-wasm/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/@opengeos/whitebox-wasm.svg)](https://www.npmjs.com/package/@opengeos/whitebox-wasm)
+[![npm](https://img.shields.io/npm/v/whitebox-wasm.svg)](https://www.npmjs.com/package/whitebox-wasm)
 [![Live demo](https://img.shields.io/badge/demo-GitHub%20Pages-blue)](https://opengeos.github.io/whitebox-wasm/)
 
 **Pure-Rust GeoTIFF decoding compiled to WebAssembly.** No GDAL, no PROJ, no
@@ -22,13 +22,13 @@ published module imports nothing from the host beyond its own linear memory.
 ## Install
 
 ```bash
-npm install @opengeos/whitebox-wasm
+npm install whitebox-wasm
 ```
 
 ## Usage (browser / Deno / Node ≥ 20, ESM)
 
 ```js
-import init, { geotiff_stats, geotiff_info, version } from "@opengeos/whitebox-wasm";
+import init, { geotiff_stats, geotiff_info, version } from "whitebox-wasm";
 
 await init();                       // in Node, pass the .wasm bytes to init()
 const bytes = new Uint8Array(await (await fetch("dem.tif")).arrayBuffer());
@@ -59,13 +59,13 @@ On failure functions return `{"ok":false,"error":"..."}`.
 ```bash
 rustup target add wasm32-unknown-unknown
 cargo install wasm-pack
-wasm-pack build crates/whitebox-wasm --release --target web --scope opengeos --out-dir pkg
+wasm-pack build crates/whitebox-wasm --release --target web --out-dir pkg
 ```
 
 ## Releasing
 
 Push a tag `vX.Y.Z`. CI then:
-1. publishes `@opengeos/whitebox-wasm@X.Y.Z` to npm (requires the `NPM_TOKEN` repo secret),
+1. publishes `whitebox-wasm@X.Y.Z` to npm (requires the `NPM_TOKEN` repo secret),
 2. attaches the raw `.wasm` + JS loader to the GitHub Release.
 
 Pushes to `main` redeploy the [live demo](https://opengeos.github.io/whitebox-wasm/) to GitHub Pages.

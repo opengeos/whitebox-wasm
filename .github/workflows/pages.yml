@@ -23,7 +23,7 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Build wasm package into the demo dir
         run: |
-          wasm-pack build crates/whitebox-wasm --release --target web --scope opengeos \
+          wasm-pack build crates/whitebox-wasm --release --target web \
             --out-dir "$GITHUB_WORKSPACE/site"
           cp demo/index.html site/index.html
           cp examples/sample.tif site/sample.tif

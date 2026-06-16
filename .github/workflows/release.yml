@@ -21,7 +21,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Build package
-        run: wasm-pack build crates/whitebox-wasm --release --target web --scope opengeos --out-dir pkg
+        run: wasm-pack build crates/whitebox-wasm --release --target web --out-dir pkg
 
       - name: Sync package version to tag
         run: |

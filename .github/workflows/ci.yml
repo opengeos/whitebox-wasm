@@ -22,6 +22,6 @@ jobs:
       - name: cargo test (host)
         run: cargo test --workspace
       - name: wasm-pack build
-        run: wasm-pack build crates/whitebox-wasm --release --target web --scope opengeos --out-dir pkg
+        run: wasm-pack build crates/whitebox-wasm --release --target web --out-dir pkg
       - name: Node smoke test
         run: node examples/node-demo.mjs

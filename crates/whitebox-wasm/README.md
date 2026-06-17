@@ -9,6 +9,7 @@ in the browser, Node, Deno, or any Wasm host:
 - **Vector** - read GeoJSON, TopoJSON, GML, GPX, KML, FlatGeobuf, GeoPackage, KMZ -> GeoJSON, with reprojection
 - **LiDAR** - read LAS / LAZ / PLY point clouds (xyz, classification, intensity)
 - **Analysis** - convex hull, Moran's I spatial autocorrelation
+- **Tools** - the full WhiteboxTools suite (733 tools) via `whitebox-wasm/tools`
 
 This wraps `wbgeotiff`, the shared GeoTIFF engine from the original
 [**whitebox_next_gen**](https://github.com/jblindsay/whitebox_next_gen) project
@@ -171,6 +172,40 @@ const xyz = lidar_read_xyz(las, "laz");          // Float64Array [x0,y0,z0, x1,y
 
 - `convex_hull(points_xy)` -> hull ring `Float64Array` (input `[x0,y0,x1,y1,...]`)
 - `morans_i(points_xy, values, distance_threshold)` -> JSON global spatial autocorrelation `{morans_i, expected, variance, z_score, p_value, n}`
+
+## Tools (the full WhiteboxTools suite)
+
+The `whitebox-wasm/tools` subpath runs the complete **WhiteboxTools** algorithm
+suite (**733 tools** - slope, filters, hydrology, geomorphometry, vector ops,
+...). The tools are path-based, so they run through an in-memory WASI filesystem
+(bundled `whitebox-cli.wasm`); raster outputs are Cloud Optimized GeoTIFFs.
+
+```js
+import { runTool, listTools } from "whitebox-wasm/tools";
+
+console.log((await listTools()).length);  // 733
+
+// raster: slope -> a COG
+const { files } = await runTool("slope", {
+  args: ["--input=/work/dem.tif", "--output=/work/slope.tif", "--units=degrees"],
+  input: { "dem.tif": demBytes },         // Uint8Array, placed under /work
+});
+const slopeCog = files["slope.tif"];      // Uint8Array (tiled, Deflate, overviews)
+
+// vector: convex hull -> GeoJSON
+const hull = await runTool("minimum_convex_hull", {
+  args: ["--input=/work/in.geojson", "--output=/work/hull.geojson"],
+  input: { "in.geojson": geojsonBytes },
+});
+```
+
+- `listTools()` -> `string[]` of tool ids
+- `runTool(id, { args, input })` -> `{ exitCode, stdout, files }` (`files` = outputs the tool wrote)
+- `initTools(source?)` -> compile the runner; in Node pass the wasm bytes (browsers/bundlers omit it)
+
+Needs the `@bjorn3/browser_wasi_shim` peer (declared as a dependency). The
+`whitebox-cli.wasm` (~5 MB gzipped) is only fetched the first time you call a
+tool, so the rest of the library stays lightweight.
 
 ## Limits
 

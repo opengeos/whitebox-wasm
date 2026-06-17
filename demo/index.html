@@ -35,6 +35,7 @@
     <button data-tab="vector">Vector</button>
     <button data-tab="lidar">LiDAR</button>
     <button data-tab="analysis">Analysis</button>
+    <button data-tab="tools">Tools</button>
   </nav>
 
   <!-- RASTER -->
@@ -79,6 +80,29 @@
       <svg id="aplot" viewBox="0 0 400 400" aria-label="points and convex hull"></svg>
       <pre id="aout" style="flex:1; min-width:220px;">Click "Generate &amp; analyze".</pre>
     </div>
+  </section>
+
+  <!-- TOOLS (WASI) -->
+  <section id="tools">
+    <p>Run the real <strong>WhiteboxTools</strong> algorithm suite (733 tools) on a
+      DEM, in your browser. This loads the WASI <code>whitebox-cli.wasm</code>
+      (~5&nbsp;MB gzipped, fetched on first run) and executes it through an
+      in-memory WASI filesystem - the tool reads <code>/work/dem.tif</code> and
+      writes <code>/work/out.tif</code>, both virtual.</p>
+    <div class="row">
+      <label class="muted">tool
+        <select id="ttool">
+          <option value="slope|--units=degrees">slope (degrees)</option>
+          <option value="aspect|">aspect</option>
+          <option value="hillshade|--azimuth=315 --altitude=45">hillshade</option>
+          <option value="mean_filter|">mean_filter</option>
+          <option value="gaussian_filter|">gaussian_filter</option>
+        </select>
+      </label>
+      <input id="tfile" type="file" accept=".tif,.tiff" />
+      <button class="act" id="trun">Run on sample DEM</button>
+    </div>
+    <pre id="tout">Pick a tool and click Run. The WASI runtime downloads on first use.</pre>
   </section>
 
   <script type="module">
@@ -167,6 +191,64 @@
       show(aout, { points: n, convex_hull_vertices: hull.length/2, morans_i: mi });
     }
     document.getElementById("agen").onclick = () => guard(aout, async()=>analyze());
+
+    // ---------- Tools (WASI) ----------
+    // Runs the real WhiteboxTools WASI binary in-browser via a WASI shim, with
+    // an in-memory filesystem. The wasm + shim are loaded lazily on first run.
+    const tout = document.getElementById("tout");
+    let wasiMod = null, shimMod = null;
+    async function loadWasi() {
+      if (!shimMod) shimMod = await import("https://esm.sh/@bjorn3/browser_wasi_shim@0.4.2");
+      if (!wasiMod) {
+        tout.textContent = "Downloading WASI runtime (whitebox-cli.wasm, ~5 MB gzipped)…";
+        wasiMod = await WebAssembly.compileStreaming(fetch(`./whitebox-cli.wasm?v=${V}`));
+      }
+      return { shim: shimMod, mod: wasiMod };
+    }
+    async function runTool(toolArgs, demBytes) {
+      const { shim, mod } = await loadWasi();
+      const { WASI, File, OpenFile, ConsoleStdout, PreopenDirectory } = shim;
+      const work = new PreopenDirectory("/work", new Map([["dem.tif", new File(new Uint8Array(demBytes))]]));
+      const log = [];
+      const fds = [
+        new OpenFile(new File(new Uint8Array())),
+        ConsoleStdout.lineBuffered(s => log.push(s)),
+        ConsoleStdout.lineBuffered(s => log.push(s)),
+        work,
+      ];
+      const wasi = new WASI(["whitebox", ...toolArgs], [], fds, { debug: false });
+      const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: wasi.wasiImport });
+      let code = 0;
+      try { code = wasi.start(inst); }
+      catch (e) { if (e?.constructor?.name === "WASIProcExit") code = e.code; else throw e; }
+      const out = work.dir.contents.get("out.tif");
+      return { code, log, out: out?.data };
+    }
+    async function doTool(demBytes) {
+      const [tool, extra] = document.getElementById("ttool").value.split("|");
+      const args = [tool, "--input=/work/dem.tif", "--output=/work/out.tif", ...extra.split(" ").filter(Boolean)];
+      tout.textContent = `Running '${tool}' in WASI…`;
+      const t0 = performance.now();
+      const r = await runTool(args, demBytes);
+      const ms = Math.round(performance.now() - t0);
+      if (!r.out) { tout.textContent = `'${tool}' produced no output (exit ${r.code}).\n${r.log.join("\n")}`; return; }
+      // validate + summarize the output GeoTIFF with the browser reader
+      const info = JSON.parse(wb.geotiff_info(r.out));
+      const cells = (info.width||0)*(info.height||0)*(info.bands||1);
+      const stats = cells>0 && cells<=150_000_000 ? JSON.parse(wb.geotiff_stats(r.out)) : "skipped (too large)";
+      // offer the result for download
+      const url = URL.createObjectURL(new Blob([r.out], { type: "image/tiff" }));
+      show(tout, { tool, exit_code: r.code, ms, log: r.log, output_info: info, output_stats: stats });
+      const a = document.createElement("a");
+      a.href = url; a.download = `${tool}.tif`; a.textContent = `⬇ download ${tool}.tif (${r.out.length} bytes)`;
+      a.style.display = "inline-block"; a.style.marginTop = ".6rem";
+      tout.after(a); setTimeout(() => a.remove(), 60000);
+    }
+    document.getElementById("trun").onclick = () => guard(tout, async () => {
+      const f = document.getElementById("tfile").files[0];
+      const buf = f ? await f.arrayBuffer() : await (await fetch("./sample.tif")).arrayBuffer();
+      await doTool(buf);
+    });
   </script>
 </body>
 </html>

@@ -170,6 +170,11 @@
     async function runLidar(buf, fmt) {
       const u8 = new Uint8Array(buf);
       const info = JSON.parse(wb.lidar_info(u8, fmt));
+      if (info.copc) {   // COPC: header-only (full reads need range access / not supported yet)
+        show(lout, { format: fmt, info,
+          note: "COPC point cloud - metadata shown; full in-browser point reads are not supported yet." });
+        return;
+      }
       const xyz = wb.lidar_read_xyz(u8, fmt);
       const cls = wb.lidar_read_classification(u8, fmt);
       const pts = [];

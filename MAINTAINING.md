@@ -17,8 +17,13 @@ explains those patches and how to pull in upstream updates.
 | `crates/whitebox-cli` | WASI binary that runs the 733 `wbtools_oss` tools on files | WASI |
 | `crates/kdtree-wasm` | patched copy of the `kdtree` crate (see below) | both |
 
-The browser npm package is built **only** from `whitebox-wasm` and its
-dependencies; it does not include `wbcore`/`wbraster`/`wbtools_oss`/`whitebox-cli`.
+The browser-library wasm (`whitebox_wasm_bg.wasm`) is built **only** from
+`whitebox-wasm` and its dependencies and does not link
+`wbcore`/`wbraster`/`wbtools_oss`. The npm package, however, also **bundles the
+WASI tool runner** (`whitebox-cli.wasm` + `tools.mjs`, exposed at
+`whitebox-wasm/tools`) so the 733 tools are usable from npm; `scripts/finalize-pkg.mjs`
+adds those files, the `@bjorn3/browser_wasi_shim` dependency, and the `./tools`
+export to the wasm-pack-generated package during the release build.
 
 ## WASM compatibility reference (the issues and how they were solved)
 
@@ -63,6 +68,7 @@ must be re-applied. All are small, additive, and backward-compatible.
 | `wbgeotiff/src/lib.rs` | re-export `CogLayout, CogLevel, GeoTiffMeta` | expose the above |
 | `wbvector/src/geopackage/mod.rs` | add `from_bytes(Vec<u8>) -> Layer` | read GeoPackage from memory |
 | `wblidar/src/laz/reader.rs` | add `LazReader::header()` passthrough | LAZ metadata without decoding all points |
+| `wblidar/src/laz/laszip_chunk_table.rs` | cap the up-front `Vec::with_capacity` of the chunk table | a misread/corrupt chunk count must not cause a `capacity overflow` panic (e.g. COPC read via the standard path) |
 | `wbraster/src/formats/geotiff.rs` | `geotiff::write` defaults to `GeoTiffLayout::Cog` + `Deflate` | tool raster outputs are tiled COGs (open in geotiff.js / GeoLibre); affects every tool that writes a `.tif` |
 | `wbhdf/Cargo.toml` | `thiserror = "1"` instead of `{ workspace = true }` | optional now that the root defines `[workspace.dependencies]` |
 | `crates/kdtree-wasm/Cargo.toml` | remove the `criterion` dependency + `[[bench]]` | issue 2 above |

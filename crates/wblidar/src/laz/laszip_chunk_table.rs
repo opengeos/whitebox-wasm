@@ -214,7 +214,11 @@ pub fn read_laszip_chunk_table_entries<R: Read>(
 
     let mut int_dec = IntegerDecompressor::new(32, 2, 8, 0);
     let mut prev = LaszipChunkTableEntry::default();
-    let mut out = Vec::with_capacity(chunk_count as usize);
+    // Cap the up-front reservation: a corrupt/misread `chunk_count` (e.g. when a
+    // non-standard stream is decoded here) must not trigger a capacity-overflow
+    // panic. The vector still grows to the real count; a bogus count fails later
+    // on I/O when the bytes run out.
+    let mut out = Vec::with_capacity((chunk_count as usize).min(1 << 20));
 
     for _ in 0..chunk_count {
         let mut cur = LaszipChunkTableEntry::default();

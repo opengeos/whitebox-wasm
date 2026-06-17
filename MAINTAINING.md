@@ -63,6 +63,7 @@ must be re-applied. All are small, additive, and backward-compatible.
 | `wbgeotiff/src/lib.rs` | re-export `CogLayout, CogLevel, GeoTiffMeta` | expose the above |
 | `wbvector/src/geopackage/mod.rs` | add `from_bytes(Vec<u8>) -> Layer` | read GeoPackage from memory |
 | `wblidar/src/laz/reader.rs` | add `LazReader::header()` passthrough | LAZ metadata without decoding all points |
+| `wbraster/src/formats/geotiff.rs` | `geotiff::write` defaults to `GeoTiffLayout::Cog` + `Deflate` | tool raster outputs are tiled COGs (open in geotiff.js / GeoLibre); affects every tool that writes a `.tif` |
 | `wbhdf/Cargo.toml` | `thiserror = "1"` instead of `{ workspace = true }` | optional now that the root defines `[workspace.dependencies]` |
 | `crates/kdtree-wasm/Cargo.toml` | remove the `criterion` dependency + `[[bench]]` | issue 2 above |
 

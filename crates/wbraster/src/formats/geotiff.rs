@@ -249,7 +249,16 @@ pub fn read(path: &str) -> Result<Raster> {
 
 /// Write GeoTIFF / BigTIFF / COG to `path`.
 pub fn write(raster: &Raster, path: &str) -> Result<()> {
-    write_with_options(raster, path, &GeoTiffWriteOptions::default())
+    // Default GeoTIFF output is a Cloud Optimized GeoTIFF (tiled + overviews +
+    // GDAL ghost metadata) so tool outputs open directly in web map viewers
+    // (geotiff.js / GeoLibre require tiled rasters). A COG is a valid plain
+    // GeoTIFF, so this stays backward compatible for desktop GIS too.
+    let opts = GeoTiffWriteOptions {
+        layout: Some(GeoTiffLayout::Cog { tile_size: 512 }),
+        compression: Some(GeoTiffCompression::Deflate),
+        ..GeoTiffWriteOptions::default()
+    };
+    write_with_options(raster, path, &opts)
 }
 
 /// Write GeoTIFF / BigTIFF / COG to `path` with typed options.

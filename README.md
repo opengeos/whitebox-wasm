@@ -162,24 +162,52 @@ getrandom = { version = "0.2", features = ["js"] }
 ### `wbtools_oss` tools on real files (WASI)
 
 The full `wbtools_oss` algorithm suite (**733 tools** - slope, filters,
-hydrology, geomorphometry, ...) reads and writes rasters by **file path**, so it
-cannot run in the browser (no filesystem). It *can* run under
-[**WASI**](https://wasi.dev) (`wasm32-wasip1`), which provides a real filesystem,
-and the tools then work with regular files unchanged. This repo ships a WASI CLI
-(`crates/whitebox-cli`) for exactly that:
+hydrology, geomorphometry, vector ops, ...) reads and writes data by **file
+path**, so it cannot run in the browser directly (no filesystem). It *can* run
+under [**WASI**](https://wasi.dev) (`wasm32-wasip1`), which provides a real
+filesystem, and the tools then work with regular files unchanged. This repo
+ships a WASI CLI (`crates/whitebox-cli`) for exactly that.
+
+**Build it:**
 
 ```bash
 rustup target add wasm32-wasip1
 cargo build -p whitebox-cli --target wasm32-wasip1 --release
-
-# list all tools
-wasmtime run target/wasm32-wasip1/release/whitebox.wasm list
-
-# run a tool on regular files (map a host dir into the sandbox with --dir)
-wasmtime run --dir ./data::/work \
-  target/wasm32-wasip1/release/whitebox.wasm \
-  slope --input=/work/dem.tif --output=/work/slope.tif --units=degrees
+WB="target/wasm32-wasip1/release/whitebox.wasm"
 ```
+
+**Use it** with any WASI runtime (e.g. [wasmtime](https://wasmtime.dev)). The
+CLI is `whitebox <tool-id> --param=value ...`; tools take `--input`/`--output`
+file paths plus tool-specific parameters. Map a host directory into the sandbox
+with `--dir HOST::/work`, then reference files under `/work`:
+
+```bash
+# discover tools
+wasmtime run $WB list                 # all 733 tool ids
+wasmtime run $WB help slope           # one tool
+
+# raster: a DEM in ./data -> a slope raster (output is a Cloud Optimized GeoTIFF)
+wasmtime run --dir ./data::/work $WB \
+  slope --input=/work/dem.tif --output=/work/slope.tif --units=degrees
+
+# raster filters / terrain
+wasmtime run --dir ./data::/work $WB hillshade --input=/work/dem.tif --output=/work/hs.tif --azimuth=315 --altitude=45
+wasmtime run --dir ./data::/work $WB fill_depressions --input=/work/dem.tif --output=/work/filled.tif
+
+# vector: GeoJSON / Shapefile / FlatGeobuf / GeoPackage in and out (by extension)
+wasmtime run --dir ./data::/work $WB minimum_convex_hull --input=/work/points.geojson --output=/work/hull.geojson
+wasmtime run --dir ./data::/work $WB buffer_vector --input=/work/points.geojson --distance=100 --output=/work/buf.geojson
+```
+
+**Raster outputs are Cloud Optimized GeoTIFFs** (tiled, Deflate-compressed, with
+overviews and GDAL ghost metadata), so they open directly in QGIS, GDAL,
+rasterio, and web viewers such as geotiff.js / MapLibre. (Other output formats
+follow the file extension you give `--output`.)
+
+**In the browser:** the same `whitebox.wasm` runs client-side through a WASI
+shim with an in-memory filesystem - see the **Tools** tab of the
+[live demo](https://opengeos.github.io/whitebox-wasm/) and
+[`demo/index.html`](demo/index.html).
 
 The only change needed to compile `wbtools_oss` to WASI is patching the
 `kdtree 0.8.0` dependency, which ships `criterion` as a *normal* dependency (a

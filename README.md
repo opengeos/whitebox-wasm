@@ -1,12 +1,19 @@
 # whitebox-wasm
 
 [![CI](https://github.com/opengeos/whitebox-wasm/actions/workflows/ci.yml/badge.svg)](https://github.com/opengeos/whitebox-wasm/actions/workflows/ci.yml)
+[![WASI CLI](https://github.com/opengeos/whitebox-wasm/actions/workflows/wasi.yml/badge.svg)](https://github.com/opengeos/whitebox-wasm/actions/workflows/wasi.yml)
 [![npm](https://img.shields.io/npm/v/whitebox-wasm.svg)](https://www.npmjs.com/package/whitebox-wasm)
 [![Live demo](https://img.shields.io/badge/demo-GitHub%20Pages-blue)](https://opengeos.github.io/whitebox-wasm/)
 
 **Pure-Rust geospatial toolkit compiled to WebAssembly.** No GDAL, no PROJ, no
-native libraries, no server. Work with raster, vector, and LiDAR data entirely
-in the browser, Node, Deno, or any Wasm host:
+native libraries, no server. Two artifacts, both pure WebAssembly:
+
+- a **browser/Node library** (the npm package) for raster, vector, and LiDAR I/O
+  and analysis, and
+- a **WASI command-line runner** that runs the full WhiteboxTools algorithm suite
+  on regular files.
+
+**Library** (browser / Node / Deno / any Wasm host):
 
 - **Raster** - GeoTIFF / BigTIFF / COG read + write, stats, HTTP range-request streaming
 - **Projections** - full EPSG and user-defined CRS to WGS84 lon/lat
@@ -14,9 +21,15 @@ in the browser, Node, Deno, or any Wasm host:
 - **LiDAR** - LAS / LAZ / PLY point clouds (xyz, classification, intensity)
 - **Analysis** - convex hull, Moran's I spatial autocorrelation
 
+**Tools** (WASI): **733 WhiteboxTools** (slope, filters, hydrology,
+geomorphometry, ...) that read and write rasters as regular files - see
+[Running the tools on files](#wbtools_oss-tools-on-real-files-wasi).
+
 This vendors the pure-Rust geospatial crates from
 [**whitebox_next_gen**](https://github.com/jblindsay/whitebox_next_gen) (the
 next-generation WhiteboxTools) and exposes them through a WebAssembly API.
+Maintainers: see [MAINTAINING.md](MAINTAINING.md) for the vendored-crate patch
+set and how to re-sync from upstream.
 
 ## Why this works
 

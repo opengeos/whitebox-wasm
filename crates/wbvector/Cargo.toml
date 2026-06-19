@@ -17,7 +17,7 @@ exclude     = ["data/"]
 default = []
 kmz = ["dep:zip"]
 osmpbf = ["dep:osmpbfreader"]
-geoparquet = ["dep:parquet", "dep:serde_json"]
+geoparquet = ["dep:parquet", "dep:serde_json", "dep:bytes"]
 
 # ── Core dependencies ────────────────────────────────────────────────────────
 [dependencies]
@@ -28,4 +28,7 @@ zip = { version = "0.6", optional = true, default-features = false, features = [
 osmpbfreader = { version = "0.16", optional = true }
 parquet = { version = "58.3", optional = true }
 serde_json = { version = "1", optional = true }
+# In-memory parquet reader source so GeoParquet reads work under WASI, which
+# cannot clone/seek a std::fs::File the way parquet's File ChunkReader needs.
+bytes = { version = "1", optional = true }
 

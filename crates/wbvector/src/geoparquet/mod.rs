@@ -169,11 +169,15 @@ pub fn read<P: AsRef<Path>>(path: P) -> Result<Layer> {
         .columns()
         .iter()
         .filter_map(|c| {
-            // Skip the geometry column and every leaf of the bbox covering
-            // group (matched by the column's root path element, so leaves named
-            // xmin/ymin/... are excluded without clobbering real attributes).
-            let root = c.path().parts().first().map(String::as_str);
-            if root == Some(geom_col.as_str()) || root == Some(BBOX_COL) {
+            // Skip the geometry column and the bbox covering group's leaves. The
+            // covering is a struct, so its leaves are nested (path length >= 2,
+            // e.g. ["bbox", "xmin"]); a user attribute happens to be named
+            // "bbox" only as a top-level scalar (path length 1), so requiring
+            // nesting keeps it from being dropped.
+            let parts = c.path().parts();
+            let root = parts.first().map(String::as_str);
+            let is_covering_leaf = root == Some(BBOX_COL) && parts.len() >= 2;
+            if root == Some(geom_col.as_str()) || is_covering_leaf {
                 None
             } else {
                 Some(c.name().to_owned())
@@ -192,7 +196,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> Result<Layer> {
 
     for row in &rows {
         for (name, field) in row.get_column_iter() {
-            if name.as_str() == geom_col.as_str() || name.as_str() == BBOX_COL {
+            if name.as_str() == geom_col.as_str() || is_bbox_covering(name, field) {
                 continue;
             }
             if !ordered_attr_names.iter().any(|n| n == name) {
@@ -226,7 +230,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> Result<Layer> {
         let mut attrs = vec![FieldValue::Null; layer.schema.len()];
 
         for (name, field) in row.get_column_iter() {
-            if name.as_str() == BBOX_COL {
+            if is_bbox_covering(name, field) {
                 continue;
             }
             if name.as_str() == geom_col.as_str() {
@@ -743,6 +747,13 @@ fn build_geo_metadata(layer: &Layer, write_bbox: bool) -> Value {
             GEOMETRY_COL: geom_col,
         }
     })
+}
+
+/// Whether a row column is the GeoParquet bbox covering: named `bbox` and a
+/// struct (Group) field. A user attribute named `bbox` would be a scalar, so it
+/// is preserved rather than dropped.
+fn is_bbox_covering(name: &str, field: &Field) -> bool {
+    name == BBOX_COL && matches!(field, Field::Group(_))
 }
 
 fn geometry_from_field(field: &Field) -> Result<Option<Geometry>> {

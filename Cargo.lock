@@ -3484,6 +3484,7 @@ dependencies = [
 name = "wbvector"
 version = "0.1.4"
 dependencies = [
+ "bytes",
  "flatbuffers 24.12.23",
  "osmpbfreader",
  "parquet",

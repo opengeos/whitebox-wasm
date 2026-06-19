@@ -13,7 +13,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use parquet::basic::{Compression, ConvertedType, Type as PhysicalType};
+use parquet::basic::{Compression, ConvertedType, Repetition, Type as PhysicalType};
 use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int64Type};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
@@ -30,6 +30,9 @@ use crate::geometry::Geometry;
 
 const GEOMETRY_COL: &str = "geometry";
 const WBVECTOR_FIELD_TYPES_KEY: &str = "wbvector_field_types";
+/// Name of the GeoParquet 1.1 bbox covering column (a `struct<xmin, ymin, xmax,
+/// ymax>`). Written next to the geometry column and skipped on read.
+const BBOX_COL: &str = "bbox";
 
 /// Write-time tuning options for GeoParquet output.
 #[derive(Debug, Clone)]
@@ -44,6 +47,10 @@ pub struct GeoParquetWriteOptions {
     pub data_page_row_count_limit: usize,
     /// Column compression codec used for all columns.
     pub compression: Compression,
+    /// Emit a GeoParquet 1.1 `bbox` covering column (`struct<xmin, ymin, xmax,
+    /// ymax>`) alongside the geometry, enabling spatial pruning by readers.
+    /// Enabled by default.
+    pub write_bbox_covering: bool,
 }
 
 impl Default for GeoParquetWriteOptions {
@@ -54,6 +61,7 @@ impl Default for GeoParquetWriteOptions {
             write_batch_size: parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE,
             data_page_row_count_limit: parquet::file::properties::DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT,
             compression: parquet::file::properties::DEFAULT_COMPRESSION,
+            write_bbox_covering: true,
         }
     }
 }
@@ -119,12 +127,21 @@ impl GeoParquetWriteOptions {
         self.compression = compression;
         self
     }
+
+    /// Enable or disable the GeoParquet 1.1 bbox covering column.
+    pub fn with_bbox_covering(mut self, enabled: bool) -> Self {
+        self.write_bbox_covering = enabled;
+        self
+    }
 }
 
 /// Read a GeoParquet file into a [`Layer`].
 pub fn read<P: AsRef<Path>>(path: P) -> Result<Layer> {
-    let file = File::open(path).map_err(GeoError::Io)?;
-    let reader = SerializedFileReader::new(file)
+    // Read the whole file into memory and hand parquet a `Bytes` ChunkReader.
+    // The `File`-based reader relies on operations (e.g. try_clone) that WASI
+    // does not support, so reading directly from a `File` fails there.
+    let bytes = std::fs::read(path).map_err(GeoError::Io)?;
+    let reader = SerializedFileReader::new(bytes::Bytes::from(bytes))
         .map_err(|e| GeoError::GeoParquet(format!("failed opening parquet file: {e}")))?;
 
     let file_meta = reader.metadata().file_metadata();
@@ -152,11 +169,18 @@ pub fn read<P: AsRef<Path>>(path: P) -> Result<Layer> {
         .columns()
         .iter()
         .filter_map(|c| {
-            let name = c.name();
-            if name == geom_col.as_str() {
+            // Skip the geometry column and the bbox covering group's leaves. The
+            // covering is a struct, so its leaves are nested (path length >= 2,
+            // e.g. ["bbox", "xmin"]); a user attribute happens to be named
+            // "bbox" only as a top-level scalar (path length 1), so requiring
+            // nesting keeps it from being dropped.
+            let parts = c.path().parts();
+            let root = parts.first().map(String::as_str);
+            let is_covering_leaf = root == Some(BBOX_COL) && parts.len() >= 2;
+            if root == Some(geom_col.as_str()) || is_covering_leaf {
                 None
             } else {
-                Some(name.to_owned())
+                Some(c.name().to_owned())
             }
         })
         .collect();
@@ -172,7 +196,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> Result<Layer> {
 
     for row in &rows {
         for (name, field) in row.get_column_iter() {
-            if name.as_str() == geom_col.as_str() {
+            if name.as_str() == geom_col.as_str() || is_bbox_covering(name, field) {
                 continue;
             }
             if !ordered_attr_names.iter().any(|n| n == name) {
@@ -206,6 +230,9 @@ pub fn read<P: AsRef<Path>>(path: P) -> Result<Layer> {
         let mut attrs = vec![FieldValue::Null; layer.schema.len()];
 
         for (name, field) in row.get_column_iter() {
+            if is_bbox_covering(name, field) {
+                continue;
+            }
             if name.as_str() == geom_col.as_str() {
                 geom = geometry_from_field(field)?;
             } else if let Some(i) = layer.schema.field_index(name) {
@@ -242,7 +269,7 @@ pub fn write_with_options<P: AsRef<Path>>(
     options: &GeoParquetWriteOptions,
 ) -> Result<()> {
     let file = File::create(path).map_err(GeoError::Io)?;
-    let (schema, columns) = build_schema(layer)?;
+    let (schema, columns) = build_schema(layer, options.write_bbox_covering)?;
 
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(options.max_rows_per_group.max(1)))
@@ -257,7 +284,7 @@ pub fn write_with_options<P: AsRef<Path>>(
 
     writer.append_key_value_metadata(KeyValue {
         key: "geo".to_owned(),
-        value: Some(build_geo_metadata(layer).to_string()),
+        value: Some(build_geo_metadata(layer, options.write_bbox_covering).to_string()),
     });
     writer.append_key_value_metadata(KeyValue {
         key: WBVECTOR_FIELD_TYPES_KEY.to_owned(),
@@ -302,6 +329,8 @@ pub fn write_with_options<P: AsRef<Path>>(
 #[derive(Debug, Clone, Copy)]
 enum ColumnKind {
     Geometry,
+    /// One leaf of the bbox covering group (`xmin`/`ymin`/`xmax`/`ymax`).
+    Bbox(BboxComponent),
     Integer(usize),
     Float(usize),
     Boolean(usize),
@@ -309,7 +338,15 @@ enum ColumnKind {
     Blob(usize),
 }
 
-fn build_schema(layer: &Layer) -> Result<(TypePtr, Vec<ColumnKind>)> {
+#[derive(Debug, Clone, Copy)]
+enum BboxComponent {
+    XMin,
+    YMin,
+    XMax,
+    YMax,
+}
+
+fn build_schema(layer: &Layer, write_bbox: bool) -> Result<(TypePtr, Vec<ColumnKind>)> {
     let mut fields: Vec<TypePtr> = Vec::new();
     let mut columns: Vec<ColumnKind> = Vec::new();
 
@@ -319,6 +356,14 @@ fn build_schema(layer: &Layer) -> Result<(TypePtr, Vec<ColumnKind>)> {
             .map_err(|e| GeoError::GeoParquet(format!("failed building geometry field: {e}")))?,
     ));
     columns.push(ColumnKind::Geometry);
+
+    if write_bbox {
+        fields.push(Arc::new(build_bbox_field()?));
+        columns.push(ColumnKind::Bbox(BboxComponent::XMin));
+        columns.push(ColumnKind::Bbox(BboxComponent::YMin));
+        columns.push(ColumnKind::Bbox(BboxComponent::XMax));
+        columns.push(ColumnKind::Bbox(BboxComponent::YMax));
+    }
 
     for (idx, field) in layer.schema.fields().iter().enumerate() {
         let (parquet_field, kind) = parquet_field_def(field, idx)?;
@@ -332,6 +377,26 @@ fn build_schema(layer: &Layer) -> Result<(TypePtr, Vec<ColumnKind>)> {
         .map_err(|e| GeoError::GeoParquet(format!("failed building parquet schema: {e}")))?;
 
     Ok((Arc::new(schema), columns))
+}
+
+/// Builds the `bbox` covering field: a required group of four optional DOUBLE
+/// leaves (`xmin`, `ymin`, `xmax`, `ymax`), per the GeoParquet 1.1 spec.
+fn build_bbox_field() -> Result<Type> {
+    let leaf = |name: &str| -> Result<TypePtr> {
+        Ok(Arc::new(
+            Type::primitive_type_builder(name, PhysicalType::DOUBLE)
+                .with_repetition(Repetition::OPTIONAL)
+                .build()
+                .map_err(|e| {
+                    GeoError::GeoParquet(format!("failed building bbox.{name} field: {e}"))
+                })?,
+        ))
+    };
+    Type::group_type_builder(BBOX_COL)
+        .with_repetition(Repetition::REQUIRED)
+        .with_fields(vec![leaf("xmin")?, leaf("ymin")?, leaf("xmax")?, leaf("ymax")?])
+        .build()
+        .map_err(|e| GeoError::GeoParquet(format!("failed building bbox group: {e}")))
 }
 
 fn parquet_field_def(field: &FieldDef, idx: usize) -> Result<(Type, ColumnKind)> {
@@ -391,6 +456,9 @@ fn write_column(
 ) -> Result<()> {
     match kind {
         ColumnKind::Geometry => write_geometry_column(layer, start, end, col_writer),
+        ColumnKind::Bbox(component) => {
+            write_bbox_component(layer, *component, start, end, col_writer)
+        }
         ColumnKind::Integer(idx) => write_i64_column(layer, *idx, start, end, col_writer),
         ColumnKind::Float(idx) => write_f64_column(layer, *idx, start, end, col_writer),
         ColumnKind::Boolean(idx) => write_bool_column(layer, *idx, start, end, col_writer),
@@ -407,6 +475,40 @@ fn write_column_range(
     col_writer: &mut parquet::file::writer::SerializedColumnWriter<'_>,
 ) -> Result<()> {
     write_column(layer, kind, start, end, col_writer)
+}
+
+/// Writes one leaf of the bbox covering group. A feature contributes a value
+/// when its geometry has a bounding box; otherwise the leaf is null (def 0).
+fn write_bbox_component(
+    layer: &Layer,
+    component: BboxComponent,
+    start: usize,
+    end: usize,
+    col_writer: &mut parquet::file::writer::SerializedColumnWriter<'_>,
+) -> Result<()> {
+    let mut values: Vec<f64> = Vec::new();
+    let mut def_levels: Vec<i16> = Vec::with_capacity(end.saturating_sub(start));
+
+    for f in &layer.features[start..end] {
+        match f.geometry.as_ref().and_then(|g| g.bbox()) {
+            Some(b) => {
+                def_levels.push(1);
+                values.push(match component {
+                    BboxComponent::XMin => b.min_x,
+                    BboxComponent::YMin => b.min_y,
+                    BboxComponent::XMax => b.max_x,
+                    BboxComponent::YMax => b.max_y,
+                });
+            }
+            None => def_levels.push(0),
+        }
+    }
+
+    col_writer
+        .typed::<DoubleType>()
+        .write_batch(&values, Some(&def_levels), None)
+        .map_err(|e| GeoError::GeoParquet(format!("failed writing bbox column: {e}")))?;
+    Ok(())
 }
 
 fn write_geometry_column(
@@ -589,7 +691,7 @@ fn write_blob_column(
     Ok(())
 }
 
-fn build_geo_metadata(layer: &Layer) -> Value {
+fn build_geo_metadata(layer: &Layer, write_bbox: bool) -> Value {
     let mut geom_types = Vec::<String>::new();
 
     if let Some(gt) = layer.geom_type {
@@ -625,6 +727,19 @@ fn build_geo_metadata(layer: &Layer) -> Value {
         geom_col["crs"] = serde_json::json!({ "wkt": wkt });
     }
 
+    // GeoParquet 1.1 covering: point readers at the bbox struct's leaf columns
+    // so they can spatially prune without decoding geometries.
+    if write_bbox {
+        geom_col["covering"] = serde_json::json!({
+            "bbox": {
+                "xmin": [BBOX_COL, "xmin"],
+                "ymin": [BBOX_COL, "ymin"],
+                "xmax": [BBOX_COL, "xmax"],
+                "ymax": [BBOX_COL, "ymax"],
+            }
+        });
+    }
+
     serde_json::json!({
         "version": "1.1.0",
         "primary_column": GEOMETRY_COL,
@@ -632,6 +747,13 @@ fn build_geo_metadata(layer: &Layer) -> Value {
             GEOMETRY_COL: geom_col,
         }
     })
+}
+
+/// Whether a row column is the GeoParquet bbox covering: named `bbox` and a
+/// struct (Group) field. A user attribute named `bbox` would be a scalar, so it
+/// is preserved rather than dropped.
+fn is_bbox_covering(name: &str, field: &Field) -> bool {
+    name == BBOX_COL && matches!(field, Field::Group(_))
 }
 
 fn geometry_from_field(field: &Field) -> Result<Option<Geometry>> {

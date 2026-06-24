@@ -562,52 +562,240 @@ fn looks_like_output_param(name: &str, description: &str) -> bool {
     persist_markers.iter().any(|m| d.contains(m))
 }
 
+/// True when `word` appears in `haystack` as a whole token, i.e. not surrounded
+/// by other alphanumeric characters (an optional trailing plural `s` is allowed,
+/// so "raster" also matches "rasters"). `haystack` and `word` are lowercase.
+///
+/// This is the crucial distinction from a plain substring `contains`: a join
+/// `strategy` described as "first, last, count" must NOT be read as LiDAR just
+/// because "last" contains the substring "las". Treating `_`, `.`, spaces and
+/// punctuation as boundaries keeps "raster_input" and "(dem)" matchable while
+/// rejecting "last"/"class"/"atlas" and "texture"/"context".
+fn has_word(haystack: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let is_alnum = |b: u8| b.is_ascii_alphanumeric();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(word) {
+        let start = from + rel;
+        let mut end = start + word.len();
+        let before_ok = start == 0 || !is_alnum(bytes[start - 1]);
+        // Accept a single plural 's' before requiring the right-hand boundary.
+        if end < bytes.len() && bytes[end] == b's' {
+            end += 1;
+        }
+        let after_ok = end == bytes.len() || !is_alnum(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Whether a parameter is a boolean flag, recognized from the conventional
+/// phrasings whitebox uses ("If true, …", "(default false)", "true/false").
+fn looks_bool(description: &str) -> bool {
+    let d = description.trim().to_ascii_lowercase();
+    d.starts_with("if true")
+        || d.starts_with("if set")
+        || d.starts_with("when true")
+        || d.starts_with("whether ")
+        || d.contains("(default true")
+        || d.contains("(default false")
+        || d.contains("true/false")
+        || has_word(&d, "boolean")
+}
+
+fn has_any_word(haystack: &str, words: &[&str]) -> bool {
+    words.iter().any(|w| has_word(haystack, w))
+}
+
+/// Detects a "(default <number>)" hint, the most reliable signal that a textual
+/// parameter actually carries a number (e.g. "Buffer distance (default 10.0)").
+/// Only the first token after "default" is considered, so a categorical
+/// "(default 'mean')" with an unrelated number elsewhere is not misread.
+fn has_default_number(description: &str) -> bool {
+    let d = description.to_ascii_lowercase();
+    let Some(idx) = d.find("default") else {
+        return false;
+    };
+    let tail = &d[idx + "default".len()..];
+    for tok in tail.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-')) {
+        if tok.is_empty() {
+            continue;
+        }
+        return tok.parse::<f64>().is_ok();
+    }
+    false
+}
+
+/// Whether a non-dataset parameter is best modeled as a number. Conservative: a
+/// "(default <number>)" hint always qualifies; otherwise a numeric noun must be
+/// present and no string-valued noun (which would mark free text like a field
+/// name or an expression). Only consulted after dataset keywords are ruled out.
+fn looks_numeric(text: &str) -> bool {
+    if has_default_number(text) {
+        return true;
+    }
+    const NUMERIC_NOUNS: &[&str] = &[
+        "distance", "radius", "threshold", "tolerance", "size", "count", "factor", "weight",
+        "iterations", "iteration", "sigma", "epsg", "zoom", "height", "width", "depth", "interval",
+        "angle", "azimuth", "altitude", "percentile", "resolution", "exponent", "power", "spacing",
+        "bins", "cellsize", "zfactor", "minutes", "seconds", "degrees", "percent", "number",
+    ];
+    const STRING_NOUNS: &[&str] = &[
+        "name", "prefix", "suffix", "label", "expression", "statement", "wkt", "field", "palette",
+        "format", "colour", "color",
+    ];
+    has_any_word(text, NUMERIC_NOUNS) && !has_any_word(text, STRING_NOUNS)
+}
+
+/// Pulls a small enumeration of allowed values out of a parameter description,
+/// for whitebox tools that only spell their choices out in prose, e.g.
+///   "Spatial predicate: intersects, within, contains, touches."
+///   "Filter type: 'mean', 'median', or 'gaussian'."
+/// Returns the option list (deduped, in order) or `None` when nothing
+/// enumerable is found. Conservative on purpose, mirroring the demo UI's own
+/// recovery: a wrong guess turns a free-form field into a too-narrow dropdown.
+///
+/// A column list ("CSV with columns: a, b, c") looks identical but names a file,
+/// not a choice, so any mention of CSV/column short-circuits to `None`.
+fn infer_enum_options(description: &str) -> Option<Vec<String>> {
+    let d = description.to_ascii_lowercase();
+    if d.is_empty() || has_word(&d, "csv") || d.contains("column") {
+        return None;
+    }
+
+    let is_ident = |s: &str| {
+        let mut chars = s.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    };
+    let push_unique = |acc: &mut Vec<String>, v: String| {
+        if !acc.contains(&v) {
+            acc.push(v);
+        }
+    };
+
+    // Prefer single-quoted identifiers: 'mean', 'median', ...
+    let mut quoted = Vec::new();
+    let bytes = d.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if let Some(rel) = d[i + 1..].find('\'') {
+                let inner = &d[i + 1..i + 1 + rel];
+                if is_ident(inner) {
+                    push_unique(&mut quoted, inner.to_string());
+                }
+                i = i + 1 + rel + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if quoted.len() >= 2 {
+        return Some(quoted);
+    }
+
+    // Else a colon-introduced comma list of >= 3 bare identifiers, so we don't
+    // mistake an "x, y" coordinate hint for an enumeration.
+    let after = d.split_once(':').map(|(_, rest)| rest)?;
+    let mut items = Vec::new();
+    for raw in after.split(',') {
+        let mut tok = raw.trim().trim_end_matches('.').trim();
+        for lead in ["or ", "and "] {
+            if let Some(rest) = tok.strip_prefix(lead) {
+                tok = rest.trim();
+            }
+        }
+        if is_ident(tok) {
+            push_unique(&mut items, tok.to_string());
+        } else {
+            // A non-identifier token ends the run (keeps the list contiguous and
+            // avoids sweeping up trailing prose after the choices).
+            break;
+        }
+    }
+    (items.len() >= 3).then_some(items)
+}
+
 fn infer_data_kind(name: &str, description: &str, role: &ToolIoRole) -> ToolDataKind {
     let text = format!("{} {}", name.to_ascii_lowercase(), description.to_ascii_lowercase());
 
-    if text.contains("raster")
-        || text.contains("dem")
-        || text.contains("geotiff")
+    if has_any_word(&text, &["raster", "dem", "geotiff", "grid"])
         || text.contains(".tif")
         || text.contains(".tiff")
-        || text.contains("grid")
     {
         return ToolDataKind::Raster;
     }
-    if text.contains("vector")
-        || text.contains("feature")
-        || text.contains("geopackage")
-        || text.contains("gpkg")
-        || text.contains("geojson")
-        || text.contains("topojson")
-        || text.contains(".shp")
+    // CSV/table before vector and lidar: a column-spec description ("CSV with
+    // columns: feature, class, ...") lists field names that would otherwise be
+    // mistaken for vector/lidar markers. The explicit format word wins.
+    if has_any_word(&text, &["csv", "table"]) {
+        return ToolDataKind::Table;
+    }
+    if has_any_word(
+        &text,
+        &[
+            "vector",
+            "feature",
+            "features",
+            "geopackage",
+            "gpkg",
+            "geojson",
+            "topojson",
+            "shapefile",
+            "polygon",
+            "polyline",
+            "linestring",
+            "multipoint",
+            "layer",
+        ],
+    ) || text.contains(".shp")
     {
         return ToolDataKind::Vector;
     }
-    if text.contains("lidar")
-        || text.contains("las")
-        || text.contains("laz")
-        || text.contains("copc")
-        || text.contains("e57")
-        || text.contains("ply")
-        || text.contains("zlidar")
-    {
+    if has_any_word(&text, &["lidar", "las", "laz", "copc", "e57", "ply", "zlidar"]) {
         return ToolDataKind::Lidar;
     }
-    if text.contains("csv") || text.contains("table") {
-        return ToolDataKind::Table;
-    }
-    if text.contains("json") {
+    if has_word(&text, "json") {
         return ToolDataKind::Json;
     }
-    if text.contains("txt") || text.contains("text") || text.contains("html") || text.contains("xml") {
+    if has_any_word(&text, &["txt", "text", "html", "xml"]) {
         return ToolDataKind::Text;
     }
 
     if matches!(role, ToolIoRole::Output) {
         return ToolDataKind::File;
     }
+    if looks_numeric(&text) {
+        return ToolDataKind::Number;
+    }
     ToolDataKind::String
+}
+
+/// Synthesizes a parameter schema from its name and description for tools that
+/// ship no explicit schema. Inputs may be enumerated choice lists (rendered as a
+/// dropdown); everything else routes through dataset/scalar/string inference.
+fn infer_param_schema(name: &str, description: &str) -> ToolParamSchema {
+    if looks_like_output_param(name, description) {
+        let kind = infer_data_kind(name, description, &ToolIoRole::Output);
+        return schema_from_role_and_kind(Some(ToolIoRole::Output), kind)
+            .unwrap_or(ToolParamSchema::String);
+    }
+    if looks_bool(description) {
+        return ToolParamSchema::bool();
+    }
+    if let Some(options) = infer_enum_options(description) {
+        let refs: Vec<&str> = options.iter().map(String::as_str).collect();
+        return ToolParamSchema::enum_values(&refs);
+    }
+    let kind = infer_data_kind(name, description, &ToolIoRole::Input);
+    schema_from_role_and_kind(Some(ToolIoRole::Input), kind).unwrap_or(ToolParamSchema::String)
 }
 
 fn role_and_kind_from_schema(schema: &ToolParamSchema) -> (Option<ToolIoRole>, ToolDataKind) {
@@ -748,20 +936,25 @@ pub fn manifest_with_param_schema_json(
         }
 
         let explicit_schema = param_schemas.get(&name);
-        let (role, data_kind) = if let Some(schema) = explicit_schema {
-            role_and_kind_from_schema(schema)
-        } else {
-            let inferred_role = if looks_like_output_param(&name, &description) {
-                ToolIoRole::Output
-            } else {
-                ToolIoRole::Input
-            };
-            let inferred_kind = infer_data_kind(&name, &description, &inferred_role);
-            (Some(inferred_role), inferred_kind)
+        // The effective schema is either the tool's explicit one or, for the many
+        // whitebox tools that ship none, an inference from name + description.
+        // Role and data_kind are then derived from that schema so they always
+        // agree with it (an inferred enum/scalar carries no io_role, exactly like
+        // an explicit one would).
+        let inferred_schema;
+        let schema = match explicit_schema {
+            Some(s) => Some(s),
+            None => {
+                inferred_schema = infer_param_schema(&name, &description);
+                Some(&inferred_schema)
+            }
+        };
+        let (role, data_kind) = match schema {
+            Some(s) => role_and_kind_from_schema(s),
+            None => (Some(ToolIoRole::Input), ToolDataKind::String),
         };
 
-        let synthesized_schema = schema_from_role_and_kind(role.clone(), data_kind.clone());
-        if let Some(schema) = explicit_schema.or(synthesized_schema.as_ref()) {
+        if let Some(schema) = schema {
             po.insert(
                 "schema".to_string(),
                 serde_json::to_value(schema).unwrap_or(Value::Null),
@@ -1339,5 +1532,159 @@ mod tests {
             .collect();
 
         assert_eq!(percents, vec![0.01, 0.02, 0.03, 0.04, 0.05]);
+    }
+
+    // ── Manifest parameter inference ─────────────────────────────────────────
+
+    fn schema_for(name: &str, description: &str) -> ToolParamSchema {
+        infer_param_schema(name, description)
+    }
+
+    #[test]
+    fn has_word_respects_boundaries() {
+        assert!(has_word("first, last, count", "last"));
+        assert!(!has_word("first, last, count", "las")); // the original bug
+        assert!(!has_word("classification", "las"));
+        assert!(!has_word("texture metrics", "text"));
+        assert!(has_word("(dem)", "dem"));
+        assert!(!has_word("tandem mass", "dem"));
+        assert!(has_word("raster_input layer", "raster"));
+    }
+
+    #[test]
+    fn enum_lists_are_not_misread_as_lidar() {
+        // "Transfer strategy: first, last, count, sum, mean, min, max." used to
+        // become a LiDAR input because "last" contains "las".
+        let s = schema_for("strategy", "Transfer strategy: first, last, count, sum, mean, min, max.");
+        assert!(s.io_role().is_none(), "enums are neither input nor output");
+        match &s {
+            ToolParamSchema::Enum(e) => {
+                let vals: Vec<_> = e.options.iter().map(|o| o.value.as_str()).collect();
+                assert_eq!(vals, ["first", "last", "count", "sum", "mean", "min", "max"]);
+            }
+            other => panic!("expected enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quoted_choices_become_enums() {
+        let s = schema_for("filter", "Filter type: 'mean', 'median', or 'gaussian'.");
+        let ToolParamSchema::Enum(e) = s else {
+            panic!("expected enum");
+        };
+        let vals: Vec<_> = e.options.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(vals, ["mean", "median", "gaussian"]);
+    }
+
+    #[test]
+    fn returns_filter_choice_list_is_enum() {
+        // lidar_*.returns: "Returns filter: all, first, or last." Despite "lidar"
+        // appearing in the tool name, the param description is a choice list.
+        let s = schema_for("returns", "Returns filter: all, first, or last.");
+        assert!(matches!(s, ToolParamSchema::Enum(_)), "got {s:?}");
+    }
+
+    #[test]
+    fn csv_column_lists_are_files_not_enums() {
+        // These read like an enum ("a, b, c") but name a CSV file's columns.
+        for desc in [
+            "Optional CSV defining time-dependent edge costs (columns: edge_id, dow, start_minute, value).",
+            "Rules CSV with columns: feature, op, value, class.",
+        ] {
+            let s = schema_for("rules", desc);
+            assert!(
+                matches!(
+                    s,
+                    ToolParamSchema::Input(ToolInputSchema { dataset: ToolDatasetSchema::Table, .. })
+                ),
+                "expected a table file for {desc:?}, got {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_layers_are_vector_inputs_not_text() {
+        // clip/intersect/erase ".overlay" = "Overlay polygon layer."
+        let s = schema_for("overlay", "Overlay polygon layer.");
+        assert!(
+            matches!(
+                s,
+                ToolParamSchema::Input(ToolInputSchema { dataset: ToolDatasetSchema::Vector { .. }, .. })
+            ),
+            "got {s:?}"
+        );
+    }
+
+    #[test]
+    fn numeric_params_become_scalars() {
+        for (n, d) in [
+            ("distance", "Buffer distance in map units."),
+            ("sigma", "Standard deviation of the Gaussian smoothing kernel (default 1.0)."),
+            ("n_trees", "Number of trees (default 200)."),
+            ("radius", "Neighbourhood radius."),
+        ] {
+            assert!(
+                matches!(schema_for(n, d), ToolParamSchema::Scalar { .. }),
+                "{n}: {d:?} -> {:?}",
+                schema_for(n, d)
+            );
+        }
+    }
+
+    #[test]
+    fn string_and_field_params_stay_strings() {
+        // Numeric-sounding but genuinely textual: must not become scalars.
+        assert!(matches!(schema_for("prefix", "Prefix for joined field names."), ToolParamSchema::String));
+        assert!(matches!(schema_for("statement", "Conditional expression evaluated per cell."), ToolParamSchema::String));
+        // No numeric noun at all.
+        assert!(matches!(schema_for("note", "An arbitrary note."), ToolParamSchema::String));
+    }
+
+    #[test]
+    fn plural_dataset_words_match() {
+        assert!(has_word("array of input rasters", "raster"));
+        assert!(has_word("overlay polygons", "polygon"));
+        assert!(!has_word("rasterize", "raster")); // not a plural, not a boundary
+        // svm_classification.inputs
+        assert!(matches!(
+            schema_for("inputs", "Array of single-band input rasters."),
+            ToolParamSchema::Input(ToolInputSchema { dataset: ToolDatasetSchema::Raster, .. })
+        ));
+    }
+
+    #[test]
+    fn point_layers_are_vector_inputs() {
+        // closest_facility_network.incidents
+        assert!(matches!(
+            schema_for("incidents", "Incident/demand point layer."),
+            ToolParamSchema::Input(ToolInputSchema { dataset: ToolDatasetSchema::Vector { .. }, .. })
+        ));
+    }
+
+    #[test]
+    fn boolean_flags_are_detected() {
+        for (n, d) in [
+            ("auto_reproject", "If true (default), automatically reproject stack rasters."),
+            ("clip", "If true, remove misclassified training samples."),
+            ("hilbert_sort", "Whether to Hilbert-sort features before writing."),
+        ] {
+            assert!(matches!(schema_for(n, d), ToolParamSchema::Bool), "{n}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn datasets_and_outputs_still_infer() {
+        assert!(matches!(
+            schema_for("input", "Input raster (DEM)."),
+            ToolParamSchema::Input(ToolInputSchema { dataset: ToolDatasetSchema::Raster, .. })
+        ));
+        assert!(matches!(
+            schema_for("output", "Output raster path."),
+            ToolParamSchema::Output(_)
+        ));
+        assert!(matches!(
+            schema_for("points", "Input LiDAR point cloud (LAS)."),
+            ToolParamSchema::Input(ToolInputSchema { dataset: ToolDatasetSchema::Lidar, .. })
+        ));
     }
 }

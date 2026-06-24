@@ -105,6 +105,7 @@ pub fn hydrology_tool_param_schemas(tool_id: &str) -> Option<BTreeMap<String, To
 			("esri_pntr", ToolParamSchema::bool()),
 			("breached_dem_output", ToolParamSchema::output_raster()),
 			("flow_dir_output", ToolParamSchema::output_raster()),
+			("output_pointer", ToolParamSchema::output_raster()),
 			("output", ToolParamSchema::output_raster()),
 		])),
 		"watershed" => Some(param_schema_map(&[
@@ -1972,7 +1973,7 @@ fn d8_dir_from_dem_local(input: &Raster) -> Vec<i8> {
 	for tid in 0..num_procs {
 		let view = view.clone();
 		let tx = tx.clone();
-		thread::spawn(move || {
+		super::dispatch_worker(num_procs > 1, move || {
 			for r in (0..rows).filter(|row| row % num_procs == tid) {
 				let mut row_dirs = vec![-2i8; cols];
 				for c in 0..cols {
@@ -2202,7 +2203,7 @@ fn build_flow_dir_and_mark_nodata(
 	for tid in 0..num_procs {
 		let view = view.clone();
 		let tx = tx.clone();
-		thread::spawn(move || {
+		super::dispatch_worker(num_procs > 1, move || {
 			for r in (0..rows).filter(|row| row % num_procs == tid) {
 				let mut row_flow = vec![-2i8; cols];
 				let mut row_nodata = vec![0u8; cols];
@@ -3748,6 +3749,11 @@ impl Tool for FlowAccumFullWorkflowTool {
 					required: false,
 				},
 				ToolParamSpec {
+					name: "output_pointer",
+					description: "Optional output path for the D8 flow-direction pointer (alias of flow_dir_output; ESRI-encoded when esri_pntr is set)",
+					required: false,
+				},
+				ToolParamSpec {
 					name: "output",
 					description: "Optional output path for flow-accumulation raster",
 					required: false,
@@ -3792,7 +3798,12 @@ impl Tool for FlowAccumFullWorkflowTool {
 			.or_else(|_| parse_raster_path_arg(args, "input"))
 			.or_else(|_| parse_raster_path_arg(args, "input_dem"))?;
 		let breached_dem_output = parse_optional_output_path(args, "breached_dem_output")?;
-		let flow_dir_output = parse_optional_output_path(args, "flow_dir_output")?;
+		// `output_pointer` is the public alias requested by consumers; fall back
+		// to the original `flow_dir_output` name for backwards compatibility.
+		let flow_dir_output = match parse_optional_output_path(args, "output_pointer")? {
+			Some(path) => Some(path),
+			None => parse_optional_output_path(args, "flow_dir_output")?,
+		};
 		let flow_accum_output = parse_optional_output_path(args, "output")?;
 
 		let out_type = args
@@ -4767,7 +4778,7 @@ impl Tool for D8MassFluxTool {
 				let dirs = dirs.clone();
 				let view = Arc::new(dem.band_view(0));
 				let tx = tx.clone();
-				thread::spawn(move || {
+				super::dispatch_worker(num_procs > 1, move || {
 					const INFLOWING: [i8; 8] = [4, 5, 6, 7, 0, 1, 2, 3];
 					for r in (0..rows).filter(|row| row % num_procs == tid) {
 						let mut row_inflow = vec![-1i32; cols];
@@ -10055,7 +10066,7 @@ fn stream_link_id_pass(pntr: &Raster, streams: &Raster, esri_style: bool, out_no
 		let pntr_view = pntr_view.clone();
 		let streams_view = streams_view.clone();
 		let tx = tx.clone();
-		thread::spawn(move || {
+		super::dispatch_worker(num_procs > 1, move || {
 			for r in (0..rows).filter(|row| row % num_procs == tid) {
 				let mut row_pourpts = vec![out_nodata; cols];
 				let mut row_inflow = vec![-1i8; cols];

@@ -346,7 +346,7 @@ fn d8_dir_from_dem(input: &Raster) -> Vec<i8> {
     for tid in 0..num_procs {
         let view = view.clone();
         let tx = tx.clone();
-        thread::spawn(move || {
+        super::dispatch_worker(num_procs > 1, move || {
             for r in (0..rows).filter(|row| row % num_procs == tid) {
                 let mut row_data = vec![-2i8; cols];
                 for c in 0..cols {
@@ -803,7 +803,7 @@ fn fd8_pointer_from_dem(input: &Raster) -> Vec<f64> {
     for tid in 0..num_procs {
         let view = view.clone();
         let tx = tx.clone();
-        thread::spawn(move || {
+        super::dispatch_worker(num_procs > 1, move || {
             for r in (0..rows).filter(|row| row % num_procs == tid) {
                 let mut row_out = vec![OUT_NODATA; cols];
                 for c in 0..cols {
@@ -851,7 +851,7 @@ fn fd8_inflow_count(input: &Raster) -> Vec<i8> {
     for tid in 0..num_procs {
         let view = view.clone();
         let tx = tx.clone();
-        thread::spawn(move || {
+        super::dispatch_worker(num_procs > 1, move || {
             for r in (0..rows).filter(|row| row % num_procs == tid) {
                 let mut row_inflow = vec![-1i8; cols];
                 for c in 0..cols {
@@ -1319,7 +1319,7 @@ fn minimal_dispersion_core(
             let out_vals = out_vals;
             let y_max_val = y_max_val;
             let x_min_val = x_min_val;
-            thread::spawn(move || {
+            super::dispatch_worker(num_procs > 1, move || {
                 for r in (0..rows).filter(|row| row % num_procs == tid) {
                     let mut row_ptr = vec![0u16; cols];
                     let mut row_has_pit = false;
@@ -2072,7 +2072,7 @@ fn mdfa_initial_dirs_projected(input: &Raster, esri_style: bool) -> (Vec<u16>, V
         let tx = tx.clone();
         let out_vals = out_vals;
         let d8_lens = d8_lens;
-        thread::spawn(move || {
+        super::dispatch_worker(num_procs > 1, move || {
             for r in (0..rows).filter(|row| row % num_procs == tid) {
                 let mut row_d8 = vec![0u16; cols];
                 let mut row_dinf = vec![nodata; cols];
@@ -2204,7 +2204,7 @@ fn rho8_dir_from_dem(input: &Raster) -> Vec<i8> {
     for tid in 0..num_procs {
         let view = view.clone();
         let tx = tx.clone();
-        thread::spawn(move || {
+        super::dispatch_worker(num_procs > 1, move || {
             // Each thread gets its own RNG — rand::rng() is thread-local in rand 0.10.
             let mut rng = rand::rng();
             for r in (0..rows).filter(|row| row % num_procs == tid) {
@@ -2337,7 +2337,7 @@ fn d8_flow_accum_core(flow_dir: &[i8], rows: usize, cols: usize, nodata: f64) ->
     for tid in 0..num_procs {
         let fd = fd.clone();
         let tx = tx.clone();
-        thread::spawn(move || {
+        super::dispatch_worker(num_procs > 1, move || {
             for r in (0..rows).filter(|row| row % num_procs == tid) {
                 let mut row_inflow = vec![-1i8; cols];
                 for c in 0..cols {

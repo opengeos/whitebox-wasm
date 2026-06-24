@@ -2,6 +2,35 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use wbcore::ToolParamSchema;
 
+/// Runs `work` on a background thread on native targets, or inline on the
+/// current thread when `parallel` is `false` or when compiling for wasm32.
+///
+/// `std::thread::spawn` is unsupported on `wasm32-unknown-unknown`: calling it
+/// at runtime traps with `unreachable`, which is why the threaded flow-routing
+/// helpers (D8 pointer, D8/FD8 accumulation, basins, ...) crashed in the
+/// browser/WASI runtime while the fully-serial composite workflow kept working.
+/// Routing every worker fan-out through this helper keeps the multi-threaded
+/// fast path on native CLI builds while degrading to a serial loop on wasm.
+///
+/// Callers use the established `mpsc` fan-out pattern (each worker sends its
+/// rows down a channel that the caller drains), so running inline is safe: the
+/// channel is unbounded and the inline closure finishes sending before the
+/// caller starts receiving.
+pub(crate) fn dispatch_worker<F>(parallel: bool, work: F)
+where
+	F: FnOnce() + Send + 'static,
+{
+	#[cfg(not(target_arch = "wasm32"))]
+	{
+		if parallel {
+			std::thread::spawn(work);
+			return;
+		}
+	}
+	let _ = parallel;
+	work();
+}
+
 mod raster;
 mod data_tools;
 mod gis;

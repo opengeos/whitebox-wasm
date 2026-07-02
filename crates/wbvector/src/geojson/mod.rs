@@ -233,8 +233,14 @@ impl<'a> Parser<'a> {
 
 fn layer_from_value(val: Jv, name: &str) -> Result<Layer> {
     let type_s = val.get("type").and_then(|v| v.as_str()).unwrap_or("").to_owned();
-    match type_s.as_str() {
-        "FeatureCollection" => parse_feature_collection(val, name),
+    // GeoJSON coordinates are WGS 84 (EPSG:4326) per RFC 7946 unless a legacy
+    // GeoJSON 2008 named `crs` member says otherwise. Resolve the source CRS
+    // before consuming `val` so reprojection tools (e.g. reproject_vector) know
+    // the input's projection instead of failing with "requires source CRS
+    // metadata".
+    let source_epsg = geojson_source_epsg(&val);
+    let mut layer = match type_s.as_str() {
+        "FeatureCollection" => parse_feature_collection(val, name)?,
         "Feature" => {
             let mut layer = Layer::new(name);
             if let Some(f) = build_feature(&val, &layer.schema, 0)? {
@@ -243,7 +249,7 @@ fn layer_from_value(val: Jv, name: &str) -> Result<Layer> {
                 }
                 layer.push(f);
             }
-            Ok(layer)
+            layer
         }
         _ => {
             // Bare geometry
@@ -251,9 +257,50 @@ fn layer_from_value(val: Jv, name: &str) -> Result<Layer> {
             let mut layer = Layer::new(name);
             layer.geom_type = Some(geom.geom_type());
             layer.push(Feature { fid: 0, geometry: Some(geom), attributes: vec![] });
-            Ok(layer)
+            layer
+        }
+    };
+    // Only default the CRS when the reader has not already resolved one, so a
+    // future format-specific override is never clobbered.
+    if layer.crs.is_none() {
+        layer.set_crs_epsg(Some(source_epsg));
+    }
+    Ok(layer)
+}
+
+/// Resolve the source EPSG code of a GeoJSON document. RFC 7946 mandates WGS 84
+/// (EPSG:4326), so default to that when no `crs` member is present or it cannot
+/// be recognised. A legacy GeoJSON 2008 named `crs`
+/// (`{"type":"name","properties":{"name":"..."}}`) is honoured, covering the
+/// common `urn:ogc:def:crs:EPSG::<code>`, `EPSG:<code>`, and OGC `CRS84` forms.
+fn geojson_source_epsg(val: &Jv) -> u32 {
+    const DEFAULT_EPSG: u32 = 4326;
+    let Some(name) = val
+        .get("crs")
+        .and_then(|c| c.get("properties"))
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+    else {
+        return DEFAULT_EPSG;
+    };
+    let upper = name.to_ascii_uppercase();
+    // OGC CRS84/CRS83 are WGS 84 in lon/lat order, i.e. EPSG:4326.
+    if upper.contains("CRS84") || upper.contains("CRS:84") {
+        return DEFAULT_EPSG;
+    }
+    // Take the digits that follow the last "EPSG" token, e.g.
+    // "urn:ogc:def:crs:EPSG::3857" or "EPSG:3857".
+    if let Some(pos) = upper.rfind("EPSG") {
+        let digits: String = upper[pos + "EPSG".len()..]
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(code) = digits.parse::<u32>() {
+            return code;
         }
     }
+    DEFAULT_EPSG
 }
 
 fn parse_feature_collection(val: Jv, name: &str) -> Result<Layer> {
@@ -698,5 +745,50 @@ mod tests {
         } else {
             panic!("expected Point geometry");
         }
+    }
+
+    #[test]
+    fn parse_defaults_source_crs_to_epsg4326() {
+        // RFC 7946 GeoJSON has no `crs` member; coordinates are WGS 84.
+        let l = parse_str(SAMPLE).unwrap();
+        assert_eq!(l.crs_epsg(), Some(4326));
+    }
+
+    #[test]
+    fn parse_bare_feature_defaults_source_crs() {
+        let text = r#"{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}"#;
+        let l = parse_str(text).unwrap();
+        assert_eq!(l.crs_epsg(), Some(4326));
+    }
+
+    #[test]
+    fn parse_honours_legacy_named_epsg_crs() {
+        let text = r#"{
+            "type":"FeatureCollection",
+            "crs":{"type":"name","properties":{"name":"urn:ogc:def:crs:EPSG::3857"}},
+            "features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{}}]
+        }"#;
+        let l = parse_str(text).unwrap();
+        assert_eq!(l.crs_epsg(), Some(3857));
+    }
+
+    #[test]
+    fn parse_treats_ogc_crs84_as_epsg4326() {
+        let text = r#"{
+            "type":"FeatureCollection",
+            "crs":{"type":"name","properties":{"name":"urn:ogc:def:crs:OGC:1.3:CRS84"}},
+            "features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{}}]
+        }"#;
+        let l = parse_str(text).unwrap();
+        assert_eq!(l.crs_epsg(), Some(4326));
+    }
+
+    #[test]
+    fn parsed_geojson_is_reprojectable() {
+        // Regression for the "requires source CRS metadata" failure: a plain
+        // GeoJSON layer must carry enough CRS metadata to reproject.
+        let l = parse_str(SAMPLE).unwrap();
+        let out = reproject::layer_to_epsg(&l, 3857).unwrap();
+        assert_eq!(out.crs_epsg(), Some(3857));
     }
 }

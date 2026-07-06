@@ -595,6 +595,19 @@ fn has_word(haystack: &str, word: &str) -> bool {
     false
 }
 
+/// Whether a parameter holds a free-text expression, statement, or formula that
+/// the user types (an attribute query, a field-calculator formula, a LiDAR
+/// filter clause). Matched on the parameter name, which is unambiguous here.
+///
+/// These must be caught before the flag and dataset heuristics: their
+/// descriptions routinely mention "boolean" (the value the expression evaluates
+/// to) or "feature"/"raster" (the data it runs against), which `looks_bool` and
+/// `infer_data_kind` would otherwise misread as a checkbox or a dataset input.
+fn looks_like_expression(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    has_word(&n, "expression") || has_word(&n, "statement")
+}
+
 /// Whether a parameter is a boolean flag, recognized from the conventional
 /// phrasings whitebox uses ("If true, …", "(default false)", "true/false").
 fn looks_bool(description: &str) -> bool {
@@ -786,6 +799,9 @@ fn infer_param_schema(name: &str, description: &str) -> ToolParamSchema {
         let kind = infer_data_kind(name, description, &ToolIoRole::Output);
         return schema_from_role_and_kind(Some(ToolIoRole::Output), kind)
             .unwrap_or(ToolParamSchema::String);
+    }
+    if looks_like_expression(name) {
+        return ToolParamSchema::String;
     }
     if looks_bool(description) {
         return ToolParamSchema::bool();
@@ -1638,6 +1654,39 @@ mod tests {
         assert!(matches!(schema_for("statement", "Conditional expression evaluated per cell."), ToolParamSchema::String));
         // No numeric noun at all.
         assert!(matches!(schema_for("note", "An arbitrary note."), ToolParamSchema::String));
+    }
+
+    #[test]
+    fn expression_params_stay_strings() {
+        // A free-text expression/statement is a string the user types, even when
+        // its description mentions "boolean" (the value it evaluates to) or
+        // "feature"/"raster" (the data it runs over), which would otherwise be
+        // read as a bool flag or a dataset input. Regression for GeoLibre #1073.
+        for (n, d) in [
+            // extract_by_attribute.statement -> was a bool checkbox ("Boolean …").
+            (
+                "statement",
+                "Boolean expression evaluated against attribute fields; accepts SQL-style AND/OR/NOT/XOR aliases.",
+            ),
+            // field_calculator.expression -> was a vector input ("… per feature").
+            (
+                "expression",
+                "Expression evaluated per feature. Supports SQL-style CASE, CAST(... AS type), IS NULL/IS NOT NULL.",
+            ),
+            // filter_lidar.statement -> was a bool checkbox.
+            (
+                "statement",
+                "Boolean expression, e.g. '!is_noise && class == 2' or 'NOT is_noise AND class == 2'.",
+            ),
+            // raster_calculator.expression -> was a raster input.
+            ("expression", "Math expression with quoted raster variable names."),
+        ] {
+            assert!(
+                matches!(schema_for(n, d), ToolParamSchema::String),
+                "{n}: {d:?} -> {:?}",
+                schema_for(n, d)
+            );
+        }
     }
 
     #[test]

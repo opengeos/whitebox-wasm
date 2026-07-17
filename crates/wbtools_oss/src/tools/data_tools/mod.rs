@@ -1067,6 +1067,10 @@ struct TopologyIssue {
     detail: String,
 }
 
+/// Whether a coordinate sequence repeats a vertex. `closed_ring` must be
+/// `true` only when the sequence is *stored* closed (first == last), so the
+/// legitimate closing duplicate is excluded; for open-stored rings and
+/// linestrings every vertex participates in the check.
 fn coords_have_duplicate_vertices(coords: &[Coord], closed_ring: bool) -> bool {
     if coords.len() < 2 {
         return false;
@@ -1090,22 +1094,35 @@ fn ring_closed(coords: &[Coord]) -> bool {
         .unwrap_or(false)
 }
 
+/// Number of distinct vertices in a ring, tolerating both storage
+/// conventions: the vector readers (GeoJSON, Shapefile, FlatGeobuf) strip the
+/// closing vertex and store rings *open*, while other producers (e.g. the OSM
+/// PBF reader) keep them explicitly closed.
+fn ring_distinct_vertices(coords: &[Coord]) -> usize {
+    if ring_closed(coords) && coords.len() > 1 {
+        coords.len() - 1
+    } else {
+        coords.len()
+    }
+}
+
+// Ring closure is a property of the storage convention, not the data: readers
+// normalize rings (open for the file readers, closed for OSM PBF), so by the
+// time geometry reaches these checks an "unclosed ring" in the source file is
+// indistinguishable from a normal open-stored ring. Consequently there is no
+// `polygon_*_unclosed` issue here — emitting one flagged every polygon read
+// from GeoJSON/Shapefile (issue #7). Structural validity is covered by the
+// vertex-count check below and by `polygon_topology_invalid`.
 fn polygon_topology_issues(exterior: &Ring, interiors: &[Ring]) -> Vec<TopologyIssue> {
     let mut issues = Vec::<TopologyIssue>::new();
 
-    if exterior.0.len() < 4 {
+    if ring_distinct_vertices(&exterior.0) < 3 {
         issues.push(TopologyIssue {
             issue_type: "polygon_exterior_too_short".to_string(),
-            detail: format!("exterior ring has {} coordinates; expected at least 4 including closure", exterior.0.len()),
+            detail: format!("exterior ring has {} distinct vertices; expected at least 3", ring_distinct_vertices(&exterior.0)),
         });
     }
-    if !ring_closed(&exterior.0) {
-        issues.push(TopologyIssue {
-            issue_type: "polygon_exterior_unclosed".to_string(),
-            detail: "exterior ring is not closed".to_string(),
-        });
-    }
-    if coords_have_duplicate_vertices(&exterior.0, true) {
+    if coords_have_duplicate_vertices(&exterior.0, ring_closed(&exterior.0)) {
         issues.push(TopologyIssue {
             issue_type: "polygon_duplicate_vertices".to_string(),
             detail: "exterior ring contains duplicate vertices".to_string(),
@@ -1113,19 +1130,13 @@ fn polygon_topology_issues(exterior: &Ring, interiors: &[Ring]) -> Vec<TopologyI
     }
 
     for (idx, hole) in interiors.iter().enumerate() {
-        if hole.0.len() < 4 {
+        if ring_distinct_vertices(&hole.0) < 3 {
             issues.push(TopologyIssue {
                 issue_type: "polygon_hole_too_short".to_string(),
-                detail: format!("hole {} has {} coordinates; expected at least 4 including closure", idx + 1, hole.0.len()),
+                detail: format!("hole {} has {} distinct vertices; expected at least 3", idx + 1, ring_distinct_vertices(&hole.0)),
             });
         }
-        if !ring_closed(&hole.0) {
-            issues.push(TopologyIssue {
-                issue_type: "polygon_hole_unclosed".to_string(),
-                detail: format!("hole {} is not closed", idx + 1),
-            });
-        }
-        if coords_have_duplicate_vertices(&hole.0, true) {
+        if coords_have_duplicate_vertices(&hole.0, ring_closed(&hole.0)) {
             issues.push(TopologyIssue {
                 issue_type: "polygon_duplicate_vertices".to_string(),
                 detail: format!("hole {} contains duplicate vertices", idx + 1),
@@ -6970,5 +6981,116 @@ impl Tool for VectorPolygonsToRasterTool {
         }
 
         write_raster_output(output, output_path, ctx)
+    }
+}
+
+#[cfg(test)]
+mod polygon_topology_issue_tests {
+    use super::*;
+
+    fn c(x: f64, y: f64) -> Coord {
+        Coord::xy(x, y)
+    }
+
+    fn ring(coords: Vec<Coord>) -> Ring {
+        Ring::new(coords)
+    }
+
+    fn issue_types(exterior: Ring, interiors: Vec<Ring>) -> Vec<String> {
+        polygon_topology_issues(&exterior, &interiors)
+            .into_iter()
+            .map(|issue| issue.issue_type)
+            .collect()
+    }
+
+    #[test]
+    fn open_valid_square_has_no_issues() {
+        // Reader convention: closing vertex stripped (issue #7 regression).
+        let types = issue_types(
+            ring(vec![c(10.0, 0.0), c(14.0, 0.0), c(14.0, 4.0), c(10.0, 4.0)]),
+            vec![],
+        );
+        assert!(types.is_empty(), "expected no issues, got {types:?}");
+    }
+
+    #[test]
+    fn explicitly_closed_square_has_no_issues() {
+        // OSM PBF convention: rings stored closed. The closing duplicate must
+        // not count as a duplicate vertex or shrink the ring below minimum.
+        let types = issue_types(
+            ring(vec![
+                c(10.0, 0.0),
+                c(14.0, 0.0),
+                c(14.0, 4.0),
+                c(10.0, 4.0),
+                c(10.0, 0.0),
+            ]),
+            vec![],
+        );
+        assert!(types.is_empty(), "expected no issues, got {types:?}");
+    }
+
+    #[test]
+    fn open_triangle_is_not_too_short() {
+        let types = issue_types(
+            ring(vec![c(0.0, 0.0), c(4.0, 0.0), c(2.0, 3.0)]),
+            vec![],
+        );
+        assert!(types.is_empty(), "expected no issues, got {types:?}");
+    }
+
+    #[test]
+    fn two_vertex_ring_is_too_short() {
+        let types = issue_types(ring(vec![c(0.0, 0.0), c(4.0, 0.0)]), vec![]);
+        assert!(types.contains(&"polygon_exterior_too_short".to_string()));
+    }
+
+    #[test]
+    fn bowtie_is_invalid_but_not_unclosed() {
+        let types = issue_types(
+            ring(vec![c(0.0, 0.0), c(2.0, 2.0), c(2.0, 0.0), c(0.0, 2.0)]),
+            vec![],
+        );
+        assert!(types.contains(&"polygon_topology_invalid".to_string()));
+        assert!(
+            !types.iter().any(|t| t.contains("unclosed")),
+            "unclosed issues must never be emitted, got {types:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_last_vertex_in_open_ring_is_flagged() {
+        // With the old hardcoded closed_ring=true, the last vertex was skipped
+        // and this genuine duplicate went undetected.
+        let types = issue_types(
+            ring(vec![
+                c(0.0, 0.0),
+                c(4.0, 0.0),
+                c(4.0, 4.0),
+                c(0.0, 4.0),
+                c(4.0, 4.0),
+            ]),
+            vec![],
+        );
+        assert!(types.contains(&"polygon_duplicate_vertices".to_string()));
+    }
+
+    #[test]
+    fn hole_issues_follow_the_same_conventions() {
+        let exterior = ring(vec![
+            c(0.0, 0.0),
+            c(10.0, 0.0),
+            c(10.0, 10.0),
+            c(0.0, 10.0),
+        ]);
+        // Open hole with enough vertices: fine.
+        let ok = issue_types(
+            exterior.clone(),
+            vec![ring(vec![c(1.0, 1.0), c(2.0, 1.0), c(2.0, 2.0), c(1.0, 2.0)])],
+        );
+        assert!(ok.is_empty(), "expected no issues, got {ok:?}");
+        // Two-vertex hole: too short.
+        let short = issue_types(exterior, vec![ring(vec![c(1.0, 1.0), c(2.0, 1.0)])]);
+        assert!(short.contains(&"polygon_hole_too_short".to_string()));
     }
 }

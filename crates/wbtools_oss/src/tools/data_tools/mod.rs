@@ -2772,16 +2772,28 @@ impl Tool for TopologyRuleValidateTool {
                 .collect::<Vec<_>>();
             let endpoint_index = SpatialIndex::build_str(&endpoint_geometries, 16);
 
-            for (i, endpoint) in line_endpoints.iter().enumerate() {
-                let point_geom = TopologyGeometry::Point(TopoCoord::xy(endpoint.coord.x, endpoint.coord.y));
-                let nearest_dist = endpoint_index
-                    .nearest_k(&point_geom, 3)
-                    .into_iter()
-                    .filter(|(candidate_idx, _)| *candidate_idx != i)
-                    .map(|(_, distance)| distance)
-                    .find(|distance| *distance > 1e-9)
-                    .unwrap_or(f64::INFINITY);
-                if nearest_dist > snap_tolerance {
+            // An endpoint satisfies the rule when ANY endpoint of a different
+            // feature lies within the tolerance - including an exactly
+            // coincident one. The previous nearest-k form skipped distances
+            // <= 1e-9 outright, so a perfectly connected endpoint pair (the
+            // ideal state) was reported as a violation, and it accepted the
+            // same feature's own other endpoint as a "connection" (issue #8).
+            for endpoint in line_endpoints.iter() {
+                let env = TopologyEnvelope::new(
+                    endpoint.coord.x - snap_tolerance,
+                    endpoint.coord.y - snap_tolerance,
+                    endpoint.coord.x + snap_tolerance,
+                    endpoint.coord.y + snap_tolerance,
+                );
+                let connected = endpoint_index.query_envelope(env).into_iter().any(|candidate_idx| {
+                    let candidate = &line_endpoints[candidate_idx];
+                    candidate.fid != endpoint.fid
+                        && coord_dist(
+                            TopoCoord::xy(endpoint.coord.x, endpoint.coord.y),
+                            TopoCoord::xy(candidate.coord.x, candidate.coord.y),
+                        ) <= snap_tolerance
+                });
+                if !connected {
                     violations.push(TopologyRuleViolation {
                         rule_type: TopologyRuleType::LineEndpointsMustSnapWithinTolerance,
                         feature_fid: endpoint.fid as i64,
@@ -2924,14 +2936,14 @@ impl Tool for TopologyRuleAutoFixTool {
         ToolMetadata {
             id: "topology_rule_autofix",
             display_name: "Topology Rule AutoFix",
-            summary: "Automatically applies safe, auditable fixes to topology violations detected by topology_rule_validate.",
+            summary: "Automatically applies safe, auditable fixes to topology violations detected by topology_rule_validate: cross-feature endpoint snapping, dangling-endpoint snap/projection, and point-to-line projection. polygon_must_not_have_gaps has no automatic fix and is reported as zero changes.",
             category: ToolCategory::Conversion,
             license_tier: LicenseTier::Open,
             params: vec![
                 ToolParamSpec { name: "input", description: "Input vector path.", required: true },
                 ToolParamSpec { name: "rule_set", description: "Rule configuration as JSON array/object, CSV string, or file path. Applies fixes for supported rules only.", required: false },
                 ToolParamSpec { name: "snap_tolerance", description: "Tolerance for snapping operations in coordinate units. Defaults to 0.01.", required: false },
-                ToolParamSpec { name: "dry_run", description: "If true (default), emits change report without modifying input. If false, applies changes and overwrites output.", required: false },
+                ToolParamSpec { name: "dry_run", description: "If true (THE DEFAULT), previews only: the change report is emitted but no output is written. Pass false to apply fixes.", required: false },
                 ToolParamSpec { name: "output", description: "Output vector path for fixed features. If omitted, derived beside input.", required: false },
                 ToolParamSpec { name: "change_report", description: "Optional JSON change audit-trail report path.", required: false },
             ],
@@ -2962,14 +2974,14 @@ impl Tool for TopologyRuleAutoFixTool {
         ToolManifest {
             id: "topology_rule_autofix".to_string(),
             display_name: "Topology Rule AutoFix".to_string(),
-            summary: "Automatically applies safe, auditable fixes to topology violations detected by topology_rule_validate.".to_string(),
+            summary: "Automatically applies safe, auditable fixes to topology violations detected by topology_rule_validate: cross-feature endpoint snapping, dangling-endpoint snap/projection, and point-to-line projection. polygon_must_not_have_gaps has no automatic fix and is reported as zero changes.".to_string(),
             category: ToolCategory::Conversion,
             license_tier: LicenseTier::Open,
             params: vec![
                 ToolParamDescriptor { name: "input".to_string(), description: "Input vector path.".to_string(), required: true },
-                ToolParamDescriptor { name: "rule_set".to_string(), description: "Rule configuration as JSON array/object, CSV string, or file path. Applies fixes for supported rules only: line_endpoints_must_snap_within_tolerance, point_must_be_covered_by_line, polygon_must_not_have_gaps, line_must_not_have_dangles.".to_string(), required: false },
+                ToolParamDescriptor { name: "rule_set".to_string(), description: "Rule configuration as JSON array/object, CSV string, or file path. Rules with automatic fixes: line_endpoints_must_snap_within_tolerance, line_must_not_have_dangles, point_must_be_covered_by_line. polygon_must_not_have_gaps is accepted but never produces changes.".to_string(), required: false },
                 ToolParamDescriptor { name: "snap_tolerance".to_string(), description: "Tolerance for snapping operations in coordinate units. Defaults to 0.01.".to_string(), required: false },
-                ToolParamDescriptor { name: "dry_run".to_string(), description: "If true (default), emits change report without modifying input. If false, applies changes.".to_string(), required: false },
+                ToolParamDescriptor { name: "dry_run".to_string(), description: "If true (THE DEFAULT), previews only: the change report is emitted but no output is written. Pass false to apply fixes.".to_string(), required: false },
                 ToolParamDescriptor { name: "output".to_string(), description: "Output vector path for fixed features. If omitted, derived beside input.".to_string(), required: false },
                 ToolParamDescriptor { name: "change_report".to_string(), description: "Optional JSON change audit-trail report path.".to_string(), required: false },
             ],
@@ -3025,85 +3037,20 @@ impl Tool for TopologyRuleAutoFixTool {
             "running topology_rule_autofix (dry_run={})",
             dry_run
         ));
+        if dry_run && args.get("dry_run").is_none() {
+            // Defaulting to a preview is safe, but silently so: without this
+            // note a user who omitted --dry_run believes fixes were applied
+            // when no output was written at all (issue #8).
+            ctx.progress.info(
+                "dry_run defaulted to true (preview): no output is written; pass --dry_run=false to apply fixes",
+            );
+        }
         let mut input = read_vector_layer(&input_path, "input")?;
         let mut changes = Vec::<AppliedFix>::new();
         let mut change_counter = 0u32;
 
         if rules.contains(&TopologyRuleType::LineEndpointsMustSnapWithinTolerance) {
-            let endpoint_updates = input
-                .features
-                .par_iter()
-                .map(|feature| {
-                    let Some(geometry) = feature.geometry.as_ref() else {
-                        return None;
-                    };
-                    match geometry {
-                        Geometry::LineString(coords) => {
-                            if coords.len() < 2 {
-                                return None;
-                            }
-                            let updated = snap_line_endpoints(coords, snap_tolerance);
-                            if updated == *coords {
-                                return None;
-                            }
-                            let pre_hash = hash_string(&geom_to_hash_string(Some(&Geometry::line_string(coords.clone()))));
-                            let post_hash = hash_string(&geom_to_hash_string(Some(&Geometry::line_string(updated.clone()))));
-                            Some((
-                                Geometry::LineString(updated),
-                                vec![(feature.fid as i64, pre_hash, post_hash, "snapped linestring endpoints".to_string())],
-                            ))
-                        }
-                        Geometry::MultiLineString(parts) => {
-                            let mut updated_parts = parts.clone();
-                            let mut feature_changes = Vec::<(i64, String, String, String)>::new();
-                            for (part_idx, part) in parts.iter().enumerate() {
-                                if part.len() < 2 {
-                                    continue;
-                                }
-                                let updated = snap_line_endpoints(part, snap_tolerance);
-                                if updated != *part {
-                                    let pre_hash = hash_string(&geom_to_hash_string(Some(&Geometry::line_string(part.clone()))));
-                                    let post_hash = hash_string(&geom_to_hash_string(Some(&Geometry::line_string(updated.clone()))));
-                                    updated_parts[part_idx] = updated;
-                                    feature_changes.push((
-                                        feature.fid as i64,
-                                        pre_hash,
-                                        post_hash,
-                                        "snapped multilinestring part endpoints".to_string(),
-                                    ));
-                                }
-                            }
-                            if feature_changes.is_empty() {
-                                None
-                            } else {
-                                Some((Geometry::MultiLineString(updated_parts), feature_changes))
-                            }
-                        }
-                        _ => None,
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            for (idx, pending) in endpoint_updates.into_iter().enumerate() {
-                let Some((updated_geometry, feature_changes)) = pending else {
-                    continue;
-                };
-                if let Some(feature) = input.features.get_mut(idx) {
-                    feature.geometry = Some(updated_geometry);
-                }
-                for (target_fid, pre_hash, post_hash, detail) in feature_changes {
-                    changes.push(AppliedFix {
-                        change_id: format!("fix_{}", change_counter),
-                        rule_id: "line_endpoints_must_snap_within_tolerance".to_string(),
-                        action_type: "snap_endpoints".to_string(),
-                        target_fid,
-                        pre_state_hash: pre_hash,
-                        post_state_hash: post_hash,
-                        detail,
-                    });
-                    change_counter += 1;
-                }
-            }
+            autofix_snap_endpoints(&mut input, snap_tolerance, &mut changes, &mut change_counter);
         }
 
         if rules.contains(&TopologyRuleType::PointMustBeCoveredByLine) {
@@ -3135,7 +3082,7 @@ impl Tool for TopologyRuleAutoFixTool {
                         };
 
                         let pre_hash = hash_string(&geom_to_hash_string(Some(geometry)));
-                        let Some(snap_coord) = find_nearest_point_on_lines(coord, &lines, snap_tolerance) else {
+                        let Some(snap_coord) = find_nearest_point_on_lines(coord, &lines, snap_tolerance, None) else {
                             return None;
                         };
                         if coord_dist(
@@ -3170,6 +3117,10 @@ impl Tool for TopologyRuleAutoFixTool {
                     change_counter += 1;
                 }
             }
+        }
+
+        if rules.contains(&TopologyRuleType::LineMustNotHaveDangles) {
+            autofix_dangles(&mut input, snap_tolerance, &mut changes, &mut change_counter);
         }
 
         if let Some(report_path) = change_report_path {
@@ -3245,11 +3196,14 @@ fn snap_line_endpoints(coords: &[Coord], tolerance: f64) -> Vec<Coord> {
     result
 }
 
-fn find_nearest_point_on_lines(point: &Coord, lines: &[(u64, Geometry)], tolerance: f64) -> Option<Coord> {
+fn find_nearest_point_on_lines(point: &Coord, lines: &[(u64, Geometry)], tolerance: f64, exclude_fid: Option<u64>) -> Option<Coord> {
     let mut nearest: Option<Coord> = None;
     let mut nearest_dist = f64::INFINITY;
 
-    for (_line_fid, line_geom) in lines {
+    for (line_fid, line_geom) in lines {
+        if exclude_fid == Some(*line_fid) {
+            continue;
+        }
         match line_geom {
             Geometry::LineString(coords) => {
                 if let Some((closest, dist)) = closest_point_on_linestring(point, coords) {
@@ -6981,6 +6935,437 @@ impl Tool for VectorPolygonsToRasterTool {
         }
 
         write_raster_output(output, output_path, ctx)
+    }
+}
+
+/// Which end of which part of a line geometry an endpoint lives at.
+/// `part` is 0 for a plain `LineString`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LineEndpointSlot {
+    part: usize,
+    at_end: bool,
+}
+
+/// Every line endpoint of a geometry with its slot, in part order.
+/// Non-line geometry (and degenerate parts with fewer than 2 vertices)
+/// contribute nothing.
+fn line_endpoint_slots(geometry: &Geometry) -> Vec<(LineEndpointSlot, Coord)> {
+    match geometry {
+        Geometry::LineString(coords) if coords.len() >= 2 => vec![
+            (LineEndpointSlot { part: 0, at_end: false }, coords[0].clone()),
+            (LineEndpointSlot { part: 0, at_end: true }, coords[coords.len() - 1].clone()),
+        ],
+        Geometry::MultiLineString(parts) => parts
+            .iter()
+            .enumerate()
+            .filter(|(_, part)| part.len() >= 2)
+            .flat_map(|(idx, part)| {
+                vec![
+                    (LineEndpointSlot { part: idx, at_end: false }, part[0].clone()),
+                    (LineEndpointSlot { part: idx, at_end: true }, part[part.len() - 1].clone()),
+                ]
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Move one line endpoint of `geometry` to `coord`.
+fn set_line_endpoint(geometry: &mut Geometry, slot: LineEndpointSlot, coord: Coord) {
+    match geometry {
+        Geometry::LineString(coords) => {
+            if let Some(target) = if slot.at_end { coords.last_mut() } else { coords.first_mut() } {
+                *target = coord;
+            }
+        }
+        Geometry::MultiLineString(parts) => {
+            if let Some(part) = parts.get_mut(slot.part) {
+                if let Some(target) = if slot.at_end { part.last_mut() } else { part.first_mut() } {
+                    *target = coord;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Endpoints closer than this are considered already connected; snapping
+/// them would be a no-op (and validate treats them as connected too).
+const ENDPOINT_COINCIDENT: f64 = 1e-9;
+
+/// Fixer for `line_endpoints_must_snap_within_tolerance`: snap line endpoints
+/// onto endpoints of *other* features within `(1e-9, tolerance]`.
+///
+/// Features are processed in order and each snaps onto the already-settled
+/// endpoints of earlier features, so a mutually-close endpoint pair converges
+/// onto the earlier feature's coordinate instead of the two swapping past
+/// each other. A line whose own two endpoints are within tolerance (a nearly
+/// closed ring) still closes onto their midpoint — the pre-existing
+/// `snap_line_endpoints` behavior — when neither end snapped to another
+/// feature.
+///
+/// The previous implementation only ever performed that self-closure, so
+/// cross-feature near-misses (the case the validate rule actually reports)
+/// were never fixed (issue #8).
+fn autofix_snap_endpoints(
+    input: &mut Layer,
+    tolerance: f64,
+    changes: &mut Vec<AppliedFix>,
+    change_counter: &mut u32,
+) {
+    let mut anchors: Vec<(u64, Coord)> = Vec::new();
+    let mut anchor_tree: KdTree<f64, usize, [f64; 2]> = KdTree::new(2);
+
+    for idx in 0..input.features.len() {
+        let fid = input.features[idx].fid;
+        let Some(original) = input.features[idx].geometry.clone() else {
+            continue;
+        };
+        let slots = line_endpoint_slots(&original);
+        if slots.is_empty() {
+            continue;
+        }
+
+        let mut updated = original.clone();
+        let mut details = Vec::<String>::new();
+        let mut snapped = std::collections::HashSet::<LineEndpointSlot>::new();
+
+        for (slot, coord) in &slots {
+            let candidates = anchor_tree
+                .within(&[coord.x, coord.y], tolerance * tolerance, &squared_euclidean)
+                .unwrap_or_default();
+            // `within` returns candidates sorted by ascending distance.
+            for (sq_dist, anchor_idx) in candidates {
+                let (anchor_fid, anchor_coord) = &anchors[*anchor_idx];
+                if *anchor_fid == fid {
+                    continue;
+                }
+                if sq_dist.sqrt() <= ENDPOINT_COINCIDENT {
+                    // Already connected to another feature; nothing to fix.
+                    break;
+                }
+                details.push(format!(
+                    "snapped endpoint ({}, {}) to ({}, {})",
+                    coord.x, coord.y, anchor_coord.x, anchor_coord.y
+                ));
+                set_line_endpoint(&mut updated, *slot, anchor_coord.clone());
+                snapped.insert(*slot);
+                break;
+            }
+        }
+
+        // Self-closure of nearly-closed parts, only where cross-feature
+        // snapping left both ends of the part untouched.
+        let mut close_part = |part_idx: usize, coords: &mut Vec<Coord>| {
+            let start = LineEndpointSlot { part: part_idx, at_end: false };
+            let end = LineEndpointSlot { part: part_idx, at_end: true };
+            if snapped.contains(&start) || snapped.contains(&end) || coords.len() < 2 {
+                return;
+            }
+            let closed = snap_line_endpoints(coords, tolerance);
+            if closed != *coords {
+                details.push("closed nearly-closed line onto its endpoint midpoint".to_string());
+                *coords = closed;
+            }
+        };
+        match &mut updated {
+            Geometry::LineString(coords) => close_part(0, coords),
+            Geometry::MultiLineString(parts) => {
+                for (part_idx, part) in parts.iter_mut().enumerate() {
+                    close_part(part_idx, part);
+                }
+            }
+            _ => {}
+        }
+
+        if !details.is_empty() {
+            let pre_hash = hash_string(&geom_to_hash_string(Some(&original)));
+            let post_hash = hash_string(&geom_to_hash_string(Some(&updated)));
+            for detail in details {
+                changes.push(AppliedFix {
+                    change_id: format!("fix_{}", change_counter),
+                    rule_id: "line_endpoints_must_snap_within_tolerance".to_string(),
+                    action_type: "snap_endpoints".to_string(),
+                    target_fid: fid as i64,
+                    pre_state_hash: pre_hash.clone(),
+                    post_state_hash: post_hash.clone(),
+                    detail,
+                });
+                *change_counter += 1;
+            }
+            input.features[idx].geometry = Some(updated.clone());
+        }
+
+        // Register this feature's (possibly moved) endpoints as anchors for
+        // the features that follow.
+        for (_, coord) in line_endpoint_slots(&updated) {
+            anchors.push((fid, coord.clone()));
+            let _ = anchor_tree.add([coord.x, coord.y], anchors.len() - 1);
+        }
+    }
+}
+
+/// Fixer for `line_must_not_have_dangles`: a dangling endpoint (no endpoint
+/// of a different feature exactly coincident) is repaired by snapping to the
+/// nearest other-feature endpoint within tolerance, else by projecting onto
+/// the nearest point of another feature's line within tolerance.
+///
+/// Two kinds of dangle are deliberately left alone: free ends with nothing
+/// within tolerance (unfixable without inventing geometry), and T-junction
+/// ends that already touch another line mid-segment — connecting those would
+/// require splitting the touched line, which is not a safe automatic fix.
+/// Both keep being reported by `topology_rule_validate`. This rule previously
+/// had no fixer at all despite being advertised in the change report
+/// (issue #8).
+fn autofix_dangles(
+    input: &mut Layer,
+    tolerance: f64,
+    changes: &mut Vec<AppliedFix>,
+    change_counter: &mut u32,
+) {
+    let endpoints: Vec<(u64, Coord)> = input
+        .features
+        .iter()
+        .filter_map(|feature| {
+            feature
+                .geometry
+                .as_ref()
+                .map(|geometry| (feature.fid, line_endpoint_slots(geometry)))
+        })
+        .flat_map(|(fid, slots)| slots.into_iter().map(move |(_, coord)| (fid, coord)))
+        .collect();
+    if endpoints.is_empty() {
+        return;
+    }
+    let mut endpoint_tree: KdTree<f64, usize, [f64; 2]> = KdTree::new(2);
+    for (idx, (_, coord)) in endpoints.iter().enumerate() {
+        let _ = endpoint_tree.add([coord.x, coord.y], idx);
+    }
+    let lines: Vec<(u64, Geometry)> = input
+        .features
+        .iter()
+        .filter_map(|feature| {
+            let geometry = feature.geometry.as_ref()?;
+            matches!(geometry, Geometry::LineString(_) | Geometry::MultiLineString(_))
+                .then(|| (feature.fid, geometry.clone()))
+        })
+        .collect();
+
+    for idx in 0..input.features.len() {
+        let fid = input.features[idx].fid;
+        let Some(original) = input.features[idx].geometry.clone() else {
+            continue;
+        };
+        let slots = line_endpoint_slots(&original);
+        if slots.is_empty() {
+            continue;
+        }
+
+        let mut updated = original.clone();
+        let mut fixes = Vec::<(String, String)>::new();
+
+        for (slot, coord) in &slots {
+            let candidates = endpoint_tree
+                .within(&[coord.x, coord.y], tolerance * tolerance, &squared_euclidean)
+                .unwrap_or_default();
+            let connected = candidates.iter().any(|(sq_dist, endpoint_idx)| {
+                endpoints[**endpoint_idx].0 != fid && sq_dist.sqrt() <= ENDPOINT_COINCIDENT
+            });
+            if connected {
+                continue;
+            }
+            // Nearest other-feature endpoint within tolerance wins...
+            let nearest_endpoint = candidates.iter().find_map(|(sq_dist, endpoint_idx)| {
+                let (candidate_fid, candidate_coord) = &endpoints[**endpoint_idx];
+                (*candidate_fid != fid && sq_dist.sqrt() > ENDPOINT_COINCIDENT)
+                    .then(|| candidate_coord.clone())
+            });
+            if let Some(target) = nearest_endpoint {
+                fixes.push((
+                    "snap_to_endpoint".to_string(),
+                    format!(
+                        "snapped dangling endpoint ({}, {}) to endpoint ({}, {})",
+                        coord.x, coord.y, target.x, target.y
+                    ),
+                ));
+                set_line_endpoint(&mut updated, *slot, target);
+                continue;
+            }
+            // ...otherwise project onto the nearest other line within tolerance.
+            if let Some(target) = find_nearest_point_on_lines(coord, &lines, tolerance, Some(fid)) {
+                if coord_dist(
+                    TopoCoord::xy(coord.x, coord.y),
+                    TopoCoord::xy(target.x, target.y),
+                ) > ENDPOINT_COINCIDENT
+                {
+                    fixes.push((
+                        "snap_endpoint_to_line".to_string(),
+                        format!(
+                            "projected dangling endpoint ({}, {}) onto line at ({}, {})",
+                            coord.x, coord.y, target.x, target.y
+                        ),
+                    ));
+                    set_line_endpoint(&mut updated, *slot, target);
+                }
+            }
+        }
+
+        if !fixes.is_empty() {
+            let pre_hash = hash_string(&geom_to_hash_string(Some(&original)));
+            let post_hash = hash_string(&geom_to_hash_string(Some(&updated)));
+            for (action_type, detail) in fixes {
+                changes.push(AppliedFix {
+                    change_id: format!("fix_{}", change_counter),
+                    rule_id: "line_must_not_have_dangles".to_string(),
+                    action_type,
+                    target_fid: fid as i64,
+                    pre_state_hash: pre_hash.clone(),
+                    post_state_hash: post_hash.clone(),
+                    detail,
+                });
+                *change_counter += 1;
+            }
+            input.features[idx].geometry = Some(updated);
+        }
+    }
+}
+
+#[cfg(test)]
+mod topology_autofix_tests {
+    use super::*;
+    use wbvector::Feature;
+
+    fn c(x: f64, y: f64) -> Coord {
+        Coord::xy(x, y)
+    }
+
+    fn line_layer(lines: Vec<Vec<Coord>>) -> Layer {
+        let mut layer = Layer::new("test");
+        for (idx, coords) in lines.into_iter().enumerate() {
+            let mut feature = Feature::new();
+            feature.fid = idx as u64;
+            feature.geometry = Some(Geometry::LineString(coords));
+            layer.features.push(feature);
+        }
+        layer
+    }
+
+    fn line_coords(layer: &Layer, idx: usize) -> &[Coord] {
+        match layer.features[idx].geometry.as_ref().unwrap() {
+            Geometry::LineString(coords) => coords,
+            other => panic!("expected LineString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snap_endpoints_joins_cross_feature_near_miss() {
+        // Issue #8: the near-miss end of the second line must land exactly on
+        // the first line's endpoint; the earlier feature's geometry wins.
+        let mut layer = line_layer(vec![
+            vec![c(12.0, 10.0), c(15.0, 10.0), c(15.0, 14.0)],
+            vec![c(10.0, 10.0), c(12.0, 10.0001)],
+        ]);
+        let mut changes = Vec::new();
+        let mut counter = 0u32;
+        autofix_snap_endpoints(&mut layer, 0.001, &mut changes, &mut counter);
+        assert_eq!(changes.len(), 1, "changes: {:?}", changes.iter().map(|f| &f.detail).collect::<Vec<_>>());
+        assert_eq!(changes[0].rule_id, "line_endpoints_must_snap_within_tolerance");
+        assert_eq!(line_coords(&layer, 0)[0], c(12.0, 10.0), "earlier feature must not move");
+        assert_eq!(line_coords(&layer, 1)[1], c(12.0, 10.0), "near-miss end must snap exactly");
+    }
+
+    #[test]
+    fn snap_endpoints_ignores_connected_and_far_endpoints() {
+        // Exactly-connected pair plus a far-away line: nothing to do.
+        let mut layer = line_layer(vec![
+            vec![c(0.0, 0.0), c(5.0, 0.0)],
+            vec![c(5.0, 0.0), c(5.0, 5.0)],
+            vec![c(100.0, 100.0), c(110.0, 100.0)],
+        ]);
+        let mut changes = Vec::new();
+        let mut counter = 0u32;
+        autofix_snap_endpoints(&mut layer, 0.01, &mut changes, &mut counter);
+        assert!(changes.is_empty(), "changes: {:?}", changes.iter().map(|f| &f.detail).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn snap_endpoints_still_closes_nearly_closed_rings() {
+        // The pre-existing self-closure behavior must survive the rework.
+        let mut layer = line_layer(vec![vec![
+            c(0.0, 0.0),
+            c(4.0, 0.0),
+            c(4.0, 4.0),
+            c(0.0, 4.0),
+            c(0.0, 0.004),
+        ]]);
+        let mut changes = Vec::new();
+        let mut counter = 0u32;
+        autofix_snap_endpoints(&mut layer, 0.01, &mut changes, &mut counter);
+        assert_eq!(changes.len(), 1);
+        let coords = line_coords(&layer, 0);
+        assert_eq!(coords[0], coords[coords.len() - 1], "ring must be closed");
+    }
+
+    #[test]
+    fn dangles_project_spur_end_onto_line() {
+        // Issue #8's short-spur case: the free end near line 0 projects onto
+        // it; the far network ends have nothing in tolerance and stay put.
+        let mut layer = line_layer(vec![
+            vec![c(0.0, 0.0), c(5.0, 0.0)],
+            vec![c(5.0, 0.0), c(5.0, 5.0)],
+            vec![c(2.0, 0.0), c(2.003, 0.003)],
+        ]);
+        let mut changes = Vec::new();
+        let mut counter = 0u32;
+        autofix_dangles(&mut layer, 0.01, &mut changes, &mut counter);
+        let details: Vec<_> = changes.iter().map(|f| f.detail.clone()).collect();
+        assert!(
+            changes.iter().any(|f| f.action_type == "snap_endpoint_to_line" && f.target_fid == 2),
+            "expected spur projection, got {details:?}"
+        );
+        // The spur's near end (2.003, 0.003) must now lie on y = 0.
+        let spur = line_coords(&layer, 2);
+        assert!(spur[1].y.abs() < 1e-12, "spur end not projected: {:?}", spur[1]);
+        // Free ends far from anything must not move or invent geometry.
+        assert_eq!(line_coords(&layer, 0)[0], c(0.0, 0.0));
+        assert_eq!(line_coords(&layer, 1)[1], c(5.0, 5.0));
+    }
+
+    #[test]
+    fn dangles_prefer_endpoint_snap_over_projection() {
+        let mut layer = line_layer(vec![
+            vec![c(0.0, 0.0), c(5.0, 0.0)],
+            vec![c(5.002, 0.002), c(9.0, 3.0)],
+        ]);
+        let mut changes = Vec::new();
+        let mut counter = 0u32;
+        autofix_dangles(&mut layer, 0.01, &mut changes, &mut counter);
+        assert!(
+            changes.iter().any(|f| f.action_type == "snap_to_endpoint" && f.target_fid == 1),
+            "details: {:?}",
+            changes.iter().map(|f| &f.detail).collect::<Vec<_>>()
+        );
+        assert_eq!(line_coords(&layer, 1)[0], c(5.0, 0.0));
+    }
+
+    #[test]
+    fn dangles_leave_t_junctions_alone() {
+        // An endpoint resting mid-segment on another line is a dangle by the
+        // endpoint-connectivity definition, but moving it cannot connect it —
+        // splitting the touched line is not a safe automatic fix.
+        let mut layer = line_layer(vec![
+            vec![c(0.0, 0.0), c(10.0, 0.0)],
+            vec![c(5.0, 0.0), c(5.0, 4.0)],
+        ]);
+        let mut changes = Vec::new();
+        let mut counter = 0u32;
+        autofix_dangles(&mut layer, 0.01, &mut changes, &mut counter);
+        assert!(
+            changes.iter().all(|f| f.target_fid != 1 || f.action_type != "snap_endpoint_to_line" || f.detail.contains("(5, 4)") == false),
+            "T-junction end must not be re-projected: {:?}",
+            changes.iter().map(|f| &f.detail).collect::<Vec<_>>()
+        );
+        assert_eq!(line_coords(&layer, 1)[0], c(5.0, 0.0), "touching end must not move");
     }
 }
 

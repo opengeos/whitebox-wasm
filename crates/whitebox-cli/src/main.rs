@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use serde_json::Value;
 use wbtools_oss::{ToolRegistry, register_default_tools};
-use wbcore::{ToolContext, AllowAllCapabilities, RecordingProgressSink};
+use wbcore::{ToolContext, AllowAllCapabilities, ProgressEvent, RecordingProgressSink};
 
 fn parse_value(s: &str) -> Value {
     if let Ok(i) = s.parse::<i64>() { return Value::from(i); }
@@ -57,9 +57,21 @@ fn main() {
 
     let progress = RecordingProgressSink::new();
     let caps = AllowAllCapabilities;
-    let ctx = ToolContext { progress: &progress, capabilities: &caps };
+    let result = {
+        let ctx = ToolContext { progress: &progress, capabilities: &caps };
+        reg.run(cmd, &args, &ctx)
+    };
 
-    match reg.run(cmd, &args, &ctx) {
+    // Surface the tool's own progress messages: the recording sink previously
+    // captured them and they were silently dropped, which hid operational
+    // notes like topology_rule_autofix's "dry_run defaulted to true" hint.
+    for event in progress.take_events() {
+        if let ProgressEvent::Info(msg) = event {
+            println!("{msg}");
+        }
+    }
+
+    match result {
         Ok(_) => println!("OK: tool '{cmd}' completed"),
         Err(e) => { eprintln!("ERROR running '{cmd}': {e:?}"); std::process::exit(1); }
     }

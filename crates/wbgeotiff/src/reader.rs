@@ -675,6 +675,13 @@ impl GeoTiff {
     fn decode_all_pixels(&self) -> Result<Vec<u8>> {
         let expected_total = self.info.row_bytes() * self.info.height as usize;
 
+        // Predictor stride: chunky rows interleave all bands (stride = spp),
+        // while each planar strip/tile holds a single band (stride = 1).
+        let pred_spp = match self.info.planar_config {
+            PlanarConfig::Chunky => self.info.samples_per_pixel as usize,
+            PlanarConfig::Planar => 1,
+        };
+
         match &self.info.layout {
             ImageLayout::Stripped { rows_per_strip, offsets, byte_counts } => {
                 let mut out = Vec::with_capacity(expected_total);
@@ -700,7 +707,7 @@ impl GeoTiff {
                         self.info.predictor,
                         self.info.width as usize,
                         strip_rows,
-                        self.info.samples_per_pixel as usize,
+                        pred_spp,
                         self.info.bytes_per_sample(),
                     )?;
                     out.extend_from_slice(&decompressed[..decompressed.len().min(expected_strip)]);
@@ -741,7 +748,7 @@ impl GeoTiff {
                             self.info.predictor,
                             tw,
                             th,
-                            spp,
+                            pred_spp,
                             bps,
                         )?;
 
@@ -823,7 +830,9 @@ pub struct CogLevel {
     /// Compression codec.
     pub compression: Compression,
     /// TIFF `Predictor` tag (317); 1 = none, 2 = horizontal, 3 = floating point.
-    pub predictor: u16,
+    /// Private and read only by the decoder so adding it stays a non-breaking
+    /// change for downstream code that constructs or destructures `CogLevel`.
+    predictor: u16,
 }
 
 impl CogLevel {

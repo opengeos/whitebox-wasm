@@ -428,8 +428,8 @@ fn rows_present(buf_len: usize, rows: usize, row_bytes: usize) -> impl Iterator<
     (0..rows).map(move |r| (r * row_bytes, r * row_bytes + row_bytes)).take_while(move |&(_, end)| end <= buf_len)
 }
 
-/// Reverse horizontal differencing (Predictor 2) for 1-, 2-, or 4-byte integer
-/// samples.
+/// Reverse horizontal differencing (Predictor 2) for 1-, 2-, 4-, or 8-byte
+/// integer samples.
 fn undo_horizontal(buf: &mut [u8], cols: usize, rows: usize, spp: usize, bps: usize) -> Result<()> {
     let row_bytes = cols * spp * bps;
     if cols <= 1 || row_bytes == 0 {
@@ -458,6 +458,15 @@ fn undo_horizontal(buf: &mut [u8], cols: usize, rows: usize, spp: usize, bps: us
                     let prev = u32::from_le_bytes([row[p], row[p + 1], row[p + 2], row[p + 3]]);
                     let cur = u32::from_le_bytes([row[c], row[c + 1], row[c + 2], row[c + 3]]);
                     row[c..c + 4].copy_from_slice(&cur.wrapping_add(prev).to_le_bytes());
+                }
+            }
+            8 => {
+                for i in spp..samples {
+                    let p = (i - spp) * 8;
+                    let c = i * 8;
+                    let prev = u64::from_le_bytes(row[p..p + 8].try_into().unwrap());
+                    let cur = u64::from_le_bytes(row[c..c + 8].try_into().unwrap());
+                    row[c..c + 8].copy_from_slice(&cur.wrapping_add(prev).to_le_bytes());
                 }
             }
             other => {
@@ -560,6 +569,23 @@ mod predictor_tests {
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(got, vec![1000, 1005, 1002]);
+    }
+
+    #[test]
+    fn horizontal_u64_little_endian() {
+        // 64-bit integer samples (reachable via read_band_u64/i64) must decode
+        // too. Original u64 row [5_000_000_000, 5_000_000_007, 5_000_000_004];
+        // diffs [5_000_000_000, 7, -3].
+        let mut buf = Vec::new();
+        for v in [5_000_000_000u64, 7, (-3i64 as u64)] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        undo_predictor(&mut buf, PREDICTOR_HORIZONTAL, 3, 1, 1, 8).unwrap();
+        let got: Vec<u64> = buf
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, vec![5_000_000_000, 5_000_000_007, 5_000_000_004]);
     }
 
     #[test]

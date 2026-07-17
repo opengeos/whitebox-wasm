@@ -23,6 +23,7 @@ pub mod tag {
     pub const YResolution: u16 = 283;
     pub const PlanarConfiguration: u16 = 284;
     pub const ResolutionUnit: u16 = 296;
+    pub const Predictor: u16 = 317;
     pub const Software: u16 = 305;
     pub const DateTime: u16 = 306;
     pub const SampleFormat: u16 = 339;

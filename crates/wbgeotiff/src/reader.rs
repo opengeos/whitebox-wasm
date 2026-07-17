@@ -42,6 +42,8 @@ struct ImageInfo {
     bits_per_sample: u16,
     sample_format: SampleFormat,
     compression: Compression,
+    /// TIFF `Predictor` tag (317); 1 = none, 2 = horizontal, 3 = floating point.
+    predictor: u16,
     photometric: PhotometricInterpretation,
     planar_config: PlanarConfig,
     no_data: Option<f64>,
@@ -227,6 +229,13 @@ impl GeoTiff {
             .map(|v| Compression::from_tag(v as u16))
             .unwrap_or(Compression::None);
 
+        // Predictor (317): 1 = none (default), 2 = horizontal differencing,
+        // 3 = floating point. Reversed after decompression before samples are read.
+        let predictor = ifd
+            .get(tag::Predictor)
+            .and_then(|e| e.value.as_u64())
+            .unwrap_or(1) as u16;
+
         let photometric = ifd
             .get(tag::PhotometricInterpretation)
             .and_then(|e| e.value.as_u64())
@@ -276,6 +285,7 @@ impl GeoTiff {
             bits_per_sample,
             sample_format,
             compression,
+            predictor,
             photometric,
             planar_config,
             no_data,
@@ -665,6 +675,13 @@ impl GeoTiff {
     fn decode_all_pixels(&self) -> Result<Vec<u8>> {
         let expected_total = self.info.row_bytes() * self.info.height as usize;
 
+        // Predictor stride: chunky rows interleave all bands (stride = spp),
+        // while each planar strip/tile holds a single band (stride = 1).
+        let pred_spp = match self.info.planar_config {
+            PlanarConfig::Chunky => self.info.samples_per_pixel as usize,
+            PlanarConfig::Planar => 1,
+        };
+
         match &self.info.layout {
             ImageLayout::Stripped { rows_per_strip, offsets, byte_counts } => {
                 let mut out = Vec::with_capacity(expected_total);
@@ -683,8 +700,16 @@ impl GeoTiff {
                     let compressed = &self.data[start..end];
                     let strip_rows = rps.min(self.info.height as usize - i * rps);
                     let expected_strip = strip_rows * row_bytes;
-                    let decompressed =
+                    let mut decompressed =
                         compression::decompress(self.info.compression, compressed, expected_strip)?;
+                    compression::undo_predictor(
+                        &mut decompressed,
+                        self.info.predictor,
+                        self.info.width as usize,
+                        strip_rows,
+                        pred_spp,
+                        self.info.bytes_per_sample(),
+                    )?;
                     out.extend_from_slice(&decompressed[..decompressed.len().min(expected_strip)]);
                 }
                 Ok(out)
@@ -716,8 +741,16 @@ impl GeoTiff {
                             });
                         }
                         let compressed = &self.data[off..off + bc];
-                        let decompressed =
+                        let mut decompressed =
                             compression::decompress(self.info.compression, compressed, tile_bytes_raw)?;
+                        compression::undo_predictor(
+                            &mut decompressed,
+                            self.info.predictor,
+                            tw,
+                            th,
+                            pred_spp,
+                            bps,
+                        )?;
 
                         // Copy tile into the output buffer, clipping at image edges
                         let img_x0 = tx * tw;
@@ -796,6 +829,10 @@ pub struct CogLevel {
     pub sample_format: SampleFormat,
     /// Compression codec.
     pub compression: Compression,
+    /// TIFF `Predictor` tag (317); 1 = none, 2 = horizontal, 3 = floating point.
+    /// Private and read only by the decoder so adding it stays a non-breaking
+    /// change for downstream code that constructs or destructures `CogLevel`.
+    predictor: u16,
 }
 
 impl CogLevel {
@@ -818,7 +855,16 @@ impl CogLevel {
         let bps = (self.bits_per_sample as usize + 7) / 8;
         let spp = self.samples_per_pixel as usize;
         let raw = self.tile_width as usize * self.tile_height as usize * spp * bps;
-        let decompressed = compression::decompress(self.compression, tile_bytes, raw)?;
+        let mut decompressed = compression::decompress(self.compression, tile_bytes, raw)?;
+        // Undo any TIFF predictor across each full tile row before reading samples.
+        compression::undo_predictor(
+            &mut decompressed,
+            self.predictor,
+            self.tile_width as usize,
+            self.tile_height as usize,
+            spp,
+            bps,
+        )?;
         let mut out = Vec::with_capacity(raw / bps.max(1));
         for chunk in decompressed.chunks_exact(bps.max(1)) {
             out.push(sample_to_f64(chunk, self.sample_format).unwrap_or(f64::NAN));
@@ -876,6 +922,7 @@ impl GeoTiff {
                         bits_per_sample: info.bits_per_sample,
                         sample_format: info.sample_format,
                         compression: info.compression,
+                        predictor: info.predictor,
                     });
                 }
                 ImageLayout::Stripped { .. } => {

@@ -374,7 +374,106 @@ fn normalize_conditional_expression(s: &str) -> String {
         .replace("Row", "row")
         .replace("pi()", "pi")
         .replace("e()", "e");
-    translate_sql_logical_aliases(&normalized)
+    let aliased = translate_sql_logical_aliases(&normalized);
+    let with_equality = translate_sql_equality(&aliased);
+    promote_int_literals_to_float(&with_equality)
+}
+
+/// Rewrites a lone `=` (SQL/QGIS-style equality) to `==`. In evalexpr a single
+/// `=` is an assignment, which fails against an immutable context and turns
+/// the whole output into nodata.
+fn translate_sql_equality(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len() + 8);
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+
+        if byte == b'\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+        } else if byte == b'"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+        } else if byte == b'=' && !in_single_quote && !in_double_quote {
+            let prev = bytes[..idx]
+                .iter()
+                .rev()
+                .copied()
+                .find(|c| !c.is_ascii_whitespace());
+            let part_of_operator = matches!(prev, Some(b'=' | b'!' | b'<' | b'>'))
+                || bytes.get(idx + 1) == Some(&b'=');
+            if !part_of_operator {
+                out.push_str("==");
+                idx += 1;
+                continue;
+            }
+        }
+
+        out.push(byte as char);
+        idx += 1;
+    }
+    out
+}
+
+/// Rewrites standalone integer literals as float literals (`1` → `1.0`).
+/// Raster cell values are bound into the evalexpr context as `Float`, and
+/// evalexpr never considers values of different types equal, so
+/// `value0 == 1` is always false and `value0 != 1` is always true.
+fn promote_int_literals_to_float(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+
+        if byte == b'\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+        } else if byte == b'"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+        } else if byte.is_ascii_digit() && !in_single_quote && !in_double_quote {
+            let prev = idx.checked_sub(1).map(|i| bytes[i]);
+            let prev_is_word = matches!(prev, Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b'.');
+
+            let mut end = idx;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            let next_is_word = bytes
+                .get(end)
+                .map(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'.')
+                .unwrap_or(false);
+
+            // Digits following `e`/`E` (with optional sign) of a numeric
+            // literal are an exponent, not a standalone integer.
+            let is_exponent_part = {
+                let mut j = idx;
+                if j > 0 && (bytes[j - 1] == b'+' || bytes[j - 1] == b'-') {
+                    j -= 1;
+                }
+                j > 1
+                    && (bytes[j - 1] == b'e' || bytes[j - 1] == b'E')
+                    && (bytes[j - 2].is_ascii_digit() || bytes[j - 2] == b'.')
+            };
+
+            for k in idx..end {
+                out.push(bytes[k] as char);
+            }
+            if !prev_is_word && !next_is_word && !is_exponent_part {
+                out.push_str(".0");
+            }
+            idx = end;
+            continue;
+        }
+
+        out.push(byte as char);
+        idx += 1;
+    }
+    out
 }
 
 fn translate_sql_logical_aliases(input: &str) -> String {
@@ -8483,5 +8582,121 @@ impl Tool for InversePcaTool {
         let mut outputs = BTreeMap::new();
         outputs.insert("outputs".to_string(), json!(img_locators));
         Ok(ToolRunResult { outputs })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wbcore::{AllowAllCapabilities, ProgressSink, ToolContext};
+
+    struct NoopProgress;
+    impl ProgressSink for NoopProgress {}
+
+    fn make_ctx() -> ToolContext<'static> {
+        static PROGRESS: NoopProgress = NoopProgress;
+        static CAPS: AllowAllCapabilities = AllowAllCapabilities;
+        ToolContext {
+            progress: &PROGRESS,
+            capabilities: &CAPS,
+        }
+    }
+
+    #[test]
+    fn equality_normalization_promotes_int_literals() {
+        assert_eq!(normalize_conditional_expression("value0 == 1"), "value0 == 1.0");
+        assert_eq!(normalize_conditional_expression("value0 != 1"), "value0 != 1.0");
+        assert_eq!(
+            normalize_conditional_expression("value0 > 0 && value0 < 2"),
+            "value0 > 0.0 && value0 < 2.0"
+        );
+        // Already-float and scientific-notation literals are left intact.
+        assert_eq!(normalize_conditional_expression("value0 == 1.5"), "value0 == 1.5");
+        assert_eq!(normalize_conditional_expression("value0 == 1.5e-3"), "value0 == 1.5e-3");
+        assert_eq!(normalize_conditional_expression("value0 == -32768"), "value0 == -32768.0");
+        // Identifiers with digits are not literals.
+        assert_eq!(normalize_conditional_expression("value12 == 3"), "value12 == 3.0");
+    }
+
+    #[test]
+    fn equality_normalization_translates_sql_equals() {
+        assert_eq!(normalize_conditional_expression("value0 = 1"), "value0 == 1.0");
+        assert_eq!(normalize_conditional_expression("value0 <= 1"), "value0 <= 1.0");
+        assert_eq!(normalize_conditional_expression("value0 >= 1"), "value0 >= 1.0");
+        assert_eq!(normalize_conditional_expression("value0 != 1"), "value0 != 1.0");
+        assert_eq!(normalize_conditional_expression("value0 == 1"), "value0 == 1.0");
+    }
+
+    #[test]
+    fn normalized_equality_evaluates_true_against_float_context() {
+        let mut context = HashMapContext::<DefaultNumericTypes>::new();
+        context
+            .set_value("value0".to_string(), EvalValue::Float(1.0))
+            .unwrap();
+        for expr in ["value0 == 1", "value0 = 1"] {
+            let normalized = normalize_conditional_expression(expr);
+            let tree = build_operator_tree::<DefaultNumericTypes>(&normalized).unwrap();
+            assert_eq!(
+                tree.eval_with_context(&context).unwrap(),
+                EvalValue::Boolean(true),
+                "expression {expr:?} (normalized {normalized:?}) should be true for value0 = 1.0"
+            );
+        }
+        let normalized = normalize_conditional_expression("value0 != 1");
+        let tree = build_operator_tree::<DefaultNumericTypes>(&normalized).unwrap();
+        assert_eq!(tree.eval_with_context(&context).unwrap(), EvalValue::Boolean(false));
+    }
+
+    fn run_raster_calculator(expression: &str) -> Raster {
+        let cfg = RasterConfig {
+            rows: 1,
+            cols: 4,
+            bands: 1,
+            nodata: -9999.0,
+            cell_size: 10.0,
+            ..Default::default()
+        };
+        let mut input = Raster::new(cfg);
+        for (col, v) in [0.0, 1.0, 2.0, 3.0].into_iter().enumerate() {
+            input.set(0, 0, col as isize, v).unwrap();
+        }
+        let id = memory_store::put_raster(input);
+
+        let mut args = ToolArgs::new();
+        args.insert("expression".to_string(), json!(expression));
+        args.insert(
+            "inputs".to_string(),
+            json!([memory_store::make_raster_memory_path(&id)]),
+        );
+
+        let result = RasterCalculatorTool.run(&args, &make_ctx()).unwrap();
+        let locator = result.outputs["output"]["path"].as_str().unwrap().to_string();
+        memory_store::remove_raster_by_id(&id);
+        let out = memory_store::raster_path_to_id(&locator)
+            .and_then(memory_store::get_raster_by_id)
+            .expect("output raster should be in the memory store");
+        memory_store::remove_raster_by_path(&locator);
+        out
+    }
+
+    #[test]
+    fn raster_calculator_equality_matches_cells() {
+        let out = run_raster_calculator("'clusters' == 1");
+        let values: Vec<f64> = (0..4).map(|c| out.get(0, 0, c as isize)).collect();
+        assert_eq!(values, vec![0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn raster_calculator_sql_style_equality_matches_cells() {
+        let out = run_raster_calculator("'clusters' = 1");
+        let values: Vec<f64> = (0..4).map(|c| out.get(0, 0, c as isize)).collect();
+        assert_eq!(values, vec![0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn raster_calculator_inequality_matches_cells() {
+        let out = run_raster_calculator("'clusters' != 1");
+        let values: Vec<f64> = (0..4).map(|c| out.get(0, 0, c as isize)).collect();
+        assert_eq!(values, vec![1.0, 0.0, 1.0, 1.0]);
     }
 }

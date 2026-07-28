@@ -589,7 +589,7 @@ impl SkyVisibilityCore {
             let tx = tx.clone();
             let dem = dem.clone();
             let offsets = offsets.clone();
-            thread::spawn(move || {
+            crate::tools::dispatch_worker(num_threads > 1, move || {
                 for row in (0..rows).filter(|r| r % num_threads == tid) {
                     let mut data = vec![nodata_f32 as f64; cols as usize];
                     for col in 0..cols {
@@ -749,7 +749,7 @@ impl SkyVisibilityCore {
                 let tx = tx.clone();
                 let dem = dem.clone();
                 let offsets = offsets.clone();
-                thread::spawn(move || {
+                crate::tools::dispatch_worker(num_threads > 1, move || {
                     for row in (0..rows).filter(|r| r % num_threads == tid) {
                         let mut data = vec![nodata; cols as usize];
                         let mut n = vec![0_u8; cols as usize];
@@ -936,7 +936,7 @@ impl SkyVisibilityCore {
         for tid in 0..num_threads {
             let dem = dem.clone();
             let tx = tx.clone();
-            thread::spawn(move || {
+            crate::tools::dispatch_worker(num_threads > 1, move || {
                 let mut local_counts = vec![0_u32; (rows * cols) as usize];
                 let mut view_angle = vec![-32768.0_f32; (rows * cols) as usize];
                 let mut max_view_angle = vec![-32768.0_f32; (rows * cols) as usize];
@@ -1475,7 +1475,7 @@ impl SkyVisibilityCore {
                 let tx = tx.clone();
                 let dem = dem.clone();
                 let offsets = offsets.clone();
-                thread::spawn(move || {
+                crate::tools::dispatch_worker(num_threads > 1, move || {
                     for row in (0..rows).filter(|r| r % num_threads == tid) {
                         let mut row_x = vec![nodata_f32; cols as usize];
                         let mut row_y = vec![nodata_f32; cols as usize];
@@ -4056,7 +4056,7 @@ impl SkyVisibilityCore {
                 let tx = tx.clone();
                 let dem = dem.clone();
                 let offsets = offsets.clone();
-                thread::spawn(move || {
+                crate::tools::dispatch_worker(num_threads > 1, move || {
                     for row in (0..rows).filter(|r| r % num_threads == tid) {
                         let mut data = vec![nodata; cols as usize];
                         let mut n = vec![0_u8; cols as usize];
@@ -4276,7 +4276,7 @@ impl SkyVisibilityCore {
                 let tx = tx.clone();
                 let dem = dem.clone();
                 let offsets = offsets.clone();
-                thread::spawn(move || {
+                crate::tools::dispatch_worker(num_threads > 1, move || {
                     for row in (0..rows).filter(|r| r % num_threads == tid) {
                         let mut ha_row = vec![nodata_f32; cols as usize];
                         for col in 0..cols {

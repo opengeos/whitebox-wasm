@@ -100,7 +100,7 @@ impl Tool for FindNoflowCellsTool {
         for tid in 0..num_procs {
             let view = view.clone();
             let tx = tx.clone();
-            thread::spawn(move || {
+            crate::tools::dispatch_worker(num_procs > 1, move || {
                 for row in (0..rows).filter(|r| r % num_procs == tid) {
                     let mut row_data = vec![nodata; cols as usize];
 

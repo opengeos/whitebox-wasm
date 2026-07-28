@@ -875,7 +875,7 @@ impl PlanCurvatureTool {
                     for worker_id in 0..num_workers {
                         let tx = tx.clone();
                         let input = &input;
-                        scope.spawn(move || {
+                        crate::tools::dispatch_scoped_worker(num_workers > 1, scope, move || {
                             for row_idx in (worker_id..rows).step_by(num_workers) {
                                 let mut row_out = vec![nodata; cols];
                                 let row = row_idx as isize;
@@ -921,7 +921,7 @@ impl PlanCurvatureTool {
                     for worker_id in 0..num_workers {
                         let tx = tx.clone();
                         let band_buf = Arc::clone(&band_buf);
-                        scope.spawn(move || {
+                        crate::tools::dispatch_scoped_worker(num_workers > 1, scope, move || {
                             for row_idx in (worker_id..rows).step_by(num_workers) {
                                 let mut row_out = vec![nodata; cols];
                                 let row = row_idx as isize;

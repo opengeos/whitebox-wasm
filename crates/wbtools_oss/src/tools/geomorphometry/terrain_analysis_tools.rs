@@ -3879,7 +3879,7 @@ impl TerrainAnalysisCore {
             for tid in 0..num_workers {
                 let tx = tx.clone();
                 let input = &input;
-                scope.spawn(move || {
+                crate::tools::dispatch_scoped_worker(num_workers > 1, scope, move || {
                     // Inline nodata check — avoids epsilon arithmetic in is_nodata() per pixel.
                     let is_nd = |v: f64| -> bool {
                         if nodata_is_nan { v.is_nan() } else { v == nodata }

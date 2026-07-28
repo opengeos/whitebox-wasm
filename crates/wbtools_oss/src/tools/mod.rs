@@ -5,12 +5,14 @@ use wbcore::ToolParamSchema;
 /// Runs `work` on a background thread on native targets, or inline on the
 /// current thread when `parallel` is `false` or when compiling for wasm32.
 ///
-/// `std::thread::spawn` is unsupported on `wasm32-unknown-unknown`: calling it
-/// at runtime traps with `unreachable`, which is why the threaded flow-routing
-/// helpers (D8 pointer, D8/FD8 accumulation, basins, ...) crashed in the
-/// browser/WASI runtime while the fully-serial composite workflow kept working.
-/// Routing every worker fan-out through this helper keeps the multi-threaded
-/// fast path on native CLI builds while degrading to a serial loop on wasm.
+/// `std::thread::spawn` is unsupported on every wasm32 target we ship:
+/// `wasm32-unknown-unknown` traps outright, and `wasm32-wasip1` returns
+/// `Unsupported` (errno 58), which `spawn` unwraps into a panic and therefore
+/// an `unreachable` trap. That is why the threaded flow-routing helpers (D8
+/// pointer, D8/FD8 accumulation, basins, ...) crashed in the browser/WASI
+/// runtime while the fully-serial composite workflow kept working. Routing
+/// every worker fan-out through this helper keeps the multi-threaded fast path
+/// on native CLI builds while degrading to a serial loop on wasm.
 ///
 /// Callers use the established `mpsc` fan-out pattern (each worker sends its
 /// rows down a channel that the caller drains), so running inline is safe: the
@@ -28,6 +30,32 @@ where
 		}
 	}
 	let _ = parallel;
+	work();
+}
+
+/// Scoped counterpart of [`dispatch_worker`], for fan-outs whose workers borrow
+/// from the enclosing frame (`std::thread::scope` + `scope.spawn`) instead of
+/// owning `'static` data.
+///
+/// `scope.spawn` goes through the same unsupported OS primitive as
+/// `std::thread::spawn`, so it traps on wasm32 exactly the same way. Callers
+/// keep the `mpsc` fan-out pattern and drain the channel after the scope ends,
+/// so running inline is safe for the same reason it is in `dispatch_worker`.
+pub(crate) fn dispatch_scoped_worker<'scope, 'env, F>(
+	parallel: bool,
+	scope: &'scope std::thread::Scope<'scope, 'env>,
+	work: F,
+) where
+	F: FnOnce() + Send + 'scope,
+{
+	#[cfg(not(target_arch = "wasm32"))]
+	{
+		if parallel {
+			scope.spawn(work);
+			return;
+		}
+	}
+	let _ = (parallel, scope);
 	work();
 }
 

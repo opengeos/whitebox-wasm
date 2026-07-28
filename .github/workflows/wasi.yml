@@ -22,3 +22,21 @@ jobs:
         run: curl https://wasmtime.dev/install.sh -sSf | bash
       - name: Smoke test (list tools)
         run: ~/.wasmtime/bin/wasmtime run target/wasm32-wasip1/release/whitebox.wasm list | head -1
+      - name: Smoke test (tools that fan work out to worker threads)
+        # wasm32 cannot spawn threads: `wasm32-wasip1` fails with errno 58
+        # (Unsupported), which std unwraps into a panic and therefore an
+        # `unreachable` trap. Tools that fan out must degrade to the serial
+        # path instead. Running `list` alone never exercised any of that, which
+        # is how a whole family of tools shipped broken in the browser. One tool
+        # per fan-out helper, so a regression in either is caught.
+        run: |
+          mkdir -p work && cp examples/sample.tif work/dem.tif
+          wasm=target/wasm32-wasip1/release/whitebox.wasm
+          run() { ~/.wasmtime/bin/wasmtime run --dir work::/work "$wasm" "$@"; }
+          run sky_view_factor --dem=/work/dem.tif --output=/work/svf.tif
+          run find_noflow_cells --input=/work/dem.tif --output=/work/noflow.tif
+          run plan_curvature --input=/work/dem.tif --output=/work/planc.tif
+          run pennock_landform_classification --input=/work/dem.tif --output=/work/pennock.tif
+          for f in svf noflow planc pennock; do
+            test -s "work/$f.tif" || { echo "::error::$f.tif was not written"; exit 1; }
+          done

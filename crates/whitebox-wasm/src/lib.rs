@@ -547,9 +547,25 @@ impl CogBuilder {
 /// 2. Pick a level (0 = full res, higher = overviews) and a pixel window.
 /// 3. `tiles_for_window(level, x, y, w, h)` returns the tiles and their byte
 ///    ranges; range-fetch each, then `decode_tile_f64(level, bytes)`.
+///
+/// A *plain* (non-COG) GeoTIFF, as GDAL and libtiff write one by default, keeps
+/// its directory at the **end** of the file, so no front-of-file prefix short of
+/// the whole file can reach it. Use `first_ifd_offset` to locate the directory
+/// and `CogStream.from_windows` to parse it from a small tail window.
 #[wasm_bindgen]
 pub struct CogStream {
     layout: CogLayout,
+}
+
+/// Offset of a GeoTIFF's first IFD, read from the file's first 8 (classic TIFF)
+/// or 16 (BigTIFF) bytes. An offset past the prefix you already hold means the
+/// directory lives further into the file: fetch that region and hand it to
+/// `CogStream.from_windows`.
+#[wasm_bindgen]
+pub fn first_ifd_offset(header_bytes: &[u8]) -> Result<f64, JsValue> {
+    GeoTiff::first_ifd_offset(header_bytes)
+        .map(|off| off as f64)
+        .map_err(jerr("header"))
 }
 
 #[wasm_bindgen]
@@ -558,6 +574,29 @@ impl CogStream {
     #[wasm_bindgen(constructor)]
     pub fn new(header_bytes: &[u8]) -> Result<CogStream, JsValue> {
         let layout = GeoTiff::parse_cog_layout(header_bytes).map_err(jerr("header"))?;
+        Ok(CogStream { layout })
+    }
+
+    /// Parse the tile layout from two disjoint windows of the file: a
+    /// front-of-file `prefix` and a `tail` starting at absolute byte offset
+    /// `tail_offset`.
+    ///
+    /// This is the path for a plain GeoTIFF whose directory sits at the end of
+    /// the file. Fetch the first few kilobytes plus the region from
+    /// `first_ifd_offset` to the end and pass both; the bytes in between are
+    /// pixel data that header parsing never reads. If a tag array happens to sit
+    /// *before* the directory, this throws "need more header bytes at offset N" —
+    /// widen the tail to cover N and retry.
+    pub fn from_windows(
+        prefix: &[u8],
+        tail_offset: f64,
+        tail: &[u8],
+    ) -> Result<CogStream, JsValue> {
+        if !(tail_offset >= 0.0) || tail_offset > (u64::MAX as f64) {
+            return Err(JsValue::from_str("header: tail_offset must be a non-negative offset"));
+        }
+        let layout = GeoTiff::parse_cog_layout_windowed(prefix, tail_offset as u64, tail)
+            .map_err(jerr("header"))?;
         Ok(CogStream { layout })
     }
 

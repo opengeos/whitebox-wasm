@@ -557,15 +557,38 @@ pub struct CogStream {
     layout: CogLayout,
 }
 
+/// Largest integer a JS number holds exactly (2^53 - 1). Byte offsets cross the
+/// wasm boundary as `f64`, so anything past this would come back as a *nearby*
+/// offset rather than the one meant — a silently wrong read. No real file gets
+/// close (it is 8 PB); a corrupt or hostile header can, so it is rejected.
+const MAX_SAFE_OFFSET: f64 = 9_007_199_254_740_991.0;
+
+/// A byte offset that survives the round trip through a JS number.
+fn checked_offset(what: &str, offset: f64) -> Result<u64, JsValue> {
+    if !(offset >= 0.0) || offset > MAX_SAFE_OFFSET || offset.fract() != 0.0 {
+        return Err(JsValue::from_str(&format!(
+            "header: {what} must be a whole byte offset in 0..=2^53-1, got {offset}"
+        )));
+    }
+    Ok(offset as u64)
+}
+
 /// Offset of a GeoTIFF's first IFD, read from the file's first 8 (classic TIFF)
 /// or 16 (BigTIFF) bytes. An offset past the prefix you already hold means the
 /// directory lives further into the file: fetch that region and hand it to
 /// `CogStream.from_windows`.
+///
+/// Throws on an offset a JS number cannot hold exactly, which only a corrupt
+/// header produces: passing it back would address the wrong bytes.
 #[wasm_bindgen]
 pub fn first_ifd_offset(header_bytes: &[u8]) -> Result<f64, JsValue> {
-    GeoTiff::first_ifd_offset(header_bytes)
-        .map(|off| off as f64)
-        .map_err(jerr("header"))
+    let off = GeoTiff::first_ifd_offset(header_bytes).map_err(jerr("header"))?;
+    if off > MAX_SAFE_OFFSET as u64 {
+        return Err(JsValue::from_str(&format!(
+            "header: first IFD offset {off} is past the exactly representable range (2^53-1)"
+        )));
+    }
+    Ok(off as f64)
 }
 
 #[wasm_bindgen]
@@ -592,10 +615,8 @@ impl CogStream {
         tail_offset: f64,
         tail: &[u8],
     ) -> Result<CogStream, JsValue> {
-        if !(tail_offset >= 0.0) || tail_offset > (u64::MAX as f64) {
-            return Err(JsValue::from_str("header: tail_offset must be a non-negative offset"));
-        }
-        let layout = GeoTiff::parse_cog_layout_windowed(prefix, tail_offset as u64, tail)
+        let tail_offset = checked_offset("tail_offset", tail_offset)?;
+        let layout = GeoTiff::parse_cog_layout_windowed(prefix, tail_offset, tail)
             .map_err(jerr("header"))?;
         Ok(CogStream { layout })
     }

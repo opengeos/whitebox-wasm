@@ -146,11 +146,16 @@ region instead:
 ```js
 import init, { CogStream, first_ifd_offset } from "whitebox-wasm";
 
+// An open-ended `Range: bytes=N-` asks for everything from N to the end, so the
+// file's length never has to be looked up.
+const range = (a, b) => fetch(url, { headers: { Range: `bytes=${a}-${b ?? ""}` } })
+  .then(r => r.arrayBuffer()).then(b => new Uint8Array(b));
+
 const prefix = await range(0, 16383);
 const ifd = first_ifd_offset(prefix);          // 74026916 on a 74 MB file
 const stream = ifd < prefix.length
   ? new CogStream(prefix)                      // COG: it is already in hand
-  : CogStream.from_windows(prefix, ifd, await range(ifd, size - 1));
+  : CogStream.from_windows(prefix, ifd, await range(ifd));
 ```
 
 That reads under 1 MB of a 74 MB raster. If a tag array happens to sit *before*

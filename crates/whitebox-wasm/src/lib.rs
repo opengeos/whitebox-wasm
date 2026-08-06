@@ -547,9 +547,48 @@ impl CogBuilder {
 /// 2. Pick a level (0 = full res, higher = overviews) and a pixel window.
 /// 3. `tiles_for_window(level, x, y, w, h)` returns the tiles and their byte
 ///    ranges; range-fetch each, then `decode_tile_f64(level, bytes)`.
+///
+/// A *plain* (non-COG) GeoTIFF, as GDAL and libtiff write one by default, keeps
+/// its directory at the **end** of the file, so no front-of-file prefix short of
+/// the whole file can reach it. Use `first_ifd_offset` to locate the directory
+/// and `CogStream.from_windows` to parse it from a small tail window.
 #[wasm_bindgen]
 pub struct CogStream {
     layout: CogLayout,
+}
+
+/// Largest integer a JS number holds exactly (2^53 - 1). Byte offsets cross the
+/// wasm boundary as `f64`, so anything past this would come back as a *nearby*
+/// offset rather than the one meant — a silently wrong read. No real file gets
+/// close (it is 8 PB); a corrupt or hostile header can, so it is rejected.
+const MAX_SAFE_OFFSET: f64 = 9_007_199_254_740_991.0;
+
+/// A byte offset that survives the round trip through a JS number.
+fn checked_offset(what: &str, offset: f64) -> Result<u64, JsValue> {
+    if !(offset >= 0.0) || offset > MAX_SAFE_OFFSET || offset.fract() != 0.0 {
+        return Err(JsValue::from_str(&format!(
+            "header: {what} must be a whole byte offset in 0..=2^53-1, got {offset}"
+        )));
+    }
+    Ok(offset as u64)
+}
+
+/// Offset of a GeoTIFF's first IFD, read from the file's first 8 (classic TIFF)
+/// or 16 (BigTIFF) bytes. An offset past the prefix you already hold means the
+/// directory lives further into the file: fetch that region and hand it to
+/// `CogStream.from_windows`.
+///
+/// Throws on an offset a JS number cannot hold exactly, which only a corrupt
+/// header produces: passing it back would address the wrong bytes.
+#[wasm_bindgen]
+pub fn first_ifd_offset(header_bytes: &[u8]) -> Result<f64, JsValue> {
+    let off = GeoTiff::first_ifd_offset(header_bytes).map_err(jerr("header"))?;
+    if off > MAX_SAFE_OFFSET as u64 {
+        return Err(JsValue::from_str(&format!(
+            "header: first IFD offset {off} is past the exactly representable range (2^53-1)"
+        )));
+    }
+    Ok(off as f64)
 }
 
 #[wasm_bindgen]
@@ -558,6 +597,27 @@ impl CogStream {
     #[wasm_bindgen(constructor)]
     pub fn new(header_bytes: &[u8]) -> Result<CogStream, JsValue> {
         let layout = GeoTiff::parse_cog_layout(header_bytes).map_err(jerr("header"))?;
+        Ok(CogStream { layout })
+    }
+
+    /// Parse the tile layout from two disjoint windows of the file: a
+    /// front-of-file `prefix` and a `tail` starting at absolute byte offset
+    /// `tail_offset`.
+    ///
+    /// This is the path for a plain GeoTIFF whose directory sits at the end of
+    /// the file. Fetch the first few kilobytes plus the region from
+    /// `first_ifd_offset` to the end and pass both; the bytes in between are
+    /// pixel data that header parsing never reads. If a tag array happens to sit
+    /// *before* the directory, this throws "need more header bytes at offset N" —
+    /// widen the tail to cover N and retry.
+    pub fn from_windows(
+        prefix: &[u8],
+        tail_offset: f64,
+        tail: &[u8],
+    ) -> Result<CogStream, JsValue> {
+        let tail_offset = checked_offset("tail_offset", tail_offset)?;
+        let layout = GeoTiff::parse_cog_layout_windowed(prefix, tail_offset, tail)
+            .map_err(jerr("header"))?;
         Ok(CogStream { layout })
     }
 

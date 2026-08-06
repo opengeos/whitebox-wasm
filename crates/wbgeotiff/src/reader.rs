@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::compression;
@@ -873,6 +873,91 @@ impl CogLevel {
     }
 }
 
+// ── HeaderWindows ─────────────────────────────────────────────────────────────
+
+/// A `Read + Seek` view over two disjoint byte windows of a file: a
+/// front-of-file `prefix` and an optional `tail` starting at an arbitrary
+/// offset. Everything between them reads as an error naming the offset that is
+/// missing, so a caller streaming over the network knows what to fetch next.
+///
+/// A Cloud Optimized GeoTIFF keeps every IFD at the front, so the prefix alone
+/// covers the header. A plain GeoTIFF written by GDAL or libtiff keeps its
+/// directory at the *end* of the file, out of reach of any front-only prefix.
+struct HeaderWindows<'a> {
+    prefix: &'a [u8],
+    tail_offset: u64,
+    tail: &'a [u8],
+    pos: u64,
+}
+
+impl<'a> HeaderWindows<'a> {
+    fn new(prefix: &'a [u8], tail_offset: u64, tail: &'a [u8]) -> Self {
+        Self { prefix, tail_offset, tail, pos: 0 }
+    }
+
+    /// The bytes available from `pos` onwards, or `None` if `pos` sits in the gap.
+    fn available_at(&self, pos: u64) -> Option<&'a [u8]> {
+        if pos < self.prefix.len() as u64 {
+            return Some(&self.prefix[pos as usize..]);
+        }
+        if pos >= self.tail_offset {
+            let rel = pos - self.tail_offset;
+            if rel < self.tail.len() as u64 {
+                return Some(&self.tail[rel as usize..]);
+            }
+        }
+        None
+    }
+
+    /// One past the highest readable offset, used to resolve `SeekFrom::End`.
+    fn end(&self) -> u64 {
+        let tail_end = self.tail_offset.saturating_add(self.tail.len() as u64);
+        tail_end.max(self.prefix.len() as u64)
+    }
+}
+
+impl Read for HeaderWindows<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // Erroring out (rather than reporting 0 bytes) keeps the offset in the
+        // message: `read_exact` would otherwise turn this into the opaque
+        // "failed to fill whole buffer".
+        let Some(avail) = self.available_at(self.pos) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("need more header bytes at offset {}", self.pos),
+            ));
+        };
+        let n = avail.len().min(buf.len());
+        buf[..n].copy_from_slice(&avail[..n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for HeaderWindows<'_> {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        let target = match from {
+            SeekFrom::Start(n) => Some(n as i128),
+            SeekFrom::End(d) => Some(self.end() as i128 + d as i128),
+            SeekFrom::Current(d) => Some(self.pos as i128 + d as i128),
+        }
+        .filter(|p| *p >= 0 && *p <= u64::MAX as i128);
+        match target {
+            Some(p) => {
+                self.pos = p as u64;
+                Ok(self.pos)
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek to a negative offset",
+            )),
+        }
+    }
+}
+
 /// Multi-resolution tile layout of a COG, parsed from front-of-file bytes only.
 #[derive(Debug, Clone)]
 pub struct CogLayout {
@@ -895,8 +980,37 @@ impl GeoTiff {
     /// Returns an error if `header_bytes` is too short to contain the IFDs and
     /// their tile-offset arrays (fetch more bytes and retry), or if any level is
     /// striped rather than tiled (tile-by-tile range streaming needs a tiled COG).
+    ///
+    /// A plain (non-COG) GeoTIFF keeps its directory at the *end* of the file,
+    /// which no front-of-file prefix can reach; use
+    /// [`parse_cog_layout_windowed`](Self::parse_cog_layout_windowed) for those.
     pub fn parse_cog_layout(header_bytes: &[u8]) -> Result<CogLayout> {
-        let mut tiff = TiffReader::new(std::io::Cursor::new(header_bytes))?;
+        Self::parse_cog_layout_windowed(header_bytes, 0, &[])
+    }
+
+    /// Offset of the first IFD, read from a file's first 8 (classic TIFF) or 16
+    /// (BigTIFF) bytes. A caller streaming over range requests uses this to find
+    /// the directory of a plain GeoTIFF, which sits at the end of the file.
+    pub fn first_ifd_offset(header_bytes: &[u8]) -> Result<u64> {
+        Ok(TiffReader::new(std::io::Cursor::new(header_bytes))?.first_ifd_offset)
+    }
+
+    /// Like [`parse_cog_layout`](Self::parse_cog_layout), but reading from two
+    /// disjoint windows of the file: a front-of-file `prefix` and a `tail`
+    /// beginning at absolute offset `tail_offset`.
+    ///
+    /// This is what a plain GDAL- or libtiff-written GeoTIFF needs: its IFD and
+    /// tag arrays live at the end of the file, so a front-only prefix would have
+    /// to span the whole file to reach them. Pass the last few hundred kilobytes
+    /// as `tail` instead. Bytes in the gap between the windows are never touched
+    /// by header parsing; a read that lands there fails with the offset it wanted,
+    /// so the caller can widen the tail and retry.
+    pub fn parse_cog_layout_windowed(
+        prefix: &[u8],
+        tail_offset: u64,
+        tail: &[u8],
+    ) -> Result<CogLayout> {
+        let mut tiff = TiffReader::new(HeaderWindows::new(prefix, tail_offset, tail))?;
         let ifds = tiff.read_all_ifds()?;
         if ifds.is_empty() {
             return Err(GeoTiffError::CorruptData {
@@ -964,7 +1078,7 @@ mod tests {
     use super::*;
     use super::super::writer::GeoTiffWriter;
     use super::super::types::GeoTransform;
-    use super::super::tags::Compression;
+    use super::super::tags::{Compression, DataType};
     use tempfile::NamedTempFile;
 
     fn make_tiff(compression: Compression) -> Vec<u8> {
@@ -1303,5 +1417,123 @@ mod tests {
             .unwrap();
         let tiff_i64 = GeoTiff::open(path_i64).unwrap();
         assert_eq!(tiff_i64.read_band_i64(0).unwrap(), data_i64);
+    }
+
+    // ── Header parsing from a directory that sits past the pixel data ─────────
+
+    /// A 512x512 tiled f32 GeoTIFF, the layout `parse_cog_layout` accepts.
+    fn make_tiled_tiff() -> Vec<u8> {
+        use super::super::writer::WriteLayout;
+        let data: Vec<f32> = (0..512 * 512).map(|i| i as f32).collect();
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        GeoTiffWriter::new(512, 512, 1)
+            .layout(WriteLayout::Tiled { tile_width: 256, tile_height: 256 })
+            .compression(Compression::Deflate)
+            .sample_format(SampleFormat::IeeeFloat)
+            .geo_transform(GeoTransform::north_up(0.0, 1.0, 512.0, -1.0))
+            .epsg(4326)
+            .write_f32_to_writer(&mut cursor, &data)
+            .unwrap();
+        cursor.into_inner()
+    }
+
+    /// Rebuild `orig` (a single-IFD classic little-endian TIFF) with everything
+    /// after the 8-byte header pushed `pad` bytes further into the file, so the
+    /// directory ends up past a front-of-file prefix. That is the layout GDAL and
+    /// libtiff write by default, and the one the reporter's file in GeoLibre#1743
+    /// has. Every absolute offset moves by the same `pad`, so the IFD, its value
+    /// arrays and the tile offsets all stay consistent.
+    fn push_directory_back(orig: &[u8], pad: usize) -> Vec<u8> {
+        fn rd(b: &[u8], o: usize) -> u32 { u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) }
+        /// Add `pad` to the 32-bit offset stored at `o`.
+        fn bump(b: &mut [u8], o: usize, pad: u32) {
+            let v = rd(b, o) + pad;
+            b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+
+        let pad32 = pad as u32;
+        let mut out = Vec::with_capacity(orig.len() + pad);
+        out.extend_from_slice(&orig[..4]);
+        out.extend_from_slice(&(rd(orig, 4) + pad32).to_le_bytes());
+        out.resize(8 + pad, 0); // the gap: pixel data in a real file, never read as header
+        out.extend_from_slice(&orig[8..]);
+
+        let ifd = rd(&out, 4) as usize;
+        let n = u16::from_le_bytes(out[ifd..ifd + 2].try_into().unwrap()) as usize;
+        for i in 0..n {
+            let e = ifd + 2 + i * 12;
+            let tag_code = u16::from_le_bytes(out[e..e + 2].try_into().unwrap());
+            let type_code = u16::from_le_bytes(out[e + 2..e + 4].try_into().unwrap());
+            let count = rd(&out, e + 4) as usize;
+            let type_size = DataType::from_u16(type_code).map(|t| t.byte_size()).unwrap_or(0);
+            let inline = type_size * count <= 4;
+            // Where the tag's values live: in the entry itself, or out of line.
+            let values = if inline { e + 8 } else { rd(&out, e + 8) as usize + pad };
+            if !inline {
+                bump(&mut out, e + 8, pad32);
+            }
+            // Tile offsets point at the pixel data, which moved by `pad` as well.
+            if tag_code == tag::TileOffsets {
+                for k in 0..count {
+                    bump(&mut out, values + k * 4, pad32);
+                }
+            }
+        }
+        let next = ifd + 2 + n * 12;
+        if rd(&out, next) != 0 {
+            bump(&mut out, next, pad32);
+        }
+        out
+    }
+
+    #[test]
+    fn front_prefix_cannot_reach_a_trailing_directory() {
+        let buf = push_directory_back(&make_tiled_tiff(), 4 << 20);
+        // The prefix holds the file header but not the directory 4 MB later, which
+        // is exactly how GeoLibre#1743 failed: an opaque short-read, not a hint.
+        assert!(GeoTiff::parse_cog_layout(&buf[..64 << 10]).is_err());
+        assert_eq!(GeoTiff::first_ifd_offset(&buf).unwrap(), 8 + (4 << 20));
+    }
+
+    #[test]
+    fn windowed_parse_reads_a_trailing_directory() {
+        let buf = push_directory_back(&make_tiled_tiff(), 4 << 20);
+        let ifd = GeoTiff::first_ifd_offset(&buf).unwrap() as usize;
+        let windowed =
+            GeoTiff::parse_cog_layout_windowed(&buf[..1024], ifd as u64, &buf[ifd..]).unwrap();
+        // Same layout as parsing the whole file, from ~1 KB + the tail.
+        let whole = GeoTiff::parse_cog_layout(&buf).unwrap();
+        assert_eq!(windowed.levels.len(), whole.levels.len());
+        assert_eq!(windowed.epsg, Some(4326));
+        let lv = &windowed.levels[0];
+        assert_eq!((lv.width, lv.height), (512, 512));
+        assert_eq!((lv.tile_width, lv.tile_height), (256, 256));
+        assert_eq!(lv.tile_offsets, whole.levels[0].tile_offsets);
+        assert_eq!(lv.tile_byte_counts, whole.levels[0].tile_byte_counts);
+    }
+
+    #[test]
+    fn windowed_parse_names_the_offset_it_still_needs() {
+        let buf = push_directory_back(&make_tiled_tiff(), 4 << 20);
+        let ifd = GeoTiff::first_ifd_offset(&buf).unwrap() as usize;
+        // A tail that starts after the directory leaves a hole the parser walks into.
+        let short = ifd + 64;
+        let err = GeoTiff::parse_cog_layout_windowed(&buf[..1024], short as u64, &buf[short..])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("need more header bytes at offset"),
+            "expected an actionable offset, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_front_loaded_directory_still_parses_from_the_prefix_alone() {
+        // A COG keeps its IFD at the front; the windowed path must not regress it.
+        let buf = make_tiled_tiff();
+        assert_eq!(GeoTiff::first_ifd_offset(&buf).unwrap(), 8);
+        let layout = GeoTiff::parse_cog_layout(&buf).unwrap();
+        assert_eq!(layout.levels.len(), 1);
+        assert_eq!(layout.levels[0].width, 512);
     }
 }

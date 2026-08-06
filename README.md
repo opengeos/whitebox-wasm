@@ -128,6 +128,12 @@ that fetches ~13% of a 5.7 MiB file. `CogStream` API: `num_levels`, `epsg`,
 `nodata`, `geo_transform()`, `levels_json()`, `tiles_for_window(level,x,y,w,h)`,
 `tile_range(level,col,row)`, `decode_tile_f64(level, bytes)`.
 
+A **plain** GeoTIFF (what GDAL writes unless you ask for a COG) keeps its
+directory at the *end* of the file, where no front-of-file prefix can reach it.
+Call `first_ifd_offset(prefix)` to locate it and
+`CogStream.from_windows(prefix, ifd, tail)` to parse from that region alone -
+under 1 MB of a 74 MB raster.
+
 ## Limits
 
 WebAssembly is 32-bit, so linear memory is capped at ~4 GiB. `geotiff_info` is

@@ -126,11 +126,41 @@ for (const t of tiles) {
 
 - `new CogStream(headerBytes)` - parse the IFD chain + tile index (throws if the
   prefix is too short; fetch more and retry).
+- `first_ifd_offset(headerBytes)` - where the directory actually is (see below).
+- `CogStream.from_windows(prefix, tailOffset, tail)` - parse from a front prefix
+  plus a window elsewhere in the file.
 - `num_levels`, `epsg`, `nodata`, `geo_transform()`, `levels_json()`
 - `bounding_box()`, `center()`, `center_lonlat()`, `bounds_lonlat()` (same semantics as `GeoTiffReader`)
 - `tiles_for_window(level, x, y, w, h)` -> JSON `[{col,row,offset,length}]`
 - `tile_range(level, col, row)` -> `[offset, length]`
 - `decode_tile_f64(level, tileBytes)` -> `Float64Array` (one decoded tile)
+
+#### Plain GeoTIFFs, whose directory sits at the end
+
+A COG keeps every IFD at the front of the file, so a 64 KB prefix reaches it. A
+**plain** GeoTIFF - what GDAL and libtiff write unless you ask for a COG - puts
+the directory *after* the pixel data, so growing a front-of-file prefix can only
+reach it by downloading the entire file. Read the offset first and fetch that
+region instead:
+
+```js
+import init, { CogStream, first_ifd_offset } from "whitebox-wasm";
+
+// An open-ended `Range: bytes=N-` asks for everything from N to the end, so the
+// file's length never has to be looked up.
+const range = (a, b) => fetch(url, { headers: { Range: `bytes=${a}-${b ?? ""}` } })
+  .then(r => r.arrayBuffer()).then(b => new Uint8Array(b));
+
+const prefix = await range(0, 16383);
+const ifd = first_ifd_offset(prefix);          // 74026916 on a 74 MB file
+const stream = ifd < prefix.length
+  ? new CogStream(prefix)                      // COG: it is already in hand
+  : CogStream.from_windows(prefix, ifd, await range(ifd));
+```
+
+That reads under 1 MB of a 74 MB raster. If a tag array happens to sit *before*
+the directory, `from_windows` throws `need more header bytes at offset N`; start
+the tail earlier and retry.
 
 Use a higher `level` (overview) for zoomed-out views. See
 [`examples/cog-stream.mjs`](../../examples/cog-stream.mjs) for a full window read

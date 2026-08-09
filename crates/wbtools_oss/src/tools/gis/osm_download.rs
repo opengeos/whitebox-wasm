@@ -1,14 +1,14 @@
-use serde_json::json;
 use rayon::prelude::*;
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use wbprojection::Crs;
 use wbcore::{
     LicenseTier, Tool, ToolArgs, ToolCategory, ToolContext, ToolError, ToolExample, ToolManifest,
     ToolMetadata, ToolParamDescriptor, ToolParamSpec, ToolRunResult, ToolStability,
 };
+use wbprojection::Crs;
 
 pub struct DownloadOsmVectorTool;
 
@@ -37,18 +37,37 @@ const FILTER_PRESET_DESCRIPTION: &str = "Feature class preset: all, roads, build
 
 fn preset_to_overpass_filters(preset: &str) -> Vec<String> {
     match preset {
-        "roads"      => vec!["[highway]".to_string()],
-        "buildings"  => vec!["[building]".to_string()],
-        "water"      => vec!["[waterway]".to_string(), "[natural=water]".to_string()],
-        "landuse"    => vec!["[landuse]".to_string()],
-        "trails"     => vec!["[highway=path]".to_string(), "[highway=footway]".to_string(), "[highway=cycleway]".to_string(), "[highway=bridleway]".to_string()],
-        "parks"      => vec!["[leisure=park]".to_string(), "[boundary=national_park]".to_string(), "[landuse=recreation_ground]".to_string(), "[leisure=nature_reserve]".to_string()],
-        "rail"       => vec!["[railway]".to_string()],
-        "amenities"  => vec!["[amenity]".to_string()],
+        "roads" => vec!["[highway]".to_string()],
+        "buildings" => vec!["[building]".to_string()],
+        "water" => vec!["[waterway]".to_string(), "[natural=water]".to_string()],
+        "landuse" => vec!["[landuse]".to_string()],
+        "trails" => vec![
+            "[highway=path]".to_string(),
+            "[highway=footway]".to_string(),
+            "[highway=cycleway]".to_string(),
+            "[highway=bridleway]".to_string(),
+        ],
+        "parks" => vec![
+            "[leisure=park]".to_string(),
+            "[boundary=national_park]".to_string(),
+            "[landuse=recreation_ground]".to_string(),
+            "[leisure=nature_reserve]".to_string(),
+        ],
+        "rail" => vec!["[railway]".to_string()],
+        "amenities" => vec!["[amenity]".to_string()],
         "boundaries" => vec!["[boundary]".to_string()],
-        "transit"    => vec!["[public_transport]".to_string(), "[railway=station]".to_string(), "[highway=bus_stop]".to_string()],
-        "poi"        => vec!["[amenity]".to_string(), "[tourism]".to_string(), "[shop]".to_string(), "[leisure]".to_string()],
-        _ => vec![],  // "all" or unrecognised → no tag filter
+        "transit" => vec![
+            "[public_transport]".to_string(),
+            "[railway=station]".to_string(),
+            "[highway=bus_stop]".to_string(),
+        ],
+        "poi" => vec![
+            "[amenity]".to_string(),
+            "[tourism]".to_string(),
+            "[shop]".to_string(),
+            "[leisure]".to_string(),
+        ],
+        _ => vec![], // "all" or unrecognised → no tag filter
     }
 }
 
@@ -59,8 +78,8 @@ fn is_area_way(tags: &serde_json::Map<String, serde_json::Value>) -> bool {
         return true;
     }
     for key in &[
-        "building", "landuse", "natural", "leisure", "amenity",
-        "boundary", "sport", "place", "tourism",
+        "building", "landuse", "natural", "leisure", "amenity", "boundary", "sport", "place",
+        "tourism",
     ] {
         if tags.contains_key(*key) {
             return true;
@@ -71,12 +90,10 @@ fn is_area_way(tags: &serde_json::Map<String, serde_json::Value>) -> bool {
 
 // ── Primary classification key/value ──────────────────────────────────────────
 
-fn primary_class(
-    tags: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> (String, String) {
+fn primary_class(tags: Option<&serde_json::Map<String, serde_json::Value>>) -> (String, String) {
     const PRIORITY_KEYS: &[&str] = &[
-        "highway", "building", "waterway", "natural", "landuse",
-        "railway", "amenity", "shop", "leisure", "tourism", "boundary", "place",
+        "highway", "building", "waterway", "natural", "landuse", "railway", "amenity", "shop",
+        "leisure", "tourism", "boundary", "place",
     ];
     if let Some(t) = tags {
         for key in PRIORITY_KEYS {
@@ -200,7 +217,10 @@ fn fetch_overpass(
                 last_error = Some(format!("Overpass returned HTTP {}", code));
             }
             Err(e) => {
-                return Err(ToolError::Execution(format!("Overpass request failed: {}", e)));
+                return Err(ToolError::Execution(format!(
+                    "Overpass request failed: {}",
+                    e
+                )));
             }
         }
 
@@ -245,9 +265,8 @@ fn try_read_cached_overpass(path: &Path, ttl_hours: u64) -> Option<serde_json::V
 
 fn write_cached_overpass(path: &Path, value: &serde_json::Value) -> Result<(), ToolError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            ToolError::Execution(format!("failed creating cache directory: {}", e))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ToolError::Execution(format!("failed creating cache directory: {}", e)))?;
     }
     let text = serde_json::to_string(value)
         .map_err(|e| ToolError::Execution(format!("failed serializing cache JSON: {}", e)))?;
@@ -319,6 +338,43 @@ fn fetch_parse_chunk(
     Ok((parsed, used_cache))
 }
 
+fn parse_overpass_response_file(
+    path: &Path,
+    include_points: bool,
+    include_lines: bool,
+    include_polygons: bool,
+    max_elements: u64,
+) -> Result<ParseResult, ToolError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        ToolError::Execution(format!(
+            "failed reading host-provided Overpass response '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let json = serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
+        ToolError::Execution(format!(
+            "failed parsing host-provided Overpass JSON '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+    parse_overpass_response(
+        &json,
+        include_points,
+        include_lines,
+        include_polygons,
+        max_elements,
+    )
+    .map_err(|e| {
+        ToolError::Execution(format!(
+            "host-provided Overpass response '{}' is invalid: {}",
+            path.display(),
+            e
+        ))
+    })
+}
+
 // ── Overpass JSON → Layer ──────────────────────────────────────────────────────
 
 struct ParseResult {
@@ -337,9 +393,7 @@ fn parse_overpass_response(
         .get("elements")
         .and_then(|e| e.as_array())
         .ok_or_else(|| {
-            ToolError::Execution(
-                "Overpass response missing 'elements' array".to_string(),
-            )
+            ToolError::Execution("Overpass response missing 'elements' array".to_string())
         })?;
 
     if elements.len() as u64 > max_elements {
@@ -404,12 +458,27 @@ fn parse_overpass_response(
 
     let mut layer = wbvector::Layer::new("osm_download");
     layer.assign_crs_epsg(4326);
-    layer.add_field(wbvector::FieldDef::new("osm_id",      wbvector::FieldType::Integer));
-    layer.add_field(wbvector::FieldDef::new("osm_type",    wbvector::FieldType::Text));
-    layer.add_field(wbvector::FieldDef::new("name",        wbvector::FieldType::Text));
-    layer.add_field(wbvector::FieldDef::new("class_key",   wbvector::FieldType::Text));
-    layer.add_field(wbvector::FieldDef::new("class_value", wbvector::FieldType::Text));
-    layer.add_field(wbvector::FieldDef::new("osm_tags",    wbvector::FieldType::Text));
+    layer.add_field(wbvector::FieldDef::new(
+        "osm_id",
+        wbvector::FieldType::Integer,
+    ));
+    layer.add_field(wbvector::FieldDef::new(
+        "osm_type",
+        wbvector::FieldType::Text,
+    ));
+    layer.add_field(wbvector::FieldDef::new("name", wbvector::FieldType::Text));
+    layer.add_field(wbvector::FieldDef::new(
+        "class_key",
+        wbvector::FieldType::Text,
+    ));
+    layer.add_field(wbvector::FieldDef::new(
+        "class_value",
+        wbvector::FieldType::Text,
+    ));
+    layer.add_field(wbvector::FieldDef::new(
+        "osm_tags",
+        wbvector::FieldType::Text,
+    ));
 
     let mut skipped = 0usize;
 
@@ -431,12 +500,12 @@ fn parse_overpass_response(
             .unwrap_or_default();
 
         let attrs: &[(&str, wbvector::FieldValue)] = &[
-            ("osm_id",      wbvector::FieldValue::Integer(id)),
-            ("osm_type",    wbvector::FieldValue::Text(el_type.to_string())),
-            ("name",        wbvector::FieldValue::Text(name)),
-            ("class_key",   wbvector::FieldValue::Text(class_key)),
+            ("osm_id", wbvector::FieldValue::Integer(id)),
+            ("osm_type", wbvector::FieldValue::Text(el_type.to_string())),
+            ("name", wbvector::FieldValue::Text(name)),
+            ("class_key", wbvector::FieldValue::Text(class_key)),
             ("class_value", wbvector::FieldValue::Text(class_value)),
-            ("osm_tags",    wbvector::FieldValue::Text(tags_text)),
+            ("osm_tags", wbvector::FieldValue::Text(tags_text)),
         ];
 
         match el_type {
@@ -472,9 +541,8 @@ fn parse_overpass_response(
                 let is_closed = n >= 4
                     && (coords[0].0 - coords[n - 1].0).abs() < 1e-9
                     && (coords[0].1 - coords[n - 1].1).abs() < 1e-9;
-                let make_polygon = is_closed
-                    && include_polygons
-                    && tags_obj.map(is_area_way).unwrap_or(false);
+                let make_polygon =
+                    is_closed && include_polygons && tags_obj.map(is_area_way).unwrap_or(false);
 
                 if make_polygon {
                     let ring: Vec<wbvector::Coord> = coords
@@ -639,17 +707,13 @@ fn transform_bbox_to_wgs84(
     north: f64,
     src_epsg: u32,
 ) -> Result<(f64, f64, f64, f64), ToolError> {
-    let src = Crs::from_epsg(src_epsg)
-        .map_err(|e| ToolError::Validation(format!("invalid input_extent_epsg {}: {}", src_epsg, e)))?;
+    let src = Crs::from_epsg(src_epsg).map_err(|e| {
+        ToolError::Validation(format!("invalid input_extent_epsg {}: {}", src_epsg, e))
+    })?;
     let dst = Crs::from_epsg(4326)
         .map_err(|e| ToolError::Execution(format!("failed loading EPSG:4326 CRS: {}", e)))?;
 
-    let corners = [
-        (west, south),
-        (west, north),
-        (east, south),
-        (east, north),
-    ];
+    let corners = [(west, south), (west, north), (east, south), (east, north)];
 
     let mut out: Vec<(f64, f64)> = Vec::with_capacity(4);
     for (x, y) in corners {
@@ -720,7 +784,11 @@ fn plan_chunked_bboxes(
     }
 
     let target_tiles = (area / max_tile_area_deg2).ceil().max(1.0);
-    let aspect = if height.abs() > 1.0e-12 { width / height } else { 1.0 };
+    let aspect = if height.abs() > 1.0e-12 {
+        width / height
+    } else {
+        1.0
+    };
     let nx = ((target_tiles * aspect).sqrt().ceil().max(1.0)) as usize;
     let ny = (target_tiles / nx as f64).ceil().max(1.0) as usize;
     let total = nx.saturating_mul(ny);
@@ -737,10 +805,18 @@ fn plan_chunked_bboxes(
     let mut out = Vec::with_capacity(total);
     for iy in 0..ny {
         let y0 = south + dy * iy as f64;
-        let y1 = if iy + 1 == ny { north } else { south + dy * (iy + 1) as f64 };
+        let y1 = if iy + 1 == ny {
+            north
+        } else {
+            south + dy * (iy + 1) as f64
+        };
         for ix in 0..nx {
             let x0 = west + dx * ix as f64;
-            let x1 = if ix + 1 == nx { east } else { west + dx * (ix + 1) as f64 };
+            let x1 = if ix + 1 == nx {
+                east
+            } else {
+                west + dx * (ix + 1) as f64
+            };
             out.push((x0, y0, x1, y1));
         }
     }
@@ -781,24 +857,25 @@ fn split_key_value(kv: &str) -> (&str, &str) {
 }
 
 fn parse_semicolon_list(raw: Option<&str>) -> Vec<String> {
-    raw
-        .map(|s| {
-            s.split(';')
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+    raw.map(|s| {
+        s.split(';')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default()
 }
 
 fn build_filter_clauses(args: &ToolArgs, preset: &str) -> Vec<String> {
     let include_tags = parse_semicolon_list(
-        args.get("include_tags").and_then(|v| v.as_str())
+        args.get("include_tags")
+            .and_then(|v| v.as_str())
             .or_else(|| args.get("filter_key").and_then(|v| v.as_str())),
     );
     let include_key_values = parse_semicolon_list(
-        args.get("include_key_values").and_then(|v| v.as_str())
+        args.get("include_key_values")
+            .and_then(|v| v.as_str())
             .or_else(|| args.get("filter_key_value").and_then(|v| v.as_str())),
     );
 
@@ -834,10 +911,18 @@ fn point_inside_bbox(x: f64, y: f64, west: f64, south: f64, east: f64, north: f6
 
 fn out_code(x: f64, y: f64, west: f64, south: f64, east: f64, north: f64) -> u8 {
     let mut code = 0u8;
-    if x < west { code |= 1; }
-    if x > east { code |= 2; }
-    if y < south { code |= 4; }
-    if y > north { code |= 8; }
+    if x < west {
+        code |= 1;
+    }
+    if x > east {
+        code |= 2;
+    }
+    if y < south {
+        code |= 4;
+    }
+    if y > north {
+        code |= 8;
+    }
     code
 }
 
@@ -867,19 +952,27 @@ fn clip_segment_to_bbox(
         let mut y = 0.0;
 
         if (co & 8) != 0 {
-            if (y1 - y0).abs() < CLIP_EPS { return None; }
+            if (y1 - y0).abs() < CLIP_EPS {
+                return None;
+            }
             x = x0 + (x1 - x0) * (north - y0) / (y1 - y0);
             y = north;
         } else if (co & 4) != 0 {
-            if (y1 - y0).abs() < CLIP_EPS { return None; }
+            if (y1 - y0).abs() < CLIP_EPS {
+                return None;
+            }
             x = x0 + (x1 - x0) * (south - y0) / (y1 - y0);
             y = south;
         } else if (co & 2) != 0 {
-            if (x1 - x0).abs() < CLIP_EPS { return None; }
+            if (x1 - x0).abs() < CLIP_EPS {
+                return None;
+            }
             y = y0 + (y1 - y0) * (east - x0) / (x1 - x0);
             x = east;
         } else if (co & 1) != 0 {
-            if (x1 - x0).abs() < CLIP_EPS { return None; }
+            if (x1 - x0).abs() < CLIP_EPS {
+                return None;
+            }
             y = y0 + (y1 - y0) * (west - x0) / (x1 - x0);
             x = west;
         }
@@ -914,7 +1007,9 @@ fn clip_ring_sutherland_hodgman(
         }
     }
 
-    let clip_edge = |input: &Vec<(f64, f64)>, inside: &dyn Fn((f64, f64)) -> bool, intersect: &dyn Fn((f64, f64), (f64, f64)) -> (f64, f64)| {
+    let clip_edge = |input: &Vec<(f64, f64)>,
+                     inside: &dyn Fn((f64, f64)) -> bool,
+                     intersect: &dyn Fn((f64, f64), (f64, f64)) -> (f64, f64)| {
         if input.is_empty() {
             return Vec::new();
         }
@@ -938,19 +1033,35 @@ fn clip_ring_sutherland_hodgman(
 
     let mut out = pts;
     out = clip_edge(&out, &|p| p.0 >= west - CLIP_EPS, &|s, e| {
-        let t = if (e.0 - s.0).abs() < CLIP_EPS { 0.0 } else { (west - s.0) / (e.0 - s.0) };
+        let t = if (e.0 - s.0).abs() < CLIP_EPS {
+            0.0
+        } else {
+            (west - s.0) / (e.0 - s.0)
+        };
         (west, s.1 + t * (e.1 - s.1))
     });
     out = clip_edge(&out, &|p| p.0 <= east + CLIP_EPS, &|s, e| {
-        let t = if (e.0 - s.0).abs() < CLIP_EPS { 0.0 } else { (east - s.0) / (e.0 - s.0) };
+        let t = if (e.0 - s.0).abs() < CLIP_EPS {
+            0.0
+        } else {
+            (east - s.0) / (e.0 - s.0)
+        };
         (east, s.1 + t * (e.1 - s.1))
     });
     out = clip_edge(&out, &|p| p.1 >= south - CLIP_EPS, &|s, e| {
-        let t = if (e.1 - s.1).abs() < CLIP_EPS { 0.0 } else { (south - s.1) / (e.1 - s.1) };
+        let t = if (e.1 - s.1).abs() < CLIP_EPS {
+            0.0
+        } else {
+            (south - s.1) / (e.1 - s.1)
+        };
         (s.0 + t * (e.0 - s.0), south)
     });
     out = clip_edge(&out, &|p| p.1 <= north + CLIP_EPS, &|s, e| {
-        let t = if (e.1 - s.1).abs() < CLIP_EPS { 0.0 } else { (north - s.1) / (e.1 - s.1) };
+        let t = if (e.1 - s.1).abs() < CLIP_EPS {
+            0.0
+        } else {
+            (north - s.1) / (e.1 - s.1)
+        };
         (s.0 + t * (e.0 - s.0), north)
     });
 
@@ -961,7 +1072,9 @@ fn clip_ring_sutherland_hodgman(
         out.push(*out.first().unwrap_or(&(0.0, 0.0)));
     }
 
-    out.into_iter().map(|(x, y)| wbvector::Coord::xy(x, y)).collect()
+    out.into_iter()
+        .map(|(x, y)| wbvector::Coord::xy(x, y))
+        .collect()
 }
 
 fn clip_layer_to_bbox(
@@ -996,15 +1109,21 @@ fn clip_layer_to_bbox(
                     for win in coords.windows(2) {
                         let a = &win[0];
                         let b = &win[1];
-                        if let Some(((x0, y0), (x1, y1))) = clip_segment_to_bbox(
-                            a.x, a.y, b.x, b.y, west, south, east, north,
-                        ) {
+                        if let Some(((x0, y0), (x1, y1))) =
+                            clip_segment_to_bbox(a.x, a.y, b.x, b.y, west, south, east, north)
+                        {
                             let c0 = wbvector::Coord::xy(x0, y0);
                             let c1 = wbvector::Coord::xy(x1, y1);
                             if current.is_empty() {
                                 current.push(c0);
                                 current.push(c1);
-                            } else if current.last().map(|p| (p.x - c0.x).abs() <= CLIP_EPS && (p.y - c0.y).abs() <= CLIP_EPS).unwrap_or(false) {
+                            } else if current
+                                .last()
+                                .map(|p| {
+                                    (p.x - c0.x).abs() <= CLIP_EPS && (p.y - c0.y).abs() <= CLIP_EPS
+                                })
+                                .unwrap_or(false)
+                            {
                                 current.push(c1);
                             } else {
                                 if current.len() >= 2 {
@@ -1030,7 +1149,10 @@ fn clip_layer_to_bbox(
                     }
                 }
             }
-            wbvector::Geometry::Polygon { exterior, interiors: _ } => {
+            wbvector::Geometry::Polygon {
+                exterior,
+                interiors: _,
+            } => {
                 let ring = clip_ring_sutherland_hodgman(&exterior.0, west, south, east, north);
                 if ring.len() >= 4 {
                     Some(wbvector::Geometry::Polygon {
@@ -1104,7 +1226,9 @@ fn write_vector_output(layer: &wbvector::Layer, path: &str) -> Result<String, To
     Ok(path.to_string())
 }
 
-fn split_layer_by_geometry(layer: &wbvector::Layer) -> (wbvector::Layer, wbvector::Layer, wbvector::Layer) {
+fn split_layer_by_geometry(
+    layer: &wbvector::Layer,
+) -> (wbvector::Layer, wbvector::Layer, wbvector::Layer) {
     let mut points = layer.clone();
     let mut lines = layer.clone();
     let mut polygons = layer.clone();
@@ -1117,10 +1241,12 @@ fn split_layer_by_geometry(layer: &wbvector::Layer) -> (wbvector::Layer, wbvecto
             Some(wbvector::Geometry::Point(_)) | Some(wbvector::Geometry::MultiPoint(_)) => {
                 points.features.push(f.clone());
             }
-            Some(wbvector::Geometry::LineString(_)) | Some(wbvector::Geometry::MultiLineString(_)) => {
+            Some(wbvector::Geometry::LineString(_))
+            | Some(wbvector::Geometry::MultiLineString(_)) => {
                 lines.features.push(f.clone());
             }
-            Some(wbvector::Geometry::Polygon { .. }) | Some(wbvector::Geometry::MultiPolygon(_)) => {
+            Some(wbvector::Geometry::Polygon { .. })
+            | Some(wbvector::Geometry::MultiPolygon(_)) => {
                 polygons.features.push(f.clone());
             }
             _ => {}
@@ -1215,23 +1341,26 @@ impl Tool for DownloadOsmVectorTool {
 
     fn manifest(&self) -> ToolManifest {
         let mut defaults = ToolArgs::new();
-        defaults.insert("west".to_string(),            json!(-80.5));
-        defaults.insert("south".to_string(),           json!(43.4));
-        defaults.insert("east".to_string(),            json!(-80.4));
-        defaults.insert("north".to_string(),           json!(43.5));
-        defaults.insert("input_extent_epsg".to_string(),json!(4326));
-        defaults.insert("filter_preset".to_string(),   json!("roads"));
-        defaults.insert("include_tags".to_string(),    json!(""));
+        defaults.insert("west".to_string(), json!(-80.5));
+        defaults.insert("south".to_string(), json!(43.4));
+        defaults.insert("east".to_string(), json!(-80.4));
+        defaults.insert("north".to_string(), json!(43.5));
+        defaults.insert("input_extent_epsg".to_string(), json!(4326));
+        defaults.insert("filter_preset".to_string(), json!("roads"));
+        defaults.insert("include_tags".to_string(), json!(""));
         defaults.insert("include_key_values".to_string(), json!(""));
-        defaults.insert("include_points".to_string(),  json!(true));
-        defaults.insert("include_lines".to_string(),   json!(true));
-        defaults.insert("include_polygons".to_string(),json!(true));
-        defaults.insert("clip_to_extent".to_string(),  json!(true));
+        defaults.insert("include_points".to_string(), json!(true));
+        defaults.insert("include_lines".to_string(), json!(true));
+        defaults.insert("include_polygons".to_string(), json!(true));
+        defaults.insert("clip_to_extent".to_string(), json!(true));
         defaults.insert("split_output_by_geometry".to_string(), json!(false));
-        defaults.insert("overpass_profile".to_string(),json!("main"));
-        defaults.insert("overpass_url".to_string(),    json!("https://overpass-api.de/api/interpreter"));
+        defaults.insert("overpass_profile".to_string(), json!("main"));
+        defaults.insert(
+            "overpass_url".to_string(),
+            json!("https://overpass-api.de/api/interpreter"),
+        );
         defaults.insert("timeout_seconds".to_string(), json!(25));
-        defaults.insert("max_elements".to_string(),    json!(50_000));
+        defaults.insert("max_elements".to_string(), json!(50_000));
         defaults.insert("chunk_large_aoi".to_string(), json!(true));
         defaults.insert("chunk_max_area_deg2".to_string(), json!(4.0));
         defaults.insert("max_chunk_count".to_string(), json!(64));
@@ -1329,7 +1458,9 @@ impl Tool for DownloadOsmVectorTool {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as usize;
             if max_chunk_count == 0 {
-                return Err(ToolError::Validation("max_chunk_count must be > 0".to_string()));
+                return Err(ToolError::Validation(
+                    "max_chunk_count must be > 0".to_string(),
+                ));
             }
             if chunk_parallel_requests == 0 {
                 return Err(ToolError::Validation(
@@ -1372,15 +1503,30 @@ impl Tool for DownloadOsmVectorTool {
             .unwrap_or("all")
             .to_lowercase();
 
-        let include_points   = args.get("include_points").and_then(|v| v.as_bool()).unwrap_or(true);
-        let include_lines    = args.get("include_lines").and_then(|v| v.as_bool()).unwrap_or(true);
-        let include_polygons = args.get("include_polygons").and_then(|v| v.as_bool()).unwrap_or(true);
-        let clip_to_extent   = args.get("clip_to_extent").and_then(|v| v.as_bool()).unwrap_or(true);
+        let include_points = args
+            .get("include_points")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let include_lines = args
+            .get("include_lines")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let include_polygons = args
+            .get("include_polygons")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let clip_to_extent = args
+            .get("clip_to_extent")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let split_output_by_geometry = args
             .get("split_output_by_geometry")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let output_epsg      = args.get("output_epsg").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let output_epsg = args
+            .get("output_epsg")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
         let cache_dir = args
             .get("cache_dir")
             .and_then(|v| v.as_str())
@@ -1393,6 +1539,17 @@ impl Tool for DownloadOsmVectorTool {
             .unwrap_or(24);
         let provenance_output = args
             .get("provenance_output")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        // Browser WASI runtimes do not expose sockets to std::net. Hosts can
+        // fetch each planned Overpass request with their native fetch API and
+        // place <prefix><index>.json files in /work for the parser.
+        // This is intentionally a host-only argument, not a user-facing tool
+        // parameter in the manifest.
+        let overpass_response_prefix = args
+            .get("overpass_response_prefix")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -1471,24 +1628,37 @@ impl Tool for DownloadOsmVectorTool {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(workers)
                 .build()
-                .map_err(|e| ToolError::Execution(format!("failed creating chunk thread pool: {}", e)))?;
+                .map_err(|e| {
+                    ToolError::Execution(format!("failed creating chunk thread pool: {}", e))
+                })?;
             let mut chunk_results = pool.install(|| {
                 chunk_bboxes
                     .par_iter()
                     .enumerate()
                     .map(|(idx, bbox)| {
-                        fetch_parse_chunk(
-                            &endpoint,
-                            *bbox,
-                            include_points,
-                            include_lines,
-                            include_polygons,
-                            &filters,
-                            timeout_secs,
-                            max_elements,
-                            cache_dir.as_deref(),
-                            cache_ttl_hours,
-                        )
+                        if let Some(prefix) = overpass_response_prefix.as_ref() {
+                            parse_overpass_response_file(
+                                Path::new(&format!("{}{}.json", prefix, idx)),
+                                include_points,
+                                include_lines,
+                                include_polygons,
+                                max_elements,
+                            )
+                            .map(|parsed| (parsed, false))
+                        } else {
+                            fetch_parse_chunk(
+                                &endpoint,
+                                *bbox,
+                                include_points,
+                                include_lines,
+                                include_polygons,
+                                &filters,
+                                timeout_secs,
+                                max_elements,
+                                cache_dir.as_deref(),
+                                cache_ttl_hours,
+                            )
+                        }
                         .map(|(parsed, used_cache)| (idx, parsed, used_cache))
                     })
                     .collect::<Result<Vec<_>, ToolError>>()
@@ -1518,18 +1688,32 @@ impl Tool for DownloadOsmVectorTool {
                     ));
                 }
 
-                let (parsed, used_cache_chunk) = fetch_parse_chunk(
-                    &endpoint,
-                    *bbox,
-                    include_points,
-                    include_lines,
-                    include_polygons,
-                    &filters,
-                    timeout_secs,
-                    max_elements,
-                    cache_dir.as_deref(),
-                    cache_ttl_hours,
-                )?;
+                let (parsed, used_cache_chunk) =
+                    if let Some(prefix) = overpass_response_prefix.as_ref() {
+                    (
+                        parse_overpass_response_file(
+                            Path::new(&format!("{}{}.json", prefix, idx)),
+                            include_points,
+                            include_lines,
+                            include_polygons,
+                            max_elements,
+                        )?,
+                        false,
+                    )
+                } else {
+                    fetch_parse_chunk(
+                        &endpoint,
+                        *bbox,
+                        include_points,
+                        include_lines,
+                        include_polygons,
+                        &filters,
+                        timeout_secs,
+                        max_elements,
+                        cache_dir.as_deref(),
+                        cache_ttl_hours,
+                    )?
+                };
                 if used_cache_chunk {
                     any_cache_used = true;
                 }
@@ -1575,19 +1759,18 @@ impl Tool for DownloadOsmVectorTool {
 
         if let Some(epsg) = output_epsg {
             output_layer = output_layer.reproject_to_epsg(epsg).map_err(|e| {
-                ToolError::Execution(format!(
-                    "reprojection to EPSG:{} failed: {}",
-                    epsg, e
-                ))
+                ToolError::Execution(format!("reprojection to EPSG:{} failed: {}", epsg, e))
             })?;
         }
 
         let mut outputs = std::collections::BTreeMap::new();
 
         if split_output_by_geometry {
-            let (points_path, lines_path, polygons_path) = derive_split_output_paths(output_path.trim())?;
+            let (points_path, lines_path, polygons_path) =
+                derive_split_output_paths(output_path.trim())?;
 
-            let (mut points_layer, mut lines_layer, mut polygons_layer) = split_layer_by_geometry(&output_layer);
+            let (mut points_layer, mut lines_layer, mut polygons_layer) =
+                split_layer_by_geometry(&output_layer);
 
             // Explicitly set geometry types for each output
             points_layer.geom_type = Some(wbvector::GeometryType::Point);
@@ -1609,7 +1792,8 @@ impl Tool for DownloadOsmVectorTool {
 
             if outputs.is_empty() {
                 return Err(ToolError::Execution(
-                    "no geometries were available to write for split_output_by_geometry".to_string(),
+                    "no geometries were available to write for split_output_by_geometry"
+                        .to_string(),
                 ));
             }
         } else {
@@ -1659,6 +1843,58 @@ impl Tool for DownloadOsmVectorTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wbcore::{AllowAllCapabilities, ProgressSink};
+
+    struct SilentProgress;
+    impl ProgressSink for SilentProgress {}
+
+    static PROGRESS: SilentProgress = SilentProgress;
+    static CAPABILITIES: AllowAllCapabilities = AllowAllCapabilities;
+
+    fn test_context() -> ToolContext<'static> {
+        ToolContext {
+            progress: &PROGRESS,
+            capabilities: &CAPABILITIES,
+        }
+    }
+
+    fn host_response_args(
+        dir: &Path,
+        bbox: (f64, f64, f64, f64),
+        parallel_requests: usize,
+    ) -> ToolArgs {
+        let mut args = ToolArgs::new();
+        args.insert("west".to_string(), json!(bbox.0));
+        args.insert("south".to_string(), json!(bbox.1));
+        args.insert("east".to_string(), json!(bbox.2));
+        args.insert("north".to_string(), json!(bbox.3));
+        args.insert("filter_preset".to_string(), json!("roads"));
+        args.insert("overpass_url".to_string(), json!("https://invalid.invalid"));
+        args.insert("chunk_parallel_requests".to_string(), json!(parallel_requests));
+        args.insert(
+            "overpass_response_prefix".to_string(),
+            json!(dir.join("chunk_").to_string_lossy()),
+        );
+        args.insert(
+            "output".to_string(),
+            json!(dir.join("output.geojson").to_string_lossy()),
+        );
+        args
+    }
+
+    fn write_host_response(dir: &Path, index: usize, id: i64, lon: f64, lat: f64) {
+        let response = json!({
+            "elements": [{
+                "type": "node", "id": id, "lat": lat, "lon": lon,
+                "tags": {"highway": "crossing"}
+            }]
+        });
+        std::fs::write(
+            dir.join(format!("chunk_{}.json", index)),
+            serde_json::to_vec(&response).expect("fixture should serialize"),
+        )
+        .expect("fixture should be written");
+    }
 
     #[test]
     fn parse_semicolon_list_splits_and_trims() {
@@ -1670,7 +1906,10 @@ mod tests {
     fn build_filter_clauses_uses_design_args() {
         let mut args = ToolArgs::new();
         args.insert("include_tags".to_string(), json!("amenity;shop"));
-        args.insert("include_key_values".to_string(), json!("building=yes;amenity=school"));
+        args.insert(
+            "include_key_values".to_string(),
+            json!("building=yes;amenity=school"),
+        );
 
         let filters = build_filter_clauses(&args, "all");
         assert!(filters.contains(&"[amenity]".to_string()));
@@ -1754,7 +1993,10 @@ mod tests {
         assert_eq!(out.features.len(), 1);
         let g = out.features[0].geometry.as_ref().unwrap();
         match g {
-            wbvector::Geometry::Polygon { exterior, interiors: _ } => {
+            wbvector::Geometry::Polygon {
+                exterior,
+                interiors: _,
+            } => {
                 assert!(exterior.0.len() >= 4);
                 for c in &exterior.0 {
                     assert!(c.x >= -1.0e-9 && c.x <= 1.0 + 1.0e-9);
@@ -1795,14 +2037,79 @@ mod tests {
         assert_eq!(parsed.skipped, 0);
         assert!(parsed.layer.features.len() >= 2);
 
-        let has_point = parsed.layer.features.iter().any(|f| {
-            matches!(f.geometry.as_ref(), Some(wbvector::Geometry::Point(_)))
-        });
+        let has_point = parsed
+            .layer
+            .features
+            .iter()
+            .any(|f| matches!(f.geometry.as_ref(), Some(wbvector::Geometry::Point(_))));
         let has_polygon = parsed.layer.features.iter().any(|f| {
-            matches!(f.geometry.as_ref(), Some(wbvector::Geometry::Polygon { .. }))
+            matches!(
+                f.geometry.as_ref(),
+                Some(wbvector::Geometry::Polygon { .. })
+            )
         });
         assert!(has_point);
         assert!(has_polygon);
+    }
+
+    #[test]
+    fn parse_overpass_response_file_accepts_host_fetched_json() {
+        let path = std::env::temp_dir().join(format!(
+            "whitebox-overpass-host-response-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"elements":[{"type":"node","id":1,"lat":52.2,"lon":20.9,"tags":{"amenity":"school"}}]}"#,
+        )
+        .expect("fixture should be written");
+
+        let parsed = parse_overpass_response_file(&path, true, true, true, 100)
+            .expect("host-fetched response should parse");
+        assert_eq!(parsed.layer.features.len(), 1);
+
+        std::fs::remove_file(&path).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn run_uses_host_response_without_network_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "whitebox-overpass-host-run-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture directory should be created");
+        write_host_response(&dir, 0, 1, 20.9, 52.2);
+
+        DownloadOsmVectorTool
+            .run(
+                &host_response_args(&dir, (20.8, 52.1, 21.0, 52.3), 1),
+                &test_context(),
+            )
+            .expect("host response should avoid the invalid endpoint");
+        assert!(dir.join("output.geojson").exists());
+
+        std::fs::remove_dir_all(&dir).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn run_uses_numbered_host_responses_in_parallel() {
+        let dir = std::env::temp_dir().join(format!(
+            "whitebox-overpass-host-parallel-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture directory should be created");
+        write_host_response(&dir, 0, 1, 0.5, 1.0);
+        write_host_response(&dir, 1, 2, 3.5, 1.0);
+
+        DownloadOsmVectorTool
+            .run(&host_response_args(&dir, (0.0, 0.0, 4.0, 2.0), 2), &test_context())
+            .expect("parallel host responses should avoid the invalid endpoint");
+        let output = std::fs::read_to_string(dir.join("output.geojson"))
+            .expect("output should be readable");
+        assert!(output.contains("\"osm_id\": 1") || output.contains("\"osm_id\":1"));
+        assert!(output.contains("\"osm_id\": 2") || output.contains("\"osm_id\":2"));
+
+        std::fs::remove_dir_all(&dir).expect("fixture directory should be removed");
     }
 
     #[test]
@@ -1837,7 +2144,12 @@ mod tests {
             .layer
             .features
             .iter()
-            .filter(|f| matches!(f.geometry.as_ref(), Some(wbvector::Geometry::Polygon { .. })))
+            .filter(|f| {
+                matches!(
+                    f.geometry.as_ref(),
+                    Some(wbvector::Geometry::Polygon { .. })
+                )
+            })
             .count();
 
         assert!(polygon_count >= 1);
@@ -1855,8 +2167,12 @@ mod tests {
     fn resolve_overpass_endpoint_explicit_url_overrides_profile() {
         let mut args = ToolArgs::new();
         args.insert("overpass_profile".to_string(), json!("main"));
-        args.insert("overpass_url".to_string(), json!("https://example.test/interpreter"));
-        let endpoint = resolve_overpass_endpoint(&args).expect("explicit URL should override profile");
+        args.insert(
+            "overpass_url".to_string(),
+            json!("https://example.test/interpreter"),
+        );
+        let endpoint =
+            resolve_overpass_endpoint(&args).expect("explicit URL should override profile");
         assert_eq!(endpoint, "https://example.test/interpreter");
     }
 
@@ -1901,8 +2217,14 @@ mod tests {
     fn dedupe_layer_by_osm_identity_removes_duplicates() {
         let mut layer = wbvector::Layer::new("osm_download");
         layer.assign_crs_epsg(4326);
-        layer.add_field(wbvector::FieldDef::new("osm_id", wbvector::FieldType::Integer));
-        layer.add_field(wbvector::FieldDef::new("osm_type", wbvector::FieldType::Text));
+        layer.add_field(wbvector::FieldDef::new(
+            "osm_id",
+            wbvector::FieldType::Integer,
+        ));
+        layer.add_field(wbvector::FieldDef::new(
+            "osm_type",
+            wbvector::FieldType::Text,
+        ));
 
         let geom = wbvector::Geometry::point(-80.0, 43.0);
         layer

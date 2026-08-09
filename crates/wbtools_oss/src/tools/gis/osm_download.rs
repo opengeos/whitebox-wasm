@@ -366,6 +366,13 @@ fn parse_overpass_response_file(
         include_polygons,
         max_elements,
     )
+    .map_err(|e| {
+        ToolError::Execution(format!(
+            "host-provided Overpass response '{}' is invalid: {}",
+            path.display(),
+            e
+        ))
+    })
 }
 
 // ── Overpass JSON → Layer ──────────────────────────────────────────────────────
@@ -1836,6 +1843,58 @@ impl Tool for DownloadOsmVectorTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wbcore::{AllowAllCapabilities, ProgressSink};
+
+    struct SilentProgress;
+    impl ProgressSink for SilentProgress {}
+
+    static PROGRESS: SilentProgress = SilentProgress;
+    static CAPABILITIES: AllowAllCapabilities = AllowAllCapabilities;
+
+    fn test_context() -> ToolContext<'static> {
+        ToolContext {
+            progress: &PROGRESS,
+            capabilities: &CAPABILITIES,
+        }
+    }
+
+    fn host_response_args(
+        dir: &Path,
+        bbox: (f64, f64, f64, f64),
+        parallel_requests: usize,
+    ) -> ToolArgs {
+        let mut args = ToolArgs::new();
+        args.insert("west".to_string(), json!(bbox.0));
+        args.insert("south".to_string(), json!(bbox.1));
+        args.insert("east".to_string(), json!(bbox.2));
+        args.insert("north".to_string(), json!(bbox.3));
+        args.insert("filter_preset".to_string(), json!("roads"));
+        args.insert("overpass_url".to_string(), json!("https://invalid.invalid"));
+        args.insert("chunk_parallel_requests".to_string(), json!(parallel_requests));
+        args.insert(
+            "overpass_response_prefix".to_string(),
+            json!(dir.join("chunk_").to_string_lossy()),
+        );
+        args.insert(
+            "output".to_string(),
+            json!(dir.join("output.geojson").to_string_lossy()),
+        );
+        args
+    }
+
+    fn write_host_response(dir: &Path, index: usize, id: i64, lon: f64, lat: f64) {
+        let response = json!({
+            "elements": [{
+                "type": "node", "id": id, "lat": lat, "lon": lon,
+                "tags": {"highway": "crossing"}
+            }]
+        });
+        std::fs::write(
+            dir.join(format!("chunk_{}.json", index)),
+            serde_json::to_vec(&response).expect("fixture should serialize"),
+        )
+        .expect("fixture should be written");
+    }
 
     #[test]
     fn parse_semicolon_list_splits_and_trims() {
@@ -2010,6 +2069,47 @@ mod tests {
         assert_eq!(parsed.layer.features.len(), 1);
 
         std::fs::remove_file(&path).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn run_uses_host_response_without_network_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "whitebox-overpass-host-run-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture directory should be created");
+        write_host_response(&dir, 0, 1, 20.9, 52.2);
+
+        DownloadOsmVectorTool
+            .run(
+                &host_response_args(&dir, (20.8, 52.1, 21.0, 52.3), 1),
+                &test_context(),
+            )
+            .expect("host response should avoid the invalid endpoint");
+        assert!(dir.join("output.geojson").exists());
+
+        std::fs::remove_dir_all(&dir).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn run_uses_numbered_host_responses_in_parallel() {
+        let dir = std::env::temp_dir().join(format!(
+            "whitebox-overpass-host-parallel-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture directory should be created");
+        write_host_response(&dir, 0, 1, 0.5, 1.0);
+        write_host_response(&dir, 1, 2, 3.5, 1.0);
+
+        DownloadOsmVectorTool
+            .run(&host_response_args(&dir, (0.0, 0.0, 4.0, 2.0), 2), &test_context())
+            .expect("parallel host responses should avoid the invalid endpoint");
+        let output = std::fs::read_to_string(dir.join("output.geojson"))
+            .expect("output should be readable");
+        assert!(output.contains("\"osm_id\": 1") || output.contains("\"osm_id\":1"));
+        assert!(output.contains("\"osm_id\": 2") || output.contains("\"osm_id\":2"));
+
+        std::fs::remove_dir_all(&dir).expect("fixture directory should be removed");
     }
 
     #[test]

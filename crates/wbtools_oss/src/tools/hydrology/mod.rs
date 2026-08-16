@@ -2416,47 +2416,43 @@ fn rasterize_line_geometry(mask: &mut [u8], rows: usize, cols: usize, dem: &Rast
 	}
 }
 
+/// Burns one polygon ring into the boundary mask.
+///
+/// Rings are stored open, without the closing duplicate point, so walking them
+/// with `windows(2)` alone leaves the segment from the last vertex back to the
+/// first unburned and the mask ends up with a gap in it.
+fn rasterize_ring_boundary(mask: &mut [u8], rows: usize, cols: usize, dem: &Raster, ring: &wbvector::Ring) {
+	let n = ring.0.len();
+	if n < 2 {
+		return;
+	}
+	let closed = ring.0[0] == ring.0[n - 1];
+	let segments = if closed { n - 1 } else { n };
+	for i in 0..segments {
+		let a = &ring.0[i];
+		let b = &ring.0[(i + 1) % n];
+		if let (Some((c0, r0)), Some((c1, r1))) = (
+			dem.world_to_pixel(a.x, a.y),
+			dem.world_to_pixel(b.x, b.y),
+		) {
+			draw_line_cells(mask, rows, cols, r0, c0, r1, c1);
+		}
+	}
+}
+
 fn rasterize_polygon_boundaries(mask: &mut [u8], rows: usize, cols: usize, dem: &Raster, geom: &wbvector::Geometry) {
 	match geom {
 		wbvector::Geometry::Polygon { exterior, interiors } => {
-			for seg in exterior.0.windows(2) {
-				if let (Some((c0, r0)), Some((c1, r1))) = (
-					dem.world_to_pixel(seg[0].x, seg[0].y),
-					dem.world_to_pixel(seg[1].x, seg[1].y),
-				) {
-					draw_line_cells(mask, rows, cols, r0, c0, r1, c1);
-				}
-			}
+			rasterize_ring_boundary(mask, rows, cols, dem, exterior);
 			for ring in interiors {
-				for seg in ring.0.windows(2) {
-					if let (Some((c0, r0)), Some((c1, r1))) = (
-						dem.world_to_pixel(seg[0].x, seg[0].y),
-						dem.world_to_pixel(seg[1].x, seg[1].y),
-					) {
-						draw_line_cells(mask, rows, cols, r0, c0, r1, c1);
-					}
-				}
+				rasterize_ring_boundary(mask, rows, cols, dem, ring);
 			}
 		}
 		wbvector::Geometry::MultiPolygon(polys) => {
 			for (exterior, interiors) in polys {
-				for seg in exterior.0.windows(2) {
-					if let (Some((c0, r0)), Some((c1, r1))) = (
-						dem.world_to_pixel(seg[0].x, seg[0].y),
-						dem.world_to_pixel(seg[1].x, seg[1].y),
-					) {
-						draw_line_cells(mask, rows, cols, r0, c0, r1, c1);
-					}
-				}
+				rasterize_ring_boundary(mask, rows, cols, dem, exterior);
 				for ring in interiors {
-					for seg in ring.0.windows(2) {
-						if let (Some((c0, r0)), Some((c1, r1))) = (
-							dem.world_to_pixel(seg[0].x, seg[0].y),
-							dem.world_to_pixel(seg[1].x, seg[1].y),
-						) {
-							draw_line_cells(mask, rows, cols, r0, c0, r1, c1);
-						}
-					}
+					rasterize_ring_boundary(mask, rows, cols, dem, ring);
 				}
 			}
 		}

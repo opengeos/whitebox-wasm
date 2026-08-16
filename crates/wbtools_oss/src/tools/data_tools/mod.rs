@@ -442,6 +442,19 @@ fn close_ring(coords: &[wbvector::Coord]) -> Vec<wbvector::Coord> {
     ring
 }
 
+/// Traces a polygon ring as a linestring.
+///
+/// `Ring` stores its vertices open, without the closing duplicate point, so a
+/// straight copy of the coordinates loses the final segment from the last
+/// vertex back to the first. Degenerate rings are passed through untouched
+/// rather than closed into a doubled-back stub.
+fn ring_boundary_line(ring: &Ring) -> Vec<Coord> {
+    if ring.0.len() < 3 {
+        return ring.0.clone();
+    }
+    close_ring(&ring.0)
+}
+
 fn strip_polygon_holes_with_topology(geometry: &Geometry) -> Result<Geometry, ToolError> {
     let topo_geom = topology_from_wkb(&geometry.to_wkb())
         .map_err(|e| ToolError::Execution(format!("failed converting geometry for topology processing: {e}")))?;
@@ -968,22 +981,22 @@ fn geometry_line_parts(geometry: &Geometry, out: &mut Vec<Vec<Coord>>) {
         }
         Geometry::Polygon { exterior, interiors } => {
             if exterior.0.len() >= 2 {
-                out.push(exterior.0.clone());
+                out.push(ring_boundary_line(exterior));
             }
             for ring in interiors {
                 if ring.0.len() >= 2 {
-                    out.push(ring.0.clone());
+                    out.push(ring_boundary_line(ring));
                 }
             }
         }
         Geometry::MultiPolygon(polys) => {
             for (exterior, interiors) in polys {
                 if exterior.0.len() >= 2 {
-                    out.push(exterior.0.clone());
+                    out.push(ring_boundary_line(exterior));
                 }
                 for ring in interiors {
                     if ring.0.len() >= 2 {
-                        out.push(ring.0.clone());
+                        out.push(ring_boundary_line(ring));
                     }
                 }
             }
@@ -3772,18 +3785,18 @@ impl Tool for PolygonsToLinesTool {
             .map(|feature| {
                 let geom = match &feature.geometry {
                     Some(Geometry::Polygon { exterior, interiors }) => {
-                        let mut lines = vec![exterior.0.clone()];
+                        let mut lines = vec![ring_boundary_line(exterior)];
                         for ring in interiors {
-                            lines.push(ring.0.clone());
+                            lines.push(ring_boundary_line(ring));
                         }
                         Some(Geometry::multi_line_string(lines))
                     }
                     Some(Geometry::MultiPolygon(polys)) => {
                         let mut lines = Vec::new();
                         for (exterior, interiors) in polys {
-                            lines.push(exterior.0.clone());
+                            lines.push(ring_boundary_line(exterior));
                             for ring in interiors {
-                                lines.push(ring.0.clone());
+                                lines.push(ring_boundary_line(ring));
                             }
                         }
                         Some(Geometry::multi_line_string(lines))
@@ -7477,5 +7490,94 @@ mod polygon_topology_issue_tests {
         // Two-vertex hole: too short.
         let short = issue_types(exterior, vec![ring(vec![c(1.0, 1.0), c(2.0, 1.0)])]);
         assert!(short.contains(&"polygon_hole_too_short".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod ring_boundary_line_tests {
+    use super::*;
+
+    fn c(x: f64, y: f64) -> Coord {
+        Coord::xy(x, y)
+    }
+
+    fn square() -> Ring {
+        Ring::new(vec![c(0.0, 0.0), c(10.0, 0.0), c(10.0, 10.0), c(0.0, 10.0)])
+    }
+
+    #[test]
+    fn open_ring_gains_the_closing_vertex() {
+        let line = ring_boundary_line(&square());
+        assert_eq!(line.len(), 5, "the traced boundary must return to its start");
+        assert_eq!(line.first().map(|p| (p.x, p.y)), Some((0.0, 0.0)));
+        assert_eq!(line.last().map(|p| (p.x, p.y)), Some((0.0, 0.0)));
+    }
+
+    #[test]
+    fn already_closed_ring_is_not_doubled() {
+        let closed = Ring::new(vec![
+            c(0.0, 0.0),
+            c(10.0, 0.0),
+            c(10.0, 10.0),
+            c(0.0, 10.0),
+            c(0.0, 0.0),
+        ]);
+        assert_eq!(ring_boundary_line(&closed).len(), 5);
+    }
+
+    #[test]
+    fn degenerate_rings_are_passed_through() {
+        assert!(ring_boundary_line(&Ring::new(Vec::new())).is_empty());
+        assert_eq!(ring_boundary_line(&Ring::new(vec![c(1.0, 1.0)])).len(), 1);
+        assert_eq!(
+            ring_boundary_line(&Ring::new(vec![c(1.0, 1.0), c(2.0, 2.0)])).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn polygons_to_lines_traces_the_whole_boundary() {
+        let hole = vec![c(2.0, 2.0), c(4.0, 2.0), c(4.0, 4.0), c(2.0, 4.0)];
+        let geom = Geometry::Polygon {
+            exterior: square(),
+            interiors: vec![Ring::new(hole)],
+        };
+        let Geometry::Polygon { exterior, interiors } = &geom else {
+            panic!("expected a polygon");
+        };
+        let mut lines = vec![ring_boundary_line(exterior)];
+        for ring in interiors {
+            lines.push(ring_boundary_line(ring));
+        }
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert_eq!(
+                line.first().map(|p| (p.x, p.y)),
+                line.last().map(|p| (p.x, p.y)),
+                "every ring must be traced as a closed line"
+            );
+        }
+    }
+
+    #[test]
+    fn geometry_line_parts_closes_polygon_rings() {
+        let geom = Geometry::Polygon {
+            exterior: square(),
+            interiors: Vec::new(),
+        };
+        let mut parts: Vec<Vec<Coord>> = Vec::new();
+        geometry_line_parts(&geom, &mut parts);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].len(), 5);
+        assert_eq!(parts[0].first().map(|p| (p.x, p.y)), Some((0.0, 0.0)));
+        assert_eq!(parts[0].last().map(|p| (p.x, p.y)), Some((0.0, 0.0)));
+    }
+
+    #[test]
+    fn geometry_line_parts_leaves_linestrings_open() {
+        let geom = Geometry::line_string(vec![c(0.0, 0.0), c(1.0, 1.0), c(2.0, 0.0)]);
+        let mut parts: Vec<Vec<Coord>> = Vec::new();
+        geometry_line_parts(&geom, &mut parts);
+        assert_eq!(parts, vec![vec![c(0.0, 0.0), c(1.0, 1.0), c(2.0, 0.0)]]);
     }
 }

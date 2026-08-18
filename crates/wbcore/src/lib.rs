@@ -1753,6 +1753,18 @@ mod tests {
             // route_event_points_from_layer.measure_field, with a numeric-sounding
             // description that would otherwise read as a scalar.
             ("measure_field", "Measure field holding the route distance (default 0.0)."),
+            // The `attribute`/`attributes` spellings too:
+            // collapse_dual_lines_to_centerline.attribute.
+            (
+                "attribute",
+                "Optional field that must match for two lines to pair (e.g. road name or class).",
+            ),
+            // interpolate_shape.attributes, whose comma list would otherwise
+            // read as an enumeration of choices.
+            (
+                "attributes",
+                "Comma list of metric columns to add: z_min,z_max,z_mean,surf_len,avg_slope. Default: all.",
+            ),
         ] {
             assert!(
                 matches!(schema_for(n, d), ToolParamSchema::String),

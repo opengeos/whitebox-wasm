@@ -14386,20 +14386,47 @@ impl Tool for DissolveTool {
             coalescer.emit_unit_fraction(ctx.progress, (feature_idx + 1) as f64 / total as f64);
         }
 
+        // One feature per dissolve group, not one per disconnected region.
+        // `polygon_unary_dissolve` returns each group's parts separately, so
+        // polygons that share an attribute value but no boundary used to come
+        // back as several features carrying the same value -- 290 communes over
+        // 12 land-use classes dissolved to 48 features, not 12
+        // (opengeos/GeoLibre#1977). Collecting the parts into one
+        // Polygon/MultiPolygon per group mirrors GeoPandas' `dissolve` and
+        // GeoLibre's own client-side dissolve; the ungrouped case is the same
+        // rule with a single group, which is what "dissolves all polygons"
+        // means. Multipart output makes the layer's geometry type
+        // MultiPolygon.
+        output.geom_type = Some(wbvector::GeometryType::MultiPolygon);
         let mut next_fid = 1u64;
         if dissolve_field_index.is_some() {
             let total_groups = grouped_polygons.len().max(1);
             for (group_idx, (field_value, polygons)) in grouped_polygons.into_iter().enumerate() {
-                for dissolved in polygon_unary_dissolve(&polygons, epsilon) {
-                    push_topo_polygon_feature(&mut output, next_fid, dissolved.poly, vec![field_value.clone()]);
+                let parts: Vec<TopoPolygon> = polygon_unary_dissolve(&polygons, epsilon)
+                    .into_iter()
+                    .map(|dissolved| dissolved.poly)
+                    .collect();
+                if let Some(geometry) = polygons_to_wb_geometry(parts) {
+                    output.push(wbvector::Feature {
+                        fid: next_fid,
+                        geometry: Some(geometry),
+                        attributes: vec![field_value.clone()],
+                    });
                     next_fid += 1;
                 }
                 coalescer.emit_unit_fraction(ctx.progress, (group_idx + 1) as f64 / total_groups as f64);
             }
         } else {
-            for dissolved in polygon_unary_dissolve(&all_polygons, epsilon) {
-                push_topo_polygon_feature(&mut output, next_fid, dissolved.poly, Vec::new());
-                next_fid += 1;
+            let parts: Vec<TopoPolygon> = polygon_unary_dissolve(&all_polygons, epsilon)
+                .into_iter()
+                .map(|dissolved| dissolved.poly)
+                .collect();
+            if let Some(geometry) = polygons_to_wb_geometry(parts) {
+                output.push(wbvector::Feature {
+                    fid: next_fid,
+                    geometry: Some(geometry),
+                    attributes: Vec::new(),
+                });
             }
         }
 
@@ -35458,6 +35485,7 @@ impl Tool for NetworkServiceAreaTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wbcore::{AllowAllCapabilities, RecordingProgressSink};
 
     #[test]
     fn classify_one_way_direction_supports_forward_reverse_and_bidirectional() {
@@ -35495,6 +35523,112 @@ mod tests {
             classify_one_way_direction(&wbvector::FieldValue::Text(" reverse ".to_string()), forward, reverse),
             OneWayDirection::Reverse
         );
+    }
+
+    /// A square with `size`-long sides whose lower-left corner is at (x, y).
+    fn square(x: f64, y: f64, size: f64) -> wbvector::Geometry {
+        let coords = [
+            (x, y),
+            (x + size, y),
+            (x + size, y + size),
+            (x, y + size),
+            (x, y),
+        ]
+        .into_iter()
+        .map(|(cx, cy)| wbvector::Coord::xy(cx, cy))
+        .collect();
+        wbvector::Geometry::Polygon {
+            exterior: wbvector::Ring::new(coords),
+            interiors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dissolve_collects_disconnected_parts_into_one_feature_per_group() {
+        // Two squares that share the class "a" but no boundary, plus one "b".
+        // The dissolve used to emit one feature per disconnected region, so an
+        // attribute with scattered polygons came back as more features than it
+        // had values -- 290 communes over 12 land-use classes dissolved to 48
+        // features (opengeos/GeoLibre#1977).
+        let mut input = wbvector::Layer::new("input".to_string());
+        input.geom_type = Some(wbvector::GeometryType::Polygon);
+        input.add_field(wbvector::FieldDef::new("class", wbvector::FieldType::Text));
+        for (x, class) in [(0.0, "a"), (10.0, "a"), (20.0, "b")] {
+            input.push(wbvector::Feature {
+                fid: 0,
+                geometry: Some(square(x, 0.0, 1.0)),
+                attributes: vec![wbvector::FieldValue::Text(class.to_string())],
+            });
+        }
+        let input_path =
+            vector_memory_store::make_vector_memory_path(&vector_memory_store::put_vector(input));
+
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(input_path));
+        args.insert("dissolve_field".to_string(), json!("class"));
+        let sink = RecordingProgressSink::new();
+        let ctx = ToolContext {
+            progress: &sink,
+            capabilities: &AllowAllCapabilities,
+        };
+        let result = DissolveTool.run(&args, &ctx).expect("dissolve runs");
+
+        let output_path = result.outputs["path"].as_str().expect("output path");
+        let output = vector_memory_store::get_vector_arc_by_path(output_path).expect("output layer");
+        assert_eq!(output.len(), 2, "one feature per dissolve value");
+        // "a" keeps both of its disconnected squares, as one multipart geometry.
+        let multi = output
+            .features
+            .iter()
+            .find(|f| f.attributes == vec![wbvector::FieldValue::Text("a".to_string())])
+            .expect("the 'a' group");
+        match multi.geometry.as_ref().expect("geometry") {
+            wbvector::Geometry::MultiPolygon(parts) => assert_eq!(parts.len(), 2),
+            other => panic!("expected a MultiPolygon, got {other:?}"),
+        }
+        // A group with one part stays a plain Polygon.
+        let single = output
+            .features
+            .iter()
+            .find(|f| f.attributes == vec![wbvector::FieldValue::Text("b".to_string())])
+            .expect("the 'b' group");
+        assert!(matches!(
+            single.geometry.as_ref().expect("geometry"),
+            wbvector::Geometry::Polygon { .. }
+        ));
+    }
+
+    #[test]
+    fn dissolve_without_a_field_returns_a_single_feature() {
+        // "if omitted, dissolves all polygons" -- one group, so one feature.
+        let mut input = wbvector::Layer::new("input".to_string());
+        input.geom_type = Some(wbvector::GeometryType::Polygon);
+        for x in [0.0, 10.0] {
+            input.push(wbvector::Feature {
+                fid: 0,
+                geometry: Some(square(x, 0.0, 1.0)),
+                attributes: Vec::new(),
+            });
+        }
+        let input_path =
+            vector_memory_store::make_vector_memory_path(&vector_memory_store::put_vector(input));
+
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(input_path));
+        let sink = RecordingProgressSink::new();
+        let ctx = ToolContext {
+            progress: &sink,
+            capabilities: &AllowAllCapabilities,
+        };
+        let result = DissolveTool.run(&args, &ctx).expect("dissolve runs");
+
+        let output_path = result.outputs["path"].as_str().expect("output path");
+        let output = vector_memory_store::get_vector_arc_by_path(output_path).expect("output layer");
+        assert_eq!(output.len(), 1);
+        match output.features[0].geometry.as_ref().expect("geometry") {
+            wbvector::Geometry::MultiPolygon(parts) => assert_eq!(parts.len(), 2),
+            other => panic!("expected a MultiPolygon, got {other:?}"),
+        }
     }
 
     #[test]

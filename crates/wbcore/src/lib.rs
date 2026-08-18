@@ -595,6 +595,35 @@ fn has_word(haystack: &str, word: &str) -> bool {
     false
 }
 
+/// Whether a parameter names an attribute column of one of the tool's dataset
+/// inputs rather than carrying a value of its own: `field`, `fields`,
+/// `attribute` or `attributes`, either as the whole name or as the last
+/// `_`-separated segment (`dissolve_field`, `one_way_field`,
+/// `auxiliary_fields`).
+///
+/// Like `looks_like_expression` this is matched on the name, and for the same
+/// reason it has to run before every other heuristic: a column parameter's
+/// description describes the *data it indexes*, not the value the user types.
+/// `dissolve_field` ("Optional attribute field used to dissolve polygons within
+/// groups") read as a polygon layer to open, `one_way_field` ("Optional line
+/// field marking one-way digitized edges (supports FT/TF/B plus legacy boolean
+/// values)") read as a checkbox, and `class_field` ("Class label field in
+/// training CSV") read as a CSV file to pick -- 54 params across 28 tools, none
+/// of which the runner can do anything with but a column name
+/// (opengeos/GeoLibre#1977).
+///
+/// This only ever reaches a param the tool ships no explicit schema for, so a
+/// field-named param that genuinely is not a column keeps its declared type:
+/// `feature_to_line.attributes` (a bool) and `cul_de_sac_masks.attributes` (an
+/// `ids_only`/`all` enum) both carry explicit schemas and are untouched.
+fn looks_like_attribute_field(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    matches!(
+        n.rsplit('_').next().unwrap_or_default(),
+        "field" | "fields" | "attribute" | "attributes"
+    )
+}
+
 /// Whether a parameter holds a free-text expression, statement, or formula that
 /// the user types (an attribute query, a field-calculator formula, a LiDAR
 /// filter clause). Matched on the parameter name, which is unambiguous here.
@@ -795,6 +824,9 @@ fn infer_data_kind(name: &str, description: &str, role: &ToolIoRole) -> ToolData
 /// ship no explicit schema. Inputs may be enumerated choice lists (rendered as a
 /// dropdown); everything else routes through dataset/scalar/string inference.
 fn infer_param_schema(name: &str, description: &str) -> ToolParamSchema {
+    if looks_like_attribute_field(name) {
+        return ToolParamSchema::String;
+    }
     if looks_like_output_param(name, description) {
         let kind = infer_data_kind(name, description, &ToolIoRole::Output);
         return schema_from_role_and_kind(Some(ToolIoRole::Output), kind)
@@ -1687,6 +1719,66 @@ mod tests {
                 schema_for(n, d)
             );
         }
+    }
+
+    #[test]
+    fn attribute_field_params_stay_strings() {
+        // A `*_field`/`*_attribute` param names a column of one of the tool's
+        // dataset inputs, so it is a string the user types (or picks from the
+        // layer's columns), never a file to open or a checkbox. Its description
+        // describes the data it indexes, which is what misled the dataset and
+        // bool heuristics. Regression for GeoLibre #1977.
+        for (n, d) in [
+            // dissolve.dissolve_field -> was a vector input ("polygons").
+            (
+                "dissolve_field",
+                "Optional attribute field used to dissolve polygons within groups; if omitted, dissolves all polygons.",
+            ),
+            // join_tables.primary_key_field -> was a vector input.
+            ("primary_key_field", "Primary key field in the input vector layer."),
+            // shortest_path_network.one_way_field -> was a bool checkbox.
+            (
+                "one_way_field",
+                "Optional line field marking one-way digitized edges (supports FT/TF/B plus legacy boolean values).",
+            ),
+            // classify_objects_svm.class_field -> was a CSV file picker.
+            ("class_field", "Class label field in training CSV."),
+            // ordinary_cokriging.auxiliary_fields -> was a raster input.
+            (
+                "auxiliary_fields",
+                "Comma-separated field names for auxiliary variables (empty for rasters)",
+            ),
+            // vector_points_to_raster.field -> was a raster input.
+            ("field", "Optional numeric field used for raster values. Defaults to FID."),
+            // route_event_points_from_layer.measure_field, with a numeric-sounding
+            // description that would otherwise read as a scalar.
+            ("measure_field", "Measure field holding the route distance (default 0.0)."),
+        ] {
+            assert!(
+                matches!(schema_for(n, d), ToolParamSchema::String),
+                "{n}: {d:?} -> {:?}",
+                schema_for(n, d)
+            );
+        }
+    }
+
+    #[test]
+    fn non_field_names_are_unaffected_by_the_field_rule() {
+        // The rule keys off the last `_`-separated segment, so a param that only
+        // mentions a field in prose, or embeds "field" mid-name, keeps its own
+        // inferred type.
+        assert!(matches!(
+            schema_for("input", "Input vector layer whose fields are summarized."),
+            ToolParamSchema::Input(ToolInputSchema { dataset: ToolDatasetSchema::Vector { .. }, .. })
+        ));
+        assert!(matches!(
+            schema_for("field_type", "Output field type: float, integer, text."),
+            ToolParamSchema::Enum(_)
+        ));
+        assert!(matches!(
+            schema_for("airfield", "Input airfield raster."),
+            ToolParamSchema::Input(ToolInputSchema { dataset: ToolDatasetSchema::Raster, .. })
+        ));
     }
 
     #[test]

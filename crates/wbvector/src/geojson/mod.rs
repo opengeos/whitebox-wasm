@@ -130,9 +130,30 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Reads the four hex digits of a `\u` escape, leaving `pos` after them.
+    fn parse_hex4(&mut self) -> Result<u32> {
+        if self.pos + 4 > self.src.len() {
+            return Err(self.err("truncated \\u escape"));
+        }
+        let hex = std::str::from_utf8(&self.src[self.pos..self.pos + 4])
+            .map_err(|_| self.err("invalid \\u escape"))?;
+        let cp = u32::from_str_radix(hex, 16).map_err(|_| self.err("invalid \\u codepoint"))?;
+        self.pos += 4;
+        Ok(cp)
+    }
+
+    /// Parses a JSON string. The source is UTF-8, so unescaped bytes are copied
+    /// through verbatim and decoded once at the end: pushing each byte as a
+    /// `char` would read it as a Latin-1 code point and re-encode it, turning
+    /// every non-ASCII character into mojibake ("Céréales" -> "CÃ©rÃ©ales") in
+    /// every property value and key a tool reads (opengeos/GeoLibre#1977).
     fn parse_string(&mut self) -> Result<String> {
         self.eat(b'"')?;
-        let mut s = String::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut push_char = |buf: &mut Vec<u8>, ch: char| {
+            let mut utf8 = [0u8; 4];
+            buf.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
+        };
         loop {
             match self.peek() {
                 None        => return Err(self.err("unterminated string")),
@@ -140,33 +161,45 @@ impl<'a> Parser<'a> {
                 Some(b'\\') => {
                     self.pos += 1;
                     match self.peek() {
-                        Some(b'"')  => { s.push('"');   self.pos += 1; }
-                        Some(b'\\') => { s.push('\\');  self.pos += 1; }
-                        Some(b'/')  => { s.push('/');   self.pos += 1; }
-                        Some(b'n')  => { s.push('\n');  self.pos += 1; }
-                        Some(b'r')  => { s.push('\r');  self.pos += 1; }
-                        Some(b't')  => { s.push('\t');  self.pos += 1; }
-                        Some(b'b')  => { s.push('\x08'); self.pos += 1; }
-                        Some(b'f')  => { s.push('\x0C'); self.pos += 1; }
+                        Some(b'"')  => { buf.push(b'"');  self.pos += 1; }
+                        Some(b'\\') => { buf.push(b'\\'); self.pos += 1; }
+                        Some(b'/')  => { buf.push(b'/');  self.pos += 1; }
+                        Some(b'n')  => { buf.push(b'\n'); self.pos += 1; }
+                        Some(b'r')  => { buf.push(b'\r'); self.pos += 1; }
+                        Some(b't')  => { buf.push(b'\t'); self.pos += 1; }
+                        Some(b'b')  => { buf.push(0x08);  self.pos += 1; }
+                        Some(b'f')  => { buf.push(0x0C);  self.pos += 1; }
                         Some(b'u')  => {
                             self.pos += 1;
-                            if self.pos + 4 > self.src.len() {
-                                return Err(self.err("truncated \\u escape"));
-                            }
-                            let hex = std::str::from_utf8(&self.src[self.pos..self.pos+4])
-                                .map_err(|_| self.err("invalid \\u escape"))?;
-                            let cp = u32::from_str_radix(hex, 16)
-                                .map_err(|_| self.err("invalid \\u codepoint"))?;
-                            if let Some(ch) = char::from_u32(cp) { s.push(ch); }
-                            self.pos += 4;
+                            let cp = self.parse_hex4()?;
+                            // A character outside the BMP is escaped as a
+                            // surrogate pair; decoding the halves separately
+                            // yields two unpaired surrogates, which are not
+                            // characters, so the whole escape would be dropped.
+                            let cp = if (0xD800..0xDC00).contains(&cp)
+                                && self.src[self.pos..].starts_with(b"\\u")
+                            {
+                                let here = self.pos;
+                                self.pos += 2;
+                                let low = self.parse_hex4()?;
+                                if (0xDC00..0xE000).contains(&low) {
+                                    0x1_0000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+                                } else {
+                                    self.pos = here; // not a pair after all
+                                    cp
+                                }
+                            } else {
+                                cp
+                            };
+                            if let Some(ch) = char::from_u32(cp) { push_char(&mut buf, ch); }
                         }
-                        _ => s.push('\\'),
+                        _ => buf.push(b'\\'),
                     }
                 }
-                Some(b) => { s.push(b as char); self.pos += 1; }
+                Some(b) => { buf.push(b); self.pos += 1; }
             }
         }
-        Ok(s)
+        String::from_utf8(buf).map_err(|_| self.err("invalid UTF-8 in string"))
     }
 
     fn parse_number(&mut self) -> Result<Jv> {

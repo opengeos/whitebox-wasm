@@ -3655,6 +3655,31 @@ where
             }
             Ok(crs)
         }
+        LidarFormat::Copc => {
+            let las_file = File::open(path).map_err(|e| {
+                ToolError::Execution(format!("failed opening '{label}' lidar '{}': {e}", path.display()))
+            })?;
+            let las_reader = wblidar::las::LasReader::new(BufReader::new(las_file)).map_err(|e| {
+                ToolError::Execution(format!("failed reading '{label}' lidar '{}': {e}", path.display()))
+            })?;
+            let crs = las_reader.crs().cloned();
+            let file = File::open(path).map_err(|e| {
+                ToolError::Execution(format!("failed opening '{label}' lidar '{}': {e}", path.display()))
+            })?;
+            let mut reader = wblidar::copc::CopcReader::new(BufReader::new(file)).map_err(|e| {
+                ToolError::Execution(format!("failed reading '{label}' lidar '{}': {e}", path.display()))
+            })?;
+            for key in reader.data_node_keys() {
+                let mut node_points = Vec::new();
+                reader.read_node(key, &mut node_points).map_err(|e| {
+                    ToolError::Execution(format!("failed streaming '{label}' lidar '{}': {e}", path.display()))
+                })?;
+                for point in &node_points {
+                    visit(point);
+                }
+            }
+            Ok(crs)
+        }
         _ => {
             let cloud = PointCloud::read(path).map_err(|e| {
                 ToolError::Execution(format!("failed reading '{label}' lidar '{}': {e}", path.display()))
@@ -9723,19 +9748,26 @@ impl Tool for ClipLidarToPolygonTool {
         let output_path = parse_optional_output_path(args, "output")?;
 
         ctx.progress.info("reading input lidar and polygons");
-        let cloud = load_lidar_cloud(Path::new(&input_path), "input")?;
         let polys = read_prepared_polygons(&poly_path)?;
 
-        let points: Vec<PointRecord> = cloud
-            .points
-            .par_iter()
-            .filter(|p| point_in_any_prepared_polygon(p.x, p.y, &polys))
-            .copied()
-            .collect();
+        let input = Path::new(&input_path);
+        let (points, crs) = if lidar_memory_store::lidar_is_memory_path(&input_path) {
+            let cloud = load_lidar_cloud(input, "input")?;
+            let points = cloud.points.par_iter()
+                .filter(|p| point_in_any_prepared_polygon(p.x, p.y, &polys))
+                .copied().collect();
+            (points, cloud.crs)
+        } else {
+            let mut points = Vec::new();
+            let crs = stream_disk_lidar_points(input, "input", |p| {
+                if point_in_any_prepared_polygon(p.x, p.y, &polys) { points.push(*p); }
+            })?;
+            (points, crs)
+        };
 
         let out_cloud = PointCloud {
             points,
-            crs: cloud.crs.clone(),
+            crs,
         };
         let locator = store_or_write_lidar_output(&out_cloud, output_path, "clip_lidar_to_polygon")?;
         ctx.progress.progress(1.0);
@@ -9772,19 +9804,26 @@ impl Tool for ErasePolygonFromLidarTool {
         let output_path = parse_optional_output_path(args, "output")?;
 
         ctx.progress.info("reading input lidar and polygons");
-        let cloud = load_lidar_cloud(Path::new(&input_path), "input")?;
         let polys = read_prepared_polygons(&poly_path)?;
 
-        let points: Vec<PointRecord> = cloud
-            .points
-            .par_iter()
-            .filter(|p| !point_in_any_prepared_polygon(p.x, p.y, &polys))
-            .copied()
-            .collect();
+        let input = Path::new(&input_path);
+        let (points, crs) = if lidar_memory_store::lidar_is_memory_path(&input_path) {
+            let cloud = load_lidar_cloud(input, "input")?;
+            let points = cloud.points.par_iter()
+                .filter(|p| !point_in_any_prepared_polygon(p.x, p.y, &polys))
+                .copied().collect();
+            (points, cloud.crs)
+        } else {
+            let mut points = Vec::new();
+            let crs = stream_disk_lidar_points(input, "input", |p| {
+                if !point_in_any_prepared_polygon(p.x, p.y, &polys) { points.push(*p); }
+            })?;
+            (points, crs)
+        };
 
         let out_cloud = PointCloud {
             points,
-            crs: cloud.crs.clone(),
+            crs,
         };
         let locator = store_or_write_lidar_output(&out_cloud, output_path, "erase_polygon_from_lidar")?;
         ctx.progress.progress(1.0);
@@ -14762,6 +14801,36 @@ mod tests {
             out.points.iter().all(|p| p.classification != 5),
             "filtered output still contains excluded class 5"
         );
+    }
+
+    #[test]
+    fn stream_disk_lidar_points_reads_copc_node_by_node() {
+        let cloud = make_test_point_cloud();
+        let mut expected = cloud.points.clone();
+        let path = std::env::temp_dir().join(format!(
+            "wbtools_stream_copc_{}_{}.copc.laz",
+            std::process::id(),
+            expected.len()
+        ));
+        PointCloud::write(&cloud, &path).expect("failed writing COPC fixture");
+
+        let mut actual = Vec::new();
+        let crs = stream_disk_lidar_points(&path, "test", |point| actual.push(*point))
+            .expect("failed streaming COPC fixture");
+
+        std::fs::remove_file(&path).ok();
+        assert_eq!(actual.len(), expected.len());
+        assert_eq!(crs.and_then(|value| value.epsg), Some(32617));
+        let order = |a: &PointRecord, b: &PointRecord| {
+            a.x.total_cmp(&b.x).then_with(|| a.y.total_cmp(&b.y))
+        };
+        actual.sort_by(order);
+        expected.sort_by(order);
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert!((actual.x - expected.x).abs() < 1.0e-9);
+            assert!((actual.y - expected.y).abs() < 1.0e-9);
+            assert!((actual.z - expected.z).abs() < 1.0e-9);
+        }
     }
 
 }

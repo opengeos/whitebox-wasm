@@ -9,7 +9,7 @@ use std::path::Path;
 use super::compression;
 use super::error::{GeoTiffError, Result};
 use super::geo_keys::GeoKeyDirectory;
-use super::ifd::{Ifd, IfdValue, TiffReader};
+use super::ifd::{ByteOrder, Ifd, IfdValue, TiffReader};
 use super::tags::{tag, Compression, PhotometricInterpretation, PlanarConfig, SampleFormat};
 use super::types::{BoundingBox, GeoTransform};
 
@@ -112,6 +112,10 @@ pub struct GeoTiff {
     value_transform: Option<ValueTransform>,
     /// True if the source file was BigTIFF (64-bit offsets).
     pub is_bigtiff: bool,
+    /// The file's declared byte order ("II" or "MM"). Sample bytes are stored
+    /// in it just as the IFD values are, so every read that turns bytes into
+    /// numbers has to honor it.
+    byte_order: ByteOrder,
     /// The raw bytes of the file, loaded fully into memory for random access.
     data: Vec<u8>,
 }
@@ -146,12 +150,21 @@ impl GeoTiff {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut tiff = TiffReader::new(std::io::Cursor::new(bytes))?;
         let is_bigtiff = tiff.variant.is_bigtiff();
+        let byte_order = tiff.byte_order;
         let ifd = tiff.read_ifd(tiff.first_ifd_offset)?;
         let info = Self::parse_image_info(&ifd)?;
         let geo_transform = Self::parse_geo_transform(&ifd);
         let geo_keys = Self::parse_geo_keys(&ifd)?;
         let value_transform = Self::parse_value_transform(&ifd);
-        Ok(Self { info, geo_transform, geo_keys, value_transform, is_bigtiff, data: bytes.to_vec() })
+        Ok(Self {
+            info,
+            geo_transform,
+            geo_keys,
+            value_transform,
+            is_bigtiff,
+            byte_order,
+            data: bytes.to_vec(),
+        })
     }
 
     /// Parse only the header metadata of a GeoTIFF without retaining any pixel
@@ -184,6 +197,7 @@ impl GeoTiff {
     pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
         let mut tiff = TiffReader::new(reader)?;
         let is_bigtiff = tiff.variant.is_bigtiff();
+        let byte_order = tiff.byte_order;
 
         // Load entire file into memory for fast random access during tile/strip reads
         tiff.inner_mut().seek(std::io::SeekFrom::Start(0)).map_err(GeoTiffError::Io)?;
@@ -198,7 +212,7 @@ impl GeoTiff {
         let geo_keys = Self::parse_geo_keys(&ifd)?;
         let value_transform = Self::parse_value_transform(&ifd);
 
-        Ok(Self { info, geo_transform, geo_keys, value_transform, is_bigtiff, data })
+        Ok(Self { info, geo_transform, geo_keys, value_transform, is_bigtiff, byte_order, data })
     }
 
     // ── IFD parsing helpers ───────────────────────────────────────────────────
@@ -499,6 +513,9 @@ impl GeoTiff {
     /// No-data value (if set via GDAL NODATA tag).
     pub fn no_data(&self) -> Option<f64> { self.info.no_data }
 
+    /// The byte order declared by the file header (`II` or `MM`).
+    pub fn byte_order(&self) -> ByteOrder { self.byte_order }
+
     /// The affine geo-transform, if present.
     pub fn geo_transform(&self) -> Option<&GeoTransform> { self.geo_transform.as_ref() }
 
@@ -566,8 +583,9 @@ impl GeoTiff {
     pub fn read_band_u16(&self, band: usize) -> Result<Vec<u16>> {
         self.validate_sample_type(SampleFormat::Uint, 16)?;
         let bytes = self.read_band_bytes(band)?;
+        let bo = self.byte_order;
         Ok(bytes.chunks_exact(2)
-            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .map(|c| bo.read_u16(c.try_into().unwrap()))
             .collect())
     }
 
@@ -575,8 +593,9 @@ impl GeoTiff {
     pub fn read_band_u32(&self, band: usize) -> Result<Vec<u32>> {
         self.validate_sample_type(SampleFormat::Uint, 32)?;
         let bytes = self.read_band_bytes(band)?;
+        let bo = self.byte_order;
         Ok(bytes.chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .map(|c| bo.read_u32(c.try_into().unwrap()))
             .collect())
     }
 
@@ -584,8 +603,9 @@ impl GeoTiff {
     pub fn read_band_u64(&self, band: usize) -> Result<Vec<u64>> {
         self.validate_sample_type(SampleFormat::Uint, 64)?;
         let bytes = self.read_band_bytes(band)?;
+        let bo = self.byte_order;
         Ok(bytes.chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .map(|c| bo.read_u64(c.try_into().unwrap()))
             .collect())
     }
 
@@ -600,8 +620,9 @@ impl GeoTiff {
     pub fn read_band_i16(&self, band: usize) -> Result<Vec<i16>> {
         self.validate_sample_type(SampleFormat::Int, 16)?;
         let bytes = self.read_band_bytes(band)?;
+        let bo = self.byte_order;
         Ok(bytes.chunks_exact(2)
-            .map(|c| i16::from_le_bytes(c.try_into().unwrap()))
+            .map(|c| bo.read_i16(c.try_into().unwrap()))
             .collect())
     }
 
@@ -609,8 +630,9 @@ impl GeoTiff {
     pub fn read_band_i32(&self, band: usize) -> Result<Vec<i32>> {
         self.validate_sample_type(SampleFormat::Int, 32)?;
         let bytes = self.read_band_bytes(band)?;
+        let bo = self.byte_order;
         Ok(bytes.chunks_exact(4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .map(|c| bo.read_i32(c.try_into().unwrap()))
             .collect())
     }
 
@@ -618,8 +640,9 @@ impl GeoTiff {
     pub fn read_band_i64(&self, band: usize) -> Result<Vec<i64>> {
         self.validate_sample_type(SampleFormat::Int, 64)?;
         let bytes = self.read_band_bytes(band)?;
+        let bo = self.byte_order;
         Ok(bytes.chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .map(|c| bo.read_i64(c.try_into().unwrap()))
             .collect())
     }
 
@@ -627,8 +650,9 @@ impl GeoTiff {
     pub fn read_band_f32(&self, band: usize) -> Result<Vec<f32>> {
         self.validate_sample_type(SampleFormat::IeeeFloat, 32)?;
         let bytes = self.read_band_bytes(band)?;
+        let bo = self.byte_order;
         Ok(bytes.chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .map(|c| bo.read_f32(c.try_into().unwrap()))
             .collect())
     }
 
@@ -636,8 +660,9 @@ impl GeoTiff {
     pub fn read_band_f64(&self, band: usize) -> Result<Vec<f64>> {
         self.validate_sample_type(SampleFormat::IeeeFloat, 64)?;
         let bytes = self.read_band_bytes(band)?;
+        let bo = self.byte_order;
         Ok(bytes.chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .map(|c| bo.read_f64(c.try_into().unwrap()))
             .collect())
     }
 
@@ -648,8 +673,9 @@ impl GeoTiff {
         let bps = self.info.bytes_per_sample();
         let sf = self.info.sample_format;
 
+        let bo = self.byte_order;
         raw.chunks_exact(bps)
-            .map(|c| sample_to_f64(c, sf))
+            .map(|c| sample_to_f64(c, sf, bo))
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| GeoTiffError::UnsupportedSampleFormat {
                 bits_per_sample: self.info.bits_per_sample,
@@ -709,6 +735,7 @@ impl GeoTiff {
                         strip_rows,
                         pred_spp,
                         self.info.bytes_per_sample(),
+                        self.byte_order,
                     )?;
                     out.extend_from_slice(&decompressed[..decompressed.len().min(expected_strip)]);
                 }
@@ -750,6 +777,7 @@ impl GeoTiff {
                             th,
                             pred_spp,
                             bps,
+                            self.byte_order,
                         )?;
 
                         // Copy tile into the output buffer, clipping at image edges
@@ -833,6 +861,9 @@ pub struct CogLevel {
     /// Private and read only by the decoder so adding it stays a non-breaking
     /// change for downstream code that constructs or destructures `CogLevel`.
     predictor: u16,
+    /// The file's declared byte order, which its tile samples are stored in.
+    /// Private for the same reason as `predictor`.
+    byte_order: ByteOrder,
 }
 
 impl CogLevel {
@@ -864,10 +895,11 @@ impl CogLevel {
             self.tile_height as usize,
             spp,
             bps,
+            self.byte_order,
         )?;
         let mut out = Vec::with_capacity(raw / bps.max(1));
         for chunk in decompressed.chunks_exact(bps.max(1)) {
-            out.push(sample_to_f64(chunk, self.sample_format).unwrap_or(f64::NAN));
+            out.push(sample_to_f64(chunk, self.sample_format, self.byte_order).unwrap_or(f64::NAN));
         }
         Ok(out)
     }
@@ -1037,6 +1069,7 @@ impl GeoTiff {
                         sample_format: info.sample_format,
                         compression: info.compression,
                         predictor: info.predictor,
+                        byte_order: tiff.byte_order,
                     });
                 }
                 ImageLayout::Stripped { .. } => {
@@ -1057,18 +1090,18 @@ impl GeoTiff {
 
 // ── Helper: sample byte → f64 ─────────────────────────────────────────────────
 
-fn sample_to_f64(bytes: &[u8], fmt: SampleFormat) -> Option<f64> {
+fn sample_to_f64(bytes: &[u8], fmt: SampleFormat, bo: ByteOrder) -> Option<f64> {
     Some(match (fmt, bytes.len()) {
         (SampleFormat::Uint, 1) => bytes[0] as f64,
-        (SampleFormat::Uint, 2) => u16::from_le_bytes(bytes.try_into().ok()?) as f64,
-        (SampleFormat::Uint, 4) => u32::from_le_bytes(bytes.try_into().ok()?) as f64,
-        (SampleFormat::Uint, 8) => u64::from_le_bytes(bytes.try_into().ok()?) as f64,
+        (SampleFormat::Uint, 2) => bo.read_u16(bytes.try_into().ok()?) as f64,
+        (SampleFormat::Uint, 4) => bo.read_u32(bytes.try_into().ok()?) as f64,
+        (SampleFormat::Uint, 8) => bo.read_u64(bytes.try_into().ok()?) as f64,
         (SampleFormat::Int, 1) => bytes[0] as i8 as f64,
-        (SampleFormat::Int, 2) => i16::from_le_bytes(bytes.try_into().ok()?) as f64,
-        (SampleFormat::Int, 4) => i32::from_le_bytes(bytes.try_into().ok()?) as f64,
-        (SampleFormat::Int, 8) => i64::from_le_bytes(bytes.try_into().ok()?) as f64,
-        (SampleFormat::IeeeFloat, 4) => f32::from_le_bytes(bytes.try_into().ok()?) as f64,
-        (SampleFormat::IeeeFloat, 8) => f64::from_le_bytes(bytes.try_into().ok()?),
+        (SampleFormat::Int, 2) => bo.read_i16(bytes.try_into().ok()?) as f64,
+        (SampleFormat::Int, 4) => bo.read_i32(bytes.try_into().ok()?) as f64,
+        (SampleFormat::Int, 8) => bo.read_i64(bytes.try_into().ok()?) as f64,
+        (SampleFormat::IeeeFloat, 4) => bo.read_f32(bytes.try_into().ok()?) as f64,
+        (SampleFormat::IeeeFloat, 8) => bo.read_f64(bytes.try_into().ok()?),
         _ => return None,
     })
 }
@@ -1535,5 +1568,134 @@ mod tests {
         let layout = GeoTiff::parse_cog_layout(&buf).unwrap();
         assert_eq!(layout.levels.len(), 1);
         assert_eq!(layout.levels[0].width, 512);
+    }
+
+    /// Build a minimal classic big-endian ("MM") TIFF: one uncompressed strip
+    /// holding `sample_bytes` (already in big-endian order), a
+    /// `GDAL_NODATA` tag, and nothing else.
+    ///
+    /// Motorola TIFFs are rare from GDAL (which only writes `II`) but geotiff.js
+    /// emits them for every file it writes, and `GeoTiffWriter` only writes
+    /// little-endian, so the fixture has to be assembled by hand.
+    fn make_big_endian_tiff(
+        width: u32,
+        height: u32,
+        bits_per_sample: u16,
+        sample_format: SampleFormat,
+        sample_bytes: &[u8],
+        nodata: &str,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"MM");
+        out.extend_from_slice(&42u16.to_be_bytes());
+        let ifd_offset_at = out.len();
+        out.extend_from_slice(&0u32.to_be_bytes()); // patched once the IFD is placed
+
+        let strip_offset = out.len() as u32;
+        out.extend_from_slice(sample_bytes);
+
+        let nodata_offset = out.len() as u32;
+        out.extend_from_slice(nodata.as_bytes());
+        out.push(0); // TIFF ASCII fields are NUL-terminated
+        if out.len() % 2 == 1 {
+            out.push(0);
+        }
+
+        let ifd_offset = out.len() as u32;
+        out[ifd_offset_at..ifd_offset_at + 4].copy_from_slice(&ifd_offset.to_be_bytes());
+
+        // A SHORT that fits inline sits in the FIRST two bytes of the 4-byte
+        // value field in a big-endian file, not the last.
+        let short = |code: u16, value: u16| -> Vec<u8> {
+            let mut e = Vec::with_capacity(12);
+            e.extend_from_slice(&code.to_be_bytes());
+            e.extend_from_slice(&3u16.to_be_bytes()); // SHORT
+            e.extend_from_slice(&1u32.to_be_bytes());
+            e.extend_from_slice(&value.to_be_bytes());
+            e.extend_from_slice(&[0, 0]);
+            e
+        };
+        let long = |code: u16, value: u32| -> Vec<u8> {
+            let mut e = Vec::with_capacity(12);
+            e.extend_from_slice(&code.to_be_bytes());
+            e.extend_from_slice(&4u16.to_be_bytes()); // LONG
+            e.extend_from_slice(&1u32.to_be_bytes());
+            e.extend_from_slice(&value.to_be_bytes());
+            e
+        };
+        let ascii = |code: u16, count: u32, offset: u32| -> Vec<u8> {
+            let mut e = Vec::with_capacity(12);
+            e.extend_from_slice(&code.to_be_bytes());
+            e.extend_from_slice(&2u16.to_be_bytes()); // ASCII
+            e.extend_from_slice(&count.to_be_bytes());
+            e.extend_from_slice(&offset.to_be_bytes());
+            e
+        };
+
+        // Entries must be written in ascending tag order.
+        let entries = vec![
+            long(tag::ImageWidth, width),
+            long(tag::ImageLength, height),
+            short(tag::BitsPerSample, bits_per_sample),
+            short(tag::Compression, 1), // none
+            short(tag::PhotometricInterpretation, 1), // min-is-black
+            long(tag::StripOffsets, strip_offset),
+            short(tag::SamplesPerPixel, 1),
+            long(tag::RowsPerStrip, height),
+            long(tag::StripByteCounts, sample_bytes.len() as u32),
+            short(tag::PlanarConfiguration, 1), // chunky
+            short(tag::SampleFormat, sample_format.tag_value()),
+            ascii(tag::GdalNodata, nodata.len() as u32 + 1, nodata_offset),
+        ];
+        out.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        for entry in entries {
+            out.extend_from_slice(&entry);
+        }
+        out.extend_from_slice(&0u32.to_be_bytes()); // no next IFD
+        out
+    }
+
+    #[test]
+    fn big_endian_float32_samples_are_not_byte_swapped() {
+        // The reporting case (opengeos/GeoLibre#2410): a Float32 raster whose
+        // padding is the -9999 GDAL_NODATA sentinel. Read as little-endian the
+        // sentinel decodes as ~5.5e-39 and no pixel matches `no_data()` any
+        // more, so nothing downstream can mask it.
+        let values: Vec<f32> = vec![-9999.0, 0.5, 1.5, 2.5, 3.5, -9999.0, 5.5, 6.5,
+                                    7.5, 8.5, 9.5, 10.5, 11.5, 12.5, 13.5, 14.5];
+        let mut bytes = Vec::new();
+        for v in &values {
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        let tiff = make_big_endian_tiff(4, 4, 32, SampleFormat::IeeeFloat, &bytes, "-9999");
+
+        let reader = GeoTiff::from_bytes(&tiff).unwrap();
+        assert_eq!(reader.byte_order(), ByteOrder::BigEndian);
+        assert_eq!(reader.no_data(), Some(-9999.0));
+        assert_eq!(reader.read_band_f32(0).unwrap(), values);
+        assert_eq!(
+            reader.read_all_f64().unwrap(),
+            values.iter().map(|v| *v as f64).collect::<Vec<f64>>()
+        );
+        // The sentinel survives as itself, which is what keeps nodata maskable.
+        assert_eq!(reader.read_all_f64().unwrap()[0], reader.no_data().unwrap());
+    }
+
+    #[test]
+    fn big_endian_uint16_samples_are_not_byte_swapped() {
+        // Integer samples go through the same per-type readers, so cover one.
+        let values: Vec<u16> = vec![0, 1, 256, 4095, 65535, 32768, 7, 300, 12];
+        let mut bytes = Vec::new();
+        for v in &values {
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        let tiff = make_big_endian_tiff(3, 3, 16, SampleFormat::Uint, &bytes, "0");
+
+        let reader = GeoTiff::from_bytes(&tiff).unwrap();
+        assert_eq!(reader.read_band_u16(0).unwrap(), values);
+        assert_eq!(
+            reader.read_all_f64().unwrap(),
+            values.iter().map(|v| *v as f64).collect::<Vec<f64>>()
+        );
     }
 }

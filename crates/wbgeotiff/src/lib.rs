@@ -70,7 +70,7 @@ pub use cog::{CogWriter, Resampling};
 pub use tags::Compression;
 pub use error::{GeoTiffError, Result};
 pub use geo_keys::{GeoKeyDirectory, ModelType, RasterType};
-pub use ifd::TiffVariant;
+pub use ifd::{ByteOrder, TiffVariant};
 pub use reader::{CogLayout, CogLevel, GeoTiff, GeoTiffMeta, ValueTransform};
 pub use tags::{PhotometricInterpretation, PlanarConfig, SampleFormat};
 pub use types::GeoTransform;

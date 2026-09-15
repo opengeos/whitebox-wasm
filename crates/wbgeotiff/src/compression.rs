@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 use super::error::{GeoTiffError, Result};
+use super::ifd::ByteOrder;
 use super::tags::Compression;
 use std::io::Cursor;
 
@@ -398,8 +399,13 @@ pub const PREDICTOR_FLOATING_POINT: u16 = 3;
 /// tiled COG pass the full tile geometry (`cols = tile_width`,
 /// `rows = tile_height`); for strips pass the image width and the strip's row
 /// count — the encoder applies the predictor per row across the full (padded)
-/// tile/strip width, so the decode must mirror that. Multi-byte integer samples
-/// are interpreted little-endian, matching the rest of the reader.
+/// tile/strip width, so the decode must mirror that.
+///
+/// `byte_order` is the file's own (`II` or `MM`, from the TIFF header). Both
+/// predictors are byte-order sensitive: horizontal differencing adds whole
+/// multi-byte samples, and the floating-point predictor reassembles each sample
+/// from per-row byte planes. Both must produce samples in the file's byte
+/// order, because that is how the sample readers go on to interpret them.
 ///
 /// Predictor 1 (none) is a no-op. Rows past the bytes actually present (a short
 /// final tile/strip whose codec emitted fewer bytes) are left untouched rather
@@ -411,11 +417,12 @@ pub fn undo_predictor(
     rows: usize,
     spp: usize,
     bps: usize,
+    byte_order: ByteOrder,
 ) -> Result<()> {
     match predictor {
         PREDICTOR_NONE => Ok(()),
-        PREDICTOR_HORIZONTAL => undo_horizontal(buf, cols, rows, spp, bps),
-        PREDICTOR_FLOATING_POINT => undo_floating_point(buf, cols, rows, spp, bps),
+        PREDICTOR_HORIZONTAL => undo_horizontal(buf, cols, rows, spp, bps, byte_order),
+        PREDICTOR_FLOATING_POINT => undo_floating_point(buf, cols, rows, spp, bps, byte_order),
         other => Err(GeoTiffError::CorruptData {
             location: "predictor".into(),
             message: format!("unsupported TIFF Predictor value {other}"),
@@ -430,7 +437,14 @@ fn rows_present(buf_len: usize, rows: usize, row_bytes: usize) -> impl Iterator<
 
 /// Reverse horizontal differencing (Predictor 2) for 1-, 2-, 4-, or 8-byte
 /// integer samples.
-fn undo_horizontal(buf: &mut [u8], cols: usize, rows: usize, spp: usize, bps: usize) -> Result<()> {
+fn undo_horizontal(
+    buf: &mut [u8],
+    cols: usize,
+    rows: usize,
+    spp: usize,
+    bps: usize,
+    byte_order: ByteOrder,
+) -> Result<()> {
     let row_bytes = cols * spp * bps;
     if cols <= 1 || row_bytes == 0 {
         return Ok(());
@@ -446,27 +460,32 @@ fn undo_horizontal(buf: &mut [u8], cols: usize, rows: usize, spp: usize, bps: us
             }
             2 => {
                 for i in spp..samples {
-                    let prev = u16::from_le_bytes([row[(i - spp) * 2], row[(i - spp) * 2 + 1]]);
-                    let cur = u16::from_le_bytes([row[i * 2], row[i * 2 + 1]]);
-                    row[i * 2..i * 2 + 2].copy_from_slice(&cur.wrapping_add(prev).to_le_bytes());
+                    let p = (i - spp) * 2;
+                    let c = i * 2;
+                    let prev = byte_order.read_u16(row[p..p + 2].try_into().unwrap());
+                    let cur = byte_order.read_u16(row[c..c + 2].try_into().unwrap());
+                    row[c..c + 2]
+                        .copy_from_slice(&byte_order.u16_bytes(cur.wrapping_add(prev)));
                 }
             }
             4 => {
                 for i in spp..samples {
                     let p = (i - spp) * 4;
                     let c = i * 4;
-                    let prev = u32::from_le_bytes([row[p], row[p + 1], row[p + 2], row[p + 3]]);
-                    let cur = u32::from_le_bytes([row[c], row[c + 1], row[c + 2], row[c + 3]]);
-                    row[c..c + 4].copy_from_slice(&cur.wrapping_add(prev).to_le_bytes());
+                    let prev = byte_order.read_u32(row[p..p + 4].try_into().unwrap());
+                    let cur = byte_order.read_u32(row[c..c + 4].try_into().unwrap());
+                    row[c..c + 4]
+                        .copy_from_slice(&byte_order.u32_bytes(cur.wrapping_add(prev)));
                 }
             }
             8 => {
                 for i in spp..samples {
                     let p = (i - spp) * 8;
                     let c = i * 8;
-                    let prev = u64::from_le_bytes(row[p..p + 8].try_into().unwrap());
-                    let cur = u64::from_le_bytes(row[c..c + 8].try_into().unwrap());
-                    row[c..c + 8].copy_from_slice(&cur.wrapping_add(prev).to_le_bytes());
+                    let prev = byte_order.read_u64(row[p..p + 8].try_into().unwrap());
+                    let cur = byte_order.read_u64(row[c..c + 8].try_into().unwrap());
+                    row[c..c + 8]
+                        .copy_from_slice(&byte_order.u64_bytes(cur.wrapping_add(prev)));
                 }
             }
             other => {
@@ -484,8 +503,16 @@ fn undo_horizontal(buf: &mut [u8], cols: usize, rows: usize, spp: usize, bps: us
 
 /// Reverse the floating-point predictor (Predictor 3) for 4- or 8-byte float
 /// samples: byte-wise horizontal accumulation followed by de-interleaving the
-/// per-row byte planes back into little-endian samples (TIFF Technical Note 3).
-fn undo_floating_point(buf: &mut [u8], cols: usize, rows: usize, spp: usize, bps: usize) -> Result<()> {
+/// per-row byte planes back into whole samples (TIFF Technical Note 3), in the
+/// file's byte order.
+fn undo_floating_point(
+    buf: &mut [u8],
+    cols: usize,
+    rows: usize,
+    spp: usize,
+    bps: usize,
+    byte_order: ByteOrder,
+) -> Result<()> {
     if bps != 4 && bps != 8 {
         return Err(GeoTiffError::CorruptData {
             location: "predictor".into(),
@@ -506,11 +533,17 @@ fn undo_floating_point(buf: &mut [u8], cols: usize, rows: usize, spp: usize, bps
             row[i] = row[i].wrapping_add(row[i - stride]);
         }
         // 2) De-interleave byte planes. The row is stored most-significant byte
-        //    plane first; reassemble each little-endian sample from its planes.
+        //    plane first, independent of the file's byte order, so reassembling
+        //    a sample walks the planes forwards for a big-endian file (MSB
+        //    first in the sample too) and backwards for a little-endian one.
         plane.copy_from_slice(row);
         for s in 0..samples {
             for byte in 0..bps {
-                row[bps * s + byte] = plane[(bps - byte - 1) * samples + s];
+                let source = match byte_order {
+                    ByteOrder::LittleEndian => bps - byte - 1,
+                    ByteOrder::BigEndian => byte,
+                };
+                row[bps * s + byte] = plane[source * samples + s];
             }
         }
     }
@@ -521,10 +554,13 @@ fn undo_floating_point(buf: &mut [u8], cols: usize, rows: usize, spp: usize, bps
 mod predictor_tests {
     use super::*;
 
+    const LE: ByteOrder = ByteOrder::LittleEndian;
+    const BE: ByteOrder = ByteOrder::BigEndian;
+
     #[test]
     fn none_is_noop() {
         let mut buf = vec![5u8, 3, 9, 1];
-        undo_predictor(&mut buf, PREDICTOR_NONE, 4, 1, 1, 1).unwrap();
+        undo_predictor(&mut buf, PREDICTOR_NONE, 4, 1, 1, 1, LE).unwrap();
         assert_eq!(buf, vec![5, 3, 9, 1]);
     }
 
@@ -533,7 +569,7 @@ mod predictor_tests {
         // Original row [10, 12, 9, 20]; horizontal differences [10, 2, -3, 11]
         // stored as wrapping u8: [10, 2, 253, 11].
         let mut buf = vec![10u8, 2, 253, 11];
-        undo_predictor(&mut buf, PREDICTOR_HORIZONTAL, 4, 1, 1, 1).unwrap();
+        undo_predictor(&mut buf, PREDICTOR_HORIZONTAL, 4, 1, 1, 1, LE).unwrap();
         assert_eq!(buf, vec![10, 12, 9, 20]);
     }
 
@@ -543,7 +579,7 @@ mod predictor_tests {
         // Interleaved: [10,20,30, 15,18,33]; differenced per channel:
         // [10,20,30, 5,-2,3] -> wrapping [10,20,30, 5,254,3].
         let mut buf = vec![10u8, 20, 30, 5, 254, 3];
-        undo_predictor(&mut buf, PREDICTOR_HORIZONTAL, 2, 1, 3, 1).unwrap();
+        undo_predictor(&mut buf, PREDICTOR_HORIZONTAL, 2, 1, 3, 1, LE).unwrap();
         assert_eq!(buf, vec![10, 20, 30, 15, 18, 33]);
     }
 
@@ -552,7 +588,7 @@ mod predictor_tests {
         // Each row differenced independently; row boundary must reset accumulation.
         // Row0 orig [4,7]; diff [4,3]. Row1 orig [200,50]; diff [200, 106] (50-200 mod 256).
         let mut buf = vec![4u8, 3, 200, 106];
-        undo_predictor(&mut buf, PREDICTOR_HORIZONTAL, 2, 2, 1, 1).unwrap();
+        undo_predictor(&mut buf, PREDICTOR_HORIZONTAL, 2, 2, 1, 1, LE).unwrap();
         assert_eq!(buf, vec![4, 7, 200, 50]);
     }
 
@@ -563,7 +599,7 @@ mod predictor_tests {
         for v in [1000u16, 5, (-3i32 as u16)] {
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        undo_predictor(&mut buf, PREDICTOR_HORIZONTAL, 3, 1, 1, 2).unwrap();
+        undo_predictor(&mut buf, PREDICTOR_HORIZONTAL, 3, 1, 1, 2, LE).unwrap();
         let got: Vec<u16> = buf
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -580,7 +616,7 @@ mod predictor_tests {
         for v in [5_000_000_000u64, 7, (-3i64 as u64)] {
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        undo_predictor(&mut buf, PREDICTOR_HORIZONTAL, 3, 1, 1, 8).unwrap();
+        undo_predictor(&mut buf, PREDICTOR_HORIZONTAL, 3, 1, 1, 8, LE).unwrap();
         let got: Vec<u64> = buf
             .chunks_exact(8)
             .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
@@ -592,9 +628,9 @@ mod predictor_tests {
     fn floating_point_f32_roundtrip() {
         // Encode a known f32 row with the fp predictor, then decode and compare.
         let orig = [1.5f32, -2.25, 100.0, 0.125];
-        let encoded = fp_encode_f32_row(&orig);
+        let encoded = fp_encode_f32_row(&orig, LE);
         let mut buf = encoded;
-        undo_predictor(&mut buf, PREDICTOR_FLOATING_POINT, orig.len(), 1, 1, 4).unwrap();
+        undo_predictor(&mut buf, PREDICTOR_FLOATING_POINT, orig.len(), 1, 1, 4, LE).unwrap();
         let got: Vec<f32> = buf
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -602,18 +638,53 @@ mod predictor_tests {
         assert_eq!(got, orig);
     }
 
-    /// Forward floating-point predictor for one row of little-endian f32 samples
+    #[test]
+    fn horizontal_u16_big_endian() {
+        // The same row in a Motorola file. Decoding it as little-endian would
+        // add byte-swapped numbers and produce garbage, so the byte order has
+        // to reach the predictor, not just the sample readers.
+        let mut buf = Vec::new();
+        for v in [1000u16, 5, (-3i32 as u16)] {
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        undo_predictor(&mut buf, PREDICTOR_HORIZONTAL, 3, 1, 1, 2, BE).unwrap();
+        let got: Vec<u16> = buf
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(got, vec![1000, 1005, 1002]);
+    }
+
+    #[test]
+    fn floating_point_f32_roundtrip_big_endian() {
+        // TIFF Technical Note 3 always stores the most significant byte plane
+        // first, so only the reassembly step differs between byte orders.
+        let orig = [1.5f32, -2.25, 100.0, 0.125];
+        let mut buf = fp_encode_f32_row(&orig, BE);
+        undo_predictor(&mut buf, PREDICTOR_FLOATING_POINT, orig.len(), 1, 1, 4, BE).unwrap();
+        let got: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_be_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, orig);
+    }
+
+    /// Forward floating-point predictor for one row of f32 samples in `bo`
     /// (test-only, mirrors the TIFF encoder): interleave byte planes MSB-first,
     /// then byte-wise horizontal difference.
-    fn fp_encode_f32_row(samples: &[f32]) -> Vec<u8> {
+    fn fp_encode_f32_row(samples: &[f32], bo: ByteOrder) -> Vec<u8> {
         let n = samples.len();
         let bps = 4usize;
-        let le: Vec<[u8; 4]> = samples.iter().map(|v| v.to_le_bytes()).collect();
+        let raw: Vec<[u8; 4]> = samples.iter().map(|v| bo.f32_bytes(*v)).collect();
         // Byte-plane interleave, most-significant byte plane first.
         let mut planed = vec![0u8; n * bps];
         for s in 0..n {
             for byte in 0..bps {
-                planed[(bps - byte - 1) * n + s] = le[s][byte];
+                let plane = match bo {
+                    ByteOrder::LittleEndian => bps - byte - 1,
+                    ByteOrder::BigEndian => byte,
+                };
+                planed[plane * n + s] = raw[s][byte];
             }
         }
         // Byte-wise horizontal difference, stride = spp = 1.

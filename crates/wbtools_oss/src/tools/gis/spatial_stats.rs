@@ -3494,7 +3494,7 @@ Applications: Crime hotspot mapping, retail sales concentration, pollution zone 
         ToolManifest {
             id: "getis_ord_gi_star_raster".to_string(),
             display_name: "Getis-Ord Gi* - Raster Output".to_string(),
-            summary: r#"Computes Gi* hotspot/coldspot classifications from points and outputs raster (-1=cold, 0=NS, 1=hot). For hotspot-based analysis.\"#.to_string(),
+            summary: r#"Computes Gi* hotspot/coldspot classifications from points and outputs raster (-1=cold, 0=NS, 1=hot). For hotspot-based analysis."#.to_string(),
             category: ToolCategory::Raster,
             license_tier: LicenseTier::Open,
             params: vec![

@@ -4000,6 +4000,72 @@ fn wkt_import_extracts_epsg_from_wkt2_and_srs_references() {
     );
 }
 
+/// The CRS VLR of a USGS 3DEP COPC tile (CA_NoCAL_Wildfires_B5b_2018): UTM 10N
+/// with a NAVD88 vertical component and no authority on the compound itself.
+const USGS_3DEP_COMPD_CS: &str = concat!(
+    "COMPD_CS[\"NAD83 / UTM zone 10N + NAVD88 height\",",
+    "PROJCS[\"NAD83 / UTM zone 10N\",GEOGCS[\"NAD83\",DATUM[\"North_American_Datum_1983\",",
+    "SPHEROID[\"GRS 1980\",6378137,298.257222101,AUTHORITY[\"EPSG\",\"7019\"]],AUTHORITY[\"EPSG\",\"6269\"]],",
+    "PRIMEM[\"Greenwich\",0,AUTHORITY[\"EPSG\",\"8901\"]],",
+    "UNIT[\"degree\",0.0174532925199433,AUTHORITY[\"EPSG\",\"9122\"]],AUTHORITY[\"EPSG\",\"4269\"]],",
+    "PROJECTION[\"Transverse_Mercator\"],PARAMETER[\"latitude_of_origin\",0],",
+    "PARAMETER[\"central_meridian\",-123],PARAMETER[\"scale_factor\",0.9996],",
+    "PARAMETER[\"false_easting\",500000],PARAMETER[\"false_northing\",0],",
+    "UNIT[\"metre\",1,AUTHORITY[\"EPSG\",\"9001\"]],AXIS[\"Easting\",EAST],AXIS[\"Northing\",NORTH],",
+    "AUTHORITY[\"EPSG\",\"26910\"]],",
+    "VERT_CS[\"NAVD88 height\",VERT_DATUM[\"North American Vertical Datum 1988\",2005,",
+    "AUTHORITY[\"EPSG\",\"5103\"]],UNIT[\"metre\",1,AUTHORITY[\"EPSG\",\"9001\"]],",
+    "AXIS[\"Gravity-related height\",UP],AUTHORITY[\"EPSG\",\"5703\"]]]"
+);
+
+#[test]
+fn compound_wkt1_resolves_to_its_horizontal_epsg() {
+    // The trailing VERT_CS authority (5703) used to win, so every raster gridded
+    // from a 3DEP tile was tagged with a vertical-only CRS and could not be placed.
+    assert_eq!(epsg_from_wkt(USGS_3DEP_COMPD_CS), Some(26910));
+    let report = identify_epsg_from_wkt_report(USGS_3DEP_COMPD_CS, EpsgIdentifyPolicy::Strict)
+        .expect("compound CRS is identified");
+    assert_eq!(report.resolved_code, Some(26910));
+}
+
+#[test]
+fn compound_wkt2_resolves_to_its_horizontal_epsg() {
+    let wkt = concat!(
+        "COMPOUNDCRS[\"WGS 84 / UTM zone 33N + EGM96 height\",",
+        "PROJCRS[\"WGS 84 / UTM zone 33N\",BASEGEOGCRS[\"WGS 84\",ID[\"EPSG\",4326]],",
+        "CONVERSION[\"UTM zone 33N\",ID[\"EPSG\",16033]],ID[\"EPSG\",32633]],",
+        "VERTCRS[\"EGM96 height\",VDATUM[\"EGM96 geoid\"],ID[\"EPSG\",5773]]]"
+    );
+    assert_eq!(epsg_from_wkt(wkt), Some(32633));
+}
+
+#[test]
+fn compound_wkt_without_authorities_is_identified_from_its_horizontal_component() {
+    // No embedded codes at all: the adaptive match runs on the horizontal part.
+    let wkt = concat!(
+        "COMPD_CS[\"WGS 84 / UTM zone 33N + height\",",
+        "PROJCS[\"WGS 84 / UTM zone 33N\",GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",",
+        "SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],",
+        "UNIT[\"degree\",0.0174532925199433]],PROJECTION[\"Transverse_Mercator\"],",
+        "PARAMETER[\"latitude_of_origin\",0],PARAMETER[\"central_meridian\",15],",
+        "PARAMETER[\"scale_factor\",0.9996],PARAMETER[\"false_easting\",500000],",
+        "PARAMETER[\"false_northing\",0],UNIT[\"metre\",1]],",
+        "VERT_CS[\"height\",VERT_DATUM[\"Mean Sea Level\",2005],UNIT[\"metre\",1]]]"
+    );
+    assert_eq!(epsg_from_wkt(wkt), None, "no embedded code to extract");
+    let report = identify_epsg_from_wkt_report(wkt, EpsgIdentifyPolicy::Lenient)
+        .expect("horizontal component is identified");
+    assert_eq!(report.resolved_code, Some(32633));
+}
+
+#[test]
+fn non_compound_wkt_keeps_its_top_level_authority() {
+    // A projected CRS still resolves to its own code, not its inner GEOGCS.
+    let projcs = &USGS_3DEP_COMPD_CS[USGS_3DEP_COMPD_CS.find("PROJCS").unwrap()
+        ..USGS_3DEP_COMPD_CS.find(",VERT_CS").unwrap()];
+    assert_eq!(epsg_from_wkt(projcs), Some(26910));
+}
+
 #[test]
 fn identify_wkt_corpus_lenient_and_strict_modes() {
     let cases = [

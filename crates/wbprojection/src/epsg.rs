@@ -598,7 +598,13 @@ pub fn from_epsg(code: u32) -> Result<Crs> {
 /// identifier markers such as `AUTHORITY["EPSG",4326]`, `ID["EPSG",4326]`,
 /// `EPSG:4326`, URN forms, and common HTTP CRS references. It does not parse
 /// arbitrary WKT projection parameters into a new CRS definition.
+///
+/// For a compound CRS (`COMPD_CS` / `COMPOUNDCRS`) the code of its horizontal
+/// component is returned: that is the CRS a raster or point cloud is laid out
+/// in, and the last authority in the text belongs to the trailing vertical
+/// component (e.g. `NAVD88 height`, EPSG:5703), which places nothing.
 pub fn epsg_from_wkt(wkt: &str) -> Option<u32> {
+    let wkt = compound_horizontal_component(wkt).unwrap_or(wkt);
     extract_epsg_after_marker(wkt, "AUTHORITY[\"EPSG\",")
         .or_else(|| extract_epsg_after_marker(wkt, "ID[\"EPSG\","))
         .or_else(|| {
@@ -728,6 +734,10 @@ pub fn identify_epsg_from_wkt_with_policy(wkt: &str, policy: EpsgIdentifyPolicy)
 
 /// Return a scored identification report for a WKT CRS definition.
 pub fn identify_epsg_from_wkt_report(wkt: &str, policy: EpsgIdentifyPolicy) -> Option<EpsgIdentifyReport> {
+    // A compound CRS is identified by its horizontal component, both for an
+    // embedded authority and for the adaptive match below (which cannot parse
+    // a compound root).
+    let wkt = compound_horizontal_component(wkt).unwrap_or(wkt);
     if let Some(code) = epsg_from_wkt(wkt) {
         return Some(EpsgIdentifyReport {
             resolved_code: Some(code),
@@ -1924,6 +1934,98 @@ pub fn resolve_epsg_with_policy(code: u32, policy: EpsgResolutionPolicy) -> Resu
             "EPSG:{code} is not supported and fallback EPSG:{fallback_code} is also unsupported"
         )))
     }
+}
+
+/// The horizontal component of a compound WKT CRS (`COMPD_CS[...]` in WKT1,
+/// `COMPOUNDCRS[...]` in WKT2), as a slice of `wkt`.
+///
+/// Returns `None` when `wkt` is not a compound CRS or has no horizontal
+/// component. Only components directly under the compound root are considered,
+/// and brackets inside quoted names are ignored.
+fn compound_horizontal_component(wkt: &str) -> Option<&str> {
+    const HORIZONTAL: [&str; 9] = [
+        "PROJCS",
+        "GEOGCS",
+        "GEOCCS",
+        "PROJCRS",
+        "PROJECTEDCRS",
+        "GEOGCRS",
+        "GEOGRAPHICCRS",
+        "GEODCRS",
+        "GEODETICCRS",
+    ];
+    let trimmed = wkt.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    if !(upper.starts_with("COMPD_CS[") || upper.starts_with("COMPOUNDCRS[")) {
+        return None;
+    }
+    let bytes = upper.as_bytes();
+    let mut depth = 0usize;
+    let mut in_quotes = false;
+    // Start of the keyword being read at the current depth, if any.
+    let mut word_start: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_quotes {
+            if b == b'"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_quotes = true,
+            b'[' | b'(' => {
+                if depth == 1 {
+                    if let Some(start) = word_start {
+                        let keyword = upper[start..i].trim();
+                        if HORIZONTAL.contains(&keyword) {
+                            let end = matching_close(bytes, i)?;
+                            return Some(&trimmed[start..=end]);
+                        }
+                    }
+                }
+                depth += 1;
+                word_start = None;
+            }
+            b']' | b')' => {
+                depth = depth.checked_sub(1)?;
+                word_start = None;
+            }
+            b',' => word_start = None,
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                if word_start.is_none() {
+                    word_start = Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Index of the bracket closing the one opened at `open`, skipping quoted text.
+fn matching_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_quotes = false;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        if in_quotes {
+            if b == b'"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_quotes = true,
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn extract_epsg_after_marker(wkt: &str, marker: &str) -> Option<u32> {

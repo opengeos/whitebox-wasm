@@ -1392,6 +1392,45 @@ fn ring_signed_area(points: &[(f64, f64)]) -> f64 {
     area * 0.5
 }
 
+/// Cuts a closed traced ring into simple closed loops wherever it passes
+/// through the same vertex twice, as it does where two cells meet only at a
+/// corner. `key` maps a point to an exact vertex identity.
+///
+/// The trace walks every segment in one direction, so each loop keeps the
+/// ring's winding and stays an exterior or a hole like the ring it came from;
+/// GeoJSON and OGC consumers reject a ring that touches itself, but accept
+/// separate rings that touch at a point.
+fn split_ring_at_repeated_vertices<K: Eq + std::hash::Hash>(
+    points: Vec<(f64, f64)>,
+    key: impl Fn((f64, f64)) -> K,
+) -> Vec<Vec<(f64, f64)>> {
+    let mut loops = Vec::new();
+    let mut stack: Vec<(f64, f64)> = Vec::with_capacity(points.len());
+    let mut position: HashMap<K, usize> = HashMap::new();
+    // The last point repeats the first; it is restored by the final loop.
+    let open = match points.split_last() {
+        Some((last, rest)) if !rest.is_empty() && key(*last) == key(rest[0]) => rest,
+        _ => points.as_slice(),
+    };
+    for &p in open {
+        if let Some(&start) = position.get(&key(p)) {
+            let mut lp: Vec<(f64, f64)> = stack.drain(start..).collect();
+            for q in &lp {
+                position.remove(&key(*q));
+            }
+            lp.push(lp[0]);
+            loops.push(lp);
+        }
+        position.insert(key(p), stack.len());
+        stack.push(p);
+    }
+    if !stack.is_empty() {
+        stack.push(stack[0]);
+        loops.push(stack);
+    }
+    loops
+}
+
 /// A polygon assembled from traced rings: one exterior plus its holes.
 type TracedPolygon = (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>);
 
@@ -5147,14 +5186,24 @@ impl Tool for RasterToVectorPolygonsTool {
             let mut current_node = node;
             let line_start = node;
             let mut points: Vec<(f64, f64)> = Vec::new();
+            let node_point = |n: usize| {
+                if n % 2 == 0 {
+                    segments[n / 2].p1
+                } else {
+                    segments[n / 2].p2
+                }
+            };
+            // Each segment runs clockwise around its cell, so the region is on
+            // its right. A trace that starts at a p1 node walks the segments
+            // backwards (region on the left) and one that starts at a p2 node
+            // walks them forwards (region on the right). Only nodes that keep
+            // that direction may continue the trace: at a corner where two
+            // diagonal cells meet, taking a segment the other way reverses the
+            // ring partway, and its signed area cancels towards zero.
+            let backward = line_start % 2 == 0;
 
             loop {
-                let current_seg = current_node / 2;
-                let p1 = if current_node % 2 == 0 {
-                    segments[current_seg].p1
-                } else {
-                    segments[current_seg].p2
-                };
+                let p1 = node_point(current_node);
                 points.push(p1);
                 node_live[current_node] = false;
 
@@ -5166,7 +5215,10 @@ impl Tool for RasterToVectorPolygonsTool {
                 for hit in &ret {
                     let node_n = *hit.1;
                     let seg_n = node_n / 2;
-                    if segments[seg_n].value as usize == z && node_live[node_n] {
+                    if segments[seg_n].value as usize == z
+                        && node_live[node_n]
+                        && (node_n % 2 == 1) == backward
+                    {
                         connected_nodes.push(node_n);
                     }
                 }
@@ -5186,56 +5238,61 @@ impl Tool for RasterToVectorPolygonsTool {
                         points.push(p_close);
                         break;
                     }
-                } else if connected_nodes.len() == 1 {
-                    current_node = if connected_nodes[0] % 2 == 0 {
-                        connected_nodes[0] + 1
-                    } else {
-                        connected_nodes[0] - 1
-                    };
-                    node_live[connected_nodes[0]] = false;
                 } else {
-                    if points.len() < 2 {
-                        current_node = if connected_nodes[0] % 2 == 0 {
-                            connected_nodes[0] + 1
-                        } else {
-                            connected_nodes[0] - 1
-                        };
-                        node_live[connected_nodes[0]] = false;
-                        continue;
-                    }
-
-                    let p_prev = points[points.len() - 2];
-                    let p_curr = points[points.len() - 1];
-                    let mut best = None;
-                    let mut best_heading = -10.0;
-                    for (n, connected) in connected_nodes.iter().enumerate() {
-                        let seg_n = connected / 2;
-                        let p_next = if connected % 2 == 0 {
-                            segments[seg_n].p2
-                        } else {
-                            segments[seg_n].p1
-                        };
-                        let heading = -((p_next.1 - p_curr.1).atan2(p_next.0 - p_curr.0)
-                            - (p_prev.1 - p_curr.1).atan2(p_prev.0 - p_curr.0));
-                        if heading > best_heading && heading != 0.0 {
-                            best_heading = heading;
-                            best = Some(n);
-                        }
-                    }
-                    if let Some(best_n) = best {
-                        current_node = if connected_nodes[best_n] % 2 == 0 {
-                            connected_nodes[best_n] + 1
-                        } else {
-                            connected_nodes[best_n] - 1
-                        };
-                        node_live[connected_nodes[best_n]] = false;
+                    // Where two diagonal cells meet at a corner there are two
+                    // ways on. Take the sharpest turn towards the region, so
+                    // each cell's loop closes on itself and the loops only
+                    // touch at the corner instead of crossing there.
+                    let chosen = if connected_nodes.len() == 1 {
+                        connected_nodes[0]
                     } else {
+                        // Arriving at the start node, the trace came along the
+                        // start segment from its other end.
+                        let p_prev = if points.len() >= 2 {
+                            points[points.len() - 2]
+                        } else {
+                            node_point(line_start ^ 1)
+                        };
+                        let incoming = (p1.0 - p_prev.0, p1.1 - p_prev.1);
+                        let turn = |n: usize| {
+                            let p_next = node_point(n ^ 1);
+                            let outgoing = (p_next.0 - p1.0, p_next.1 - p1.1);
+                            let cross = incoming.0 * outgoing.1 - incoming.1 * outgoing.0;
+                            let dot = incoming.0 * outgoing.0 + incoming.1 * outgoing.1;
+                            // Left turns are positive; the region is on the
+                            // left when walking backwards.
+                            let angle = cross.atan2(dot);
+                            if backward { angle } else { -angle }
+                        };
+                        *connected_nodes
+                            .iter()
+                            .max_by(|&&a, &&b| turn(a).total_cmp(&turn(b)))
+                            .expect("connected_nodes is not empty")
+                    };
+                    node_live[chosen] = false;
+                    current_node = chosen ^ 1;
+                    // Back at the start: close the ring here, or a start node
+                    // at a corner would carry the trace on into the next loop.
+                    if current_node == line_start {
+                        points.push(node_point(line_start));
                         break;
                     }
                 }
             }
 
-            if points.len() >= 4 {
+            // Every vertex is a cell corner, so its lattice index identifies it
+            // exactly, where the coordinates of one corner reached from two
+            // cells can differ in the last bit.
+            let corner = |p: (f64, f64)| {
+                (
+                    ((p.0 - input.x_min) / input.cell_size_x).round() as i64,
+                    ((p.1 - input.y_min) / input.cell_size_y).round() as i64,
+                )
+            };
+            for mut points in split_ring_at_repeated_vertices(points, corner) {
+                if points.len() < 4 {
+                    continue;
+                }
                 // Remove collinear interior points.
                 let mut i = 1usize;
                 while i + 1 < points.len() {
@@ -7723,6 +7780,76 @@ mod raster_to_vector_polygons_tests {
             assert!(interiors.is_empty());
             assert_eq!(ring_area(exterior), 2.0);
         }
+    }
+
+    /// All rings of a Polygon or MultiPolygon, as (exterior?, ring) pairs.
+    fn rings_of(geom: &Geometry) -> Vec<(bool, &Ring)> {
+        match geom {
+            Geometry::Polygon { exterior, interiors } => {
+                std::iter::once((true, exterior)).chain(interiors.iter().map(|r| (false, r))).collect()
+            }
+            Geometry::MultiPolygon(polys) => polys
+                .iter()
+                .flat_map(|(ext, holes)| std::iter::once((true, ext)).chain(holes.iter().map(|r| (false, r))))
+                .collect(),
+            other => panic!("expected polygonal geometry, got {other:?}"),
+        }
+    }
+
+    /// Exterior area minus hole area, with every ring checked to be simple
+    /// (no repeated vertex, which is how a ring touching itself shows up).
+    fn checked_area(geoms: &[Geometry]) -> f64 {
+        let mut total = 0.0;
+        for geom in geoms {
+            for (is_exterior, ring) in rings_of(geom) {
+                let mut seen: Vec<(f64, f64)> = Vec::new();
+                for c in &ring.0 {
+                    assert!(!seen.contains(&(c.x, c.y)), "ring touches itself at ({}, {}): {ring:?}", c.x, c.y);
+                    seen.push((c.x, c.y));
+                }
+                let area = ring_area(ring);
+                assert!(area > 0.0, "zero-area ring: {ring:?}");
+                total += if is_exterior { area } else { -area };
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn diagonal_cells_become_touching_parts() {
+        // Cells that meet only at a corner used to make one ring that reversed
+        // there, so its area cancelled. Down-right also puts the start node of
+        // the second loop on the shared corner.
+        let o = Some(1.0);
+        for grid in [[[o, None], [None, o]], [[None, o], [o, None]]] {
+            let rows: Vec<&[Option<f64>]> = grid.iter().map(|r| r.as_slice()).collect();
+            let geoms = polygonize(&rows);
+            assert_eq!(geoms.len(), 1, "one clump, one feature");
+            assert_eq!(checked_area(&geoms), 2.0);
+        }
+    }
+
+    #[test]
+    fn diagonal_staircase_keeps_its_area() {
+        let n = 6;
+        let grid: Vec<Vec<Option<f64>>> =
+            (0..n).map(|r| (0..n).map(|c| (r == c).then_some(1.0)).collect()).collect();
+        let rows: Vec<&[Option<f64>]> = grid.iter().map(|r| r.as_slice()).collect();
+        let geoms = polygonize(&rows);
+        assert_eq!(geoms.len(), 1);
+        assert_eq!(checked_area(&geoms), n as f64);
+    }
+
+    #[test]
+    fn hole_pinched_at_a_corner_keeps_its_area() {
+        // Two nodata cells meeting diagonally inside a solid block.
+        let mut grid = block(4, 0);
+        grid[2][2] = None;
+        grid[3][3] = None;
+        let rows: Vec<&[Option<f64>]> = grid.iter().map(|r| r.as_slice()).collect();
+        let geoms = polygonize(&rows);
+        assert_eq!(geoms.len(), 1);
+        assert_eq!(checked_area(&geoms), 14.0);
     }
 
     fn square(x0: f64, y0: f64, s: f64, ccw: bool) -> Vec<(f64, f64)> {

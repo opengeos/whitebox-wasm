@@ -306,7 +306,18 @@ pub fn delaunay_triangulation(points: &[Coord], epsilon: f64) -> DelaunayTriangu
             i = j;
         }
 
-        if dead_since_rebuild > live_count && dead_since_rebuild > 1024 {
+        // Bowyer-Watson replaces every triangle whose circumcircle holds the new
+        // point, and the replaced ones only go dead. Kept forever, they outgrow
+        // the live mesh several times over: a 3.5M-point LiDAR tile pushed this
+        // vector past wasm32's 2 GB allocation limit ("capacity overflow").
+        // Compact them out whenever the index is rebuilt anyway; no triangle id
+        // outlives an iteration except through `tri_index` and `seen_stamp`,
+        // which are rebuilt and reset here.
+        if dead_since_rebuild * 2 > live_count && dead_since_rebuild > 1024 {
+            compact_live_triangles(&mut triangles, &mut alive);
+            seen_stamp.clear();
+            seen_stamp.resize(triangles.len().max(1), 0);
+            stamp = 1;
             tri_index.rebuild(&triangles, &alive);
             dead_since_rebuild = 0;
         }
@@ -331,6 +342,14 @@ pub fn delaunay_triangulation(points: &[Coord], epsilon: f64) -> DelaunayTriangu
         points: unique,
         triangles,
     }
+}
+
+/// Drop dead triangles in place, keeping live ones in their original order.
+fn compact_live_triangles(triangles: &mut Vec<Triangle>, alive: &mut Vec<bool>) {
+    let mut keep = alive.iter();
+    triangles.retain(|_| *keep.next().unwrap_or(&false));
+    alive.clear();
+    alive.resize(triangles.len(), true);
 }
 
 /// Build a Delaunay triangulation after snapping points to a precision model.
@@ -664,4 +683,64 @@ fn point_in_circumcircle(p: Coord, tri: &Triangle, eps: f64) -> bool {
     let dy = p.y - tri.center.y;
     let dist2 = dx * dx + dy * dy;
     dist2 <= tri.radius2 + eps * tri.radius2.max(1.0)
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+
+    /// Deterministic pseudo-random points in the unit square.
+    fn scattered_points(n: usize) -> Vec<Coord> {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        (0..n)
+            .map(|_| Coord {
+                x: next(),
+                y: next(),
+                z: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn large_triangulation_stays_a_valid_delaunay_mesh_after_compaction() {
+        // Large enough that dead triangles are compacted out many times over.
+        let input = scattered_points(30_000);
+        let tri = delaunay_triangulation(&input, 1.0e-12);
+        let n = tri.points.len();
+        assert_eq!(n, input.len(), "no duplicates in the input");
+
+        // Every edge borders one triangle (hull) or two (interior); none more.
+        let mut edge_uses: HashMap<(usize, usize), u8> = HashMap::new();
+        for t in &tri.triangles {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                *edge_uses.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+            }
+        }
+        assert!(edge_uses.values().all(|&uses| uses == 1 || uses == 2));
+        let hull_edges = edge_uses.values().filter(|&&uses| uses == 1).count();
+        // Euler: a triangulation of n points with h on the hull has 2n - h - 2
+        // triangles, so a dropped or duplicated triangle shows up here.
+        assert_eq!(tri.triangles.len(), 2 * n - hull_edges - 2);
+
+        // Empty circumcircle on a sample of triangles, checked against every point.
+        for t in tri.triangles.iter().step_by(97) {
+            let circle = make_triangle(t[0], t[1], t[2], &tri.points, 1.0e-12)
+                .expect("mesh triangles are non-degenerate");
+            for (idx, p) in tri.points.iter().enumerate() {
+                if t.contains(&idx) {
+                    continue;
+                }
+                assert!(
+                    !point_in_circumcircle(*p, &circle, 1.0e-12),
+                    "point {idx} lies inside a circumcircle"
+                );
+            }
+        }
+    }
 }

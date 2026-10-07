@@ -1392,6 +1392,98 @@ fn ring_signed_area(points: &[(f64, f64)]) -> f64 {
     area * 0.5
 }
 
+/// Cuts a closed traced ring into simple closed loops wherever it passes
+/// through the same vertex twice, as it does where two cells meet only at a
+/// corner. `key` maps a point to an exact vertex identity.
+///
+/// The trace walks every segment in one direction, so each loop keeps the
+/// ring's winding and stays an exterior or a hole like the ring it came from;
+/// GeoJSON and OGC consumers reject a ring that touches itself, but accept
+/// separate rings that touch at a point.
+fn split_ring_at_repeated_vertices<K: Eq + std::hash::Hash>(
+    points: Vec<(f64, f64)>,
+    key: impl Fn((f64, f64)) -> K,
+) -> Vec<Vec<(f64, f64)>> {
+    let mut loops = Vec::new();
+    let mut stack: Vec<(f64, f64)> = Vec::with_capacity(points.len());
+    let mut position: HashMap<K, usize> = HashMap::new();
+    // The last point repeats the first; it is restored by the final loop.
+    let open = match points.split_last() {
+        Some((last, rest)) if !rest.is_empty() && key(*last) == key(rest[0]) => rest,
+        _ => points.as_slice(),
+    };
+    for &p in open {
+        if let Some(&start) = position.get(&key(p)) {
+            let mut lp: Vec<(f64, f64)> = stack.drain(start..).collect();
+            for q in &lp {
+                position.remove(&key(*q));
+            }
+            lp.push(lp[0]);
+            loops.push(lp);
+        }
+        position.insert(key(p), stack.len());
+        stack.push(p);
+    }
+    if !stack.is_empty() {
+        stack.push(stack[0]);
+        loops.push(stack);
+    }
+    loops
+}
+
+/// A polygon assembled from traced rings: one exterior plus its holes.
+type TracedPolygon = (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>);
+
+/// Groups the boundary rings traced around one raster clump into polygons.
+///
+/// The tracer winds every exterior one way and every hole the other, but which
+/// way depends on the grid orientation (a south-up raster flips it), so the
+/// absolute sign of a ring's area cannot tell an exterior from a hole. The
+/// ring with the largest absolute area is always an exterior: rings winding the
+/// same way are exteriors too, and rings winding the other way are holes, each
+/// given to the smallest exterior that contains it. Zero-area rings are
+/// dropped. Each ring is used exactly once.
+fn group_traced_rings(rings: &[Vec<(f64, f64)>]) -> Vec<TracedPolygon> {
+    let areas: Vec<f64> = rings.iter().map(|r| ring_signed_area(r)).collect();
+    let Some(largest) = (0..rings.len())
+        .filter(|&i| areas[i] != 0.0)
+        .max_by(|&a, &b| areas[a].abs().total_cmp(&areas[b].abs()))
+    else {
+        return Vec::new();
+    };
+    let exterior_positive = areas[largest] > 0.0;
+
+    let mut polygons: Vec<TracedPolygon> = Vec::new();
+    let mut exterior_areas: Vec<f64> = Vec::new();
+    let mut holes: Vec<&Vec<(f64, f64)>> = Vec::new();
+    for (ring, &area) in rings.iter().zip(&areas) {
+        if area == 0.0 {
+            continue;
+        }
+        if (area > 0.0) == exterior_positive {
+            polygons.push((ring.clone(), Vec::new()));
+            exterior_areas.push(area.abs());
+        } else {
+            holes.push(ring);
+        }
+    }
+
+    for hole in holes {
+        // The midpoint of a hole edge is never on another ring: rings share
+        // corners at diagonal pinches, but never edges.
+        let test_pt = match (hole.first(), hole.get(1)) {
+            (Some(a), Some(b)) => ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5),
+            _ => continue,
+        };
+        let owner = (0..polygons.len())
+            .filter(|&i| point_in_ring(test_pt, &polygons[i].0))
+            .min_by(|&a, &b| exterior_areas[a].total_cmp(&exterior_areas[b]))
+            .unwrap_or(0);
+        polygons[owner].1.push(hole.clone());
+    }
+    polygons
+}
+
 fn point_in_ring(pt: (f64, f64), ring: &[(f64, f64)]) -> bool {
     if ring.len() < 3 {
         return false;
@@ -5094,14 +5186,24 @@ impl Tool for RasterToVectorPolygonsTool {
             let mut current_node = node;
             let line_start = node;
             let mut points: Vec<(f64, f64)> = Vec::new();
+            let node_point = |n: usize| {
+                if n % 2 == 0 {
+                    segments[n / 2].p1
+                } else {
+                    segments[n / 2].p2
+                }
+            };
+            // Each segment runs clockwise around its cell, so the region is on
+            // its right. A trace that starts at a p1 node walks the segments
+            // backwards (region on the left) and one that starts at a p2 node
+            // walks them forwards (region on the right). Only nodes that keep
+            // that direction may continue the trace: at a corner where two
+            // diagonal cells meet, taking a segment the other way reverses the
+            // ring partway, and its signed area cancels towards zero.
+            let backward = line_start % 2 == 0;
 
             loop {
-                let current_seg = current_node / 2;
-                let p1 = if current_node % 2 == 0 {
-                    segments[current_seg].p1
-                } else {
-                    segments[current_seg].p2
-                };
+                let p1 = node_point(current_node);
                 points.push(p1);
                 node_live[current_node] = false;
 
@@ -5113,7 +5215,10 @@ impl Tool for RasterToVectorPolygonsTool {
                 for hit in &ret {
                     let node_n = *hit.1;
                     let seg_n = node_n / 2;
-                    if segments[seg_n].value as usize == z && node_live[node_n] {
+                    if segments[seg_n].value as usize == z
+                        && node_live[node_n]
+                        && (node_n % 2 == 1) == backward
+                    {
                         connected_nodes.push(node_n);
                     }
                 }
@@ -5133,56 +5238,61 @@ impl Tool for RasterToVectorPolygonsTool {
                         points.push(p_close);
                         break;
                     }
-                } else if connected_nodes.len() == 1 {
-                    current_node = if connected_nodes[0] % 2 == 0 {
-                        connected_nodes[0] + 1
-                    } else {
-                        connected_nodes[0] - 1
-                    };
-                    node_live[connected_nodes[0]] = false;
                 } else {
-                    if points.len() < 2 {
-                        current_node = if connected_nodes[0] % 2 == 0 {
-                            connected_nodes[0] + 1
-                        } else {
-                            connected_nodes[0] - 1
-                        };
-                        node_live[connected_nodes[0]] = false;
-                        continue;
-                    }
-
-                    let p_prev = points[points.len() - 2];
-                    let p_curr = points[points.len() - 1];
-                    let mut best = None;
-                    let mut best_heading = -10.0;
-                    for (n, connected) in connected_nodes.iter().enumerate() {
-                        let seg_n = connected / 2;
-                        let p_next = if connected % 2 == 0 {
-                            segments[seg_n].p2
-                        } else {
-                            segments[seg_n].p1
-                        };
-                        let heading = -((p_next.1 - p_curr.1).atan2(p_next.0 - p_curr.0)
-                            - (p_prev.1 - p_curr.1).atan2(p_prev.0 - p_curr.0));
-                        if heading > best_heading && heading != 0.0 {
-                            best_heading = heading;
-                            best = Some(n);
-                        }
-                    }
-                    if let Some(best_n) = best {
-                        current_node = if connected_nodes[best_n] % 2 == 0 {
-                            connected_nodes[best_n] + 1
-                        } else {
-                            connected_nodes[best_n] - 1
-                        };
-                        node_live[connected_nodes[best_n]] = false;
+                    // Where two diagonal cells meet at a corner there are two
+                    // ways on. Take the sharpest turn towards the region, so
+                    // each cell's loop closes on itself and the loops only
+                    // touch at the corner instead of crossing there.
+                    let chosen = if connected_nodes.len() == 1 {
+                        connected_nodes[0]
                     } else {
+                        // Arriving at the start node, the trace came along the
+                        // start segment from its other end.
+                        let p_prev = if points.len() >= 2 {
+                            points[points.len() - 2]
+                        } else {
+                            node_point(line_start ^ 1)
+                        };
+                        let incoming = (p1.0 - p_prev.0, p1.1 - p_prev.1);
+                        let turn = |n: usize| {
+                            let p_next = node_point(n ^ 1);
+                            let outgoing = (p_next.0 - p1.0, p_next.1 - p1.1);
+                            let cross = incoming.0 * outgoing.1 - incoming.1 * outgoing.0;
+                            let dot = incoming.0 * outgoing.0 + incoming.1 * outgoing.1;
+                            // Left turns are positive; the region is on the
+                            // left when walking backwards.
+                            let angle = cross.atan2(dot);
+                            if backward { angle } else { -angle }
+                        };
+                        *connected_nodes
+                            .iter()
+                            .max_by(|&&a, &&b| turn(a).total_cmp(&turn(b)))
+                            .expect("connected_nodes is not empty")
+                    };
+                    node_live[chosen] = false;
+                    current_node = chosen ^ 1;
+                    // Back at the start: close the ring here, or a start node
+                    // at a corner would carry the trace on into the next loop.
+                    if current_node == line_start {
+                        points.push(node_point(line_start));
                         break;
                     }
                 }
             }
 
-            if points.len() >= 4 {
+            // Every vertex is a cell corner, so its lattice index identifies it
+            // exactly, where the coordinates of one corner reached from two
+            // cells can differ in the last bit.
+            let corner = |p: (f64, f64)| {
+                (
+                    ((p.0 - input.x_min) / input.cell_size_x).round() as i64,
+                    ((p.1 - input.y_min) / input.cell_size_y).round() as i64,
+                )
+            };
+            for mut points in split_ring_at_repeated_vertices(points, corner) {
+                if points.len() < 4 {
+                    continue;
+                }
                 // Remove collinear interior points.
                 let mut i = 1usize;
                 while i + 1 < points.len() {
@@ -5219,57 +5329,25 @@ impl Tool for RasterToVectorPolygonsTool {
         let mut next_fid = 1i64;
         let total_clumps = (clump_val as usize).saturating_sub(1).max(1) as f64;
         for clump_id in 1..clump_val as usize {
-            let rings = &rings_by_clump[clump_id];
-            if rings.is_empty() {
+            let polygons = group_traced_rings(&rings_by_clump[clump_id]);
+            if polygons.is_empty() {
                 continue;
             }
 
-            let mut exteriors: Vec<Vec<(f64, f64)>> = Vec::new();
-            let mut holes: Vec<Vec<(f64, f64)>> = Vec::new();
-            for ring in rings {
-                if ring_signed_area(ring) < 0.0 {
-                    exteriors.push(ring.clone());
-                } else {
-                    holes.push(ring.clone());
-                }
-            }
-            if exteriors.is_empty() {
-                exteriors.push(rings[0].clone());
-            }
-
-            let mut hole_groups: Vec<Vec<Vec<(f64, f64)>>> = vec![Vec::new(); exteriors.len()];
-            for hole in holes {
-                let test_pt = hole[0];
-                let mut assigned = false;
-                for (i, ext) in exteriors.iter().enumerate() {
-                    if point_in_ring(test_pt, ext) {
-                        hole_groups[i].push(hole.clone());
-                        assigned = true;
-                        break;
-                    }
-                }
-                if !assigned {
-                    hole_groups[0].push(hole);
-                }
-            }
-
-            let geom = if exteriors.len() == 1 {
+            let geom = if polygons.len() == 1 {
+                let (exterior, holes) = &polygons[0];
                 Geometry::Polygon {
-                    exterior: Ring(normalize_ring(&exteriors[0])),
-                    interiors: hole_groups[0]
-                        .iter()
-                        .map(|r| Ring(normalize_ring(r)))
-                        .collect(),
+                    exterior: Ring(normalize_ring(exterior)),
+                    interiors: holes.iter().map(|r| Ring(normalize_ring(r))).collect(),
                 }
             } else {
                 Geometry::MultiPolygon(
-                    exteriors
+                    polygons
                         .iter()
-                        .enumerate()
-                        .map(|(i, ext)| {
+                        .map(|(exterior, holes)| {
                             (
-                                Ring(normalize_ring(ext)),
-                                hole_groups[i].iter().map(|r| Ring(normalize_ring(r))).collect(),
+                                Ring(normalize_ring(exterior)),
+                                holes.iter().map(|r| Ring(normalize_ring(r))).collect(),
                             )
                         })
                         .collect(),
@@ -7579,5 +7657,235 @@ mod ring_boundary_line_tests {
         let mut parts: Vec<Vec<Coord>> = Vec::new();
         geometry_line_parts(&geom, &mut parts);
         assert_eq!(parts, vec![vec![c(0.0, 0.0), c(1.0, 1.0), c(2.0, 0.0)]]);
+    }
+}
+
+#[cfg(test)]
+mod raster_to_vector_polygons_tests {
+    use super::*;
+    use wbcore::{AllowAllCapabilities, ProgressSink};
+
+    struct NoopProgress;
+    impl ProgressSink for NoopProgress {}
+
+    fn make_ctx() -> ToolContext<'static> {
+        static PROGRESS: NoopProgress = NoopProgress;
+        static CAPS: AllowAllCapabilities = AllowAllCapabilities;
+        ToolContext { progress: &PROGRESS, capabilities: &CAPS }
+    }
+
+    /// Polygonizes a grid (row 0 = north, `None` = nodata) and returns its
+    /// features' geometries.
+    fn polygonize(grid: &[&[Option<f64>]]) -> Vec<Geometry> {
+        let rows = grid.len();
+        let cols = grid[0].len();
+        let mut raster = Raster::new(RasterConfig {
+            rows,
+            cols,
+            bands: 1,
+            nodata: -9999.0,
+            cell_size: 1.0,
+            ..Default::default()
+        });
+        for (r, line) in grid.iter().enumerate() {
+            for (c, v) in line.iter().enumerate() {
+                raster.set(0, r as isize, c as isize, v.unwrap_or(-9999.0)).unwrap();
+            }
+        }
+        // The tool reads its input with `Raster::read`, which takes files only.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let input = std::env::temp_dir().join(format!("r2vp_{}_{n}.tif", std::process::id()));
+        let input = input.to_string_lossy().to_string();
+        raster.write(&input, RasterFormat::GeoTiff).unwrap();
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(input));
+        let result = RasterToVectorPolygonsTool.run(&args, &make_ctx()).unwrap();
+        let _ = std::fs::remove_file(&input);
+        let path = result.outputs.get("path").unwrap().as_str().unwrap();
+        read_vector_layer(path, "output")
+            .unwrap()
+            .features
+            .into_iter()
+            .map(|f| f.geometry.unwrap())
+            .collect()
+    }
+
+    fn ring_area(ring: &Ring) -> f64 {
+        let pts: Vec<(f64, f64)> = ring.0.iter().map(|c| (c.x, c.y)).collect();
+        ring_signed_area(&pts).abs()
+    }
+
+    /// A `size` x `size` block of 1s with a `hole` x `hole` nodata gap in the
+    /// middle (no gap when `hole` is 0), inside a one-cell nodata margin.
+    fn block(size: usize, hole: usize) -> Vec<Vec<Option<f64>>> {
+        let n = size + 2;
+        let lo = 1 + (size - hole) / 2;
+        (0..n)
+            .map(|r| {
+                (0..n)
+                    .map(|c| {
+                        let inside = (1..=size).contains(&r) && (1..=size).contains(&c);
+                        let in_hole = hole > 0 && (lo..lo + hole).contains(&r) && (lo..lo + hole).contains(&c);
+                        (inside && !in_hole).then_some(1.0)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn polygonize_block(size: usize, hole: usize) -> Vec<Geometry> {
+        let grid = block(size, hole);
+        let rows: Vec<&[Option<f64>]> = grid.iter().map(|r| r.as_slice()).collect();
+        polygonize(&rows)
+    }
+
+    #[test]
+    fn solid_region_has_one_ring() {
+        // Issue opengeos/geolibre-rust#569: the shell came back a second time
+        // as a hole, cancelling the polygon's area to zero.
+        let geoms = polygonize_block(4, 0);
+        assert_eq!(geoms.len(), 1);
+        let Geometry::Polygon { exterior, interiors } = &geoms[0] else {
+            panic!("expected Polygon, got {:?}", geoms[0]);
+        };
+        assert!(interiors.is_empty(), "spurious holes: {interiors:?}");
+        assert_eq!(ring_area(exterior), 16.0);
+    }
+
+    #[test]
+    fn region_with_hole_keeps_outline_as_exterior() {
+        // The hole used to become the exterior and the outline its "hole".
+        let geoms = polygonize_block(6, 2);
+        assert_eq!(geoms.len(), 1);
+        let Geometry::Polygon { exterior, interiors } = &geoms[0] else {
+            panic!("expected Polygon, got {:?}", geoms[0]);
+        };
+        assert_eq!(ring_area(exterior), 36.0);
+        assert_eq!(interiors.len(), 1);
+        assert_eq!(ring_area(&interiors[0]), 4.0);
+    }
+
+    #[test]
+    fn separate_regions_are_separate_features() {
+        let geoms = polygonize(&[
+            &[Some(1.0), None, Some(2.0)],
+            &[Some(1.0), None, Some(2.0)],
+        ]);
+        assert_eq!(geoms.len(), 2);
+        for g in &geoms {
+            let Geometry::Polygon { exterior, interiors } = g else {
+                panic!("expected Polygon, got {g:?}");
+            };
+            assert!(interiors.is_empty());
+            assert_eq!(ring_area(exterior), 2.0);
+        }
+    }
+
+    /// All rings of a Polygon or MultiPolygon, as (exterior?, ring) pairs.
+    fn rings_of(geom: &Geometry) -> Vec<(bool, &Ring)> {
+        match geom {
+            Geometry::Polygon { exterior, interiors } => {
+                std::iter::once((true, exterior)).chain(interiors.iter().map(|r| (false, r))).collect()
+            }
+            Geometry::MultiPolygon(polys) => polys
+                .iter()
+                .flat_map(|(ext, holes)| std::iter::once((true, ext)).chain(holes.iter().map(|r| (false, r))))
+                .collect(),
+            other => panic!("expected polygonal geometry, got {other:?}"),
+        }
+    }
+
+    /// Exterior area minus hole area, with every ring checked to be simple
+    /// (no repeated vertex, which is how a ring touching itself shows up).
+    fn checked_area(geoms: &[Geometry]) -> f64 {
+        let mut total = 0.0;
+        for geom in geoms {
+            for (is_exterior, ring) in rings_of(geom) {
+                let mut seen: Vec<(f64, f64)> = Vec::new();
+                for c in &ring.0 {
+                    assert!(!seen.contains(&(c.x, c.y)), "ring touches itself at ({}, {}): {ring:?}", c.x, c.y);
+                    seen.push((c.x, c.y));
+                }
+                let area = ring_area(ring);
+                assert!(area > 0.0, "zero-area ring: {ring:?}");
+                total += if is_exterior { area } else { -area };
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn diagonal_cells_become_touching_parts() {
+        // Cells that meet only at a corner used to make one ring that reversed
+        // there, so its area cancelled. Down-right also puts the start node of
+        // the second loop on the shared corner.
+        let o = Some(1.0);
+        for grid in [[[o, None], [None, o]], [[None, o], [o, None]]] {
+            let rows: Vec<&[Option<f64>]> = grid.iter().map(|r| r.as_slice()).collect();
+            let geoms = polygonize(&rows);
+            assert_eq!(geoms.len(), 1, "one clump, one feature");
+            assert_eq!(checked_area(&geoms), 2.0);
+        }
+    }
+
+    #[test]
+    fn diagonal_staircase_keeps_its_area() {
+        let n = 6;
+        let grid: Vec<Vec<Option<f64>>> =
+            (0..n).map(|r| (0..n).map(|c| (r == c).then_some(1.0)).collect()).collect();
+        let rows: Vec<&[Option<f64>]> = grid.iter().map(|r| r.as_slice()).collect();
+        let geoms = polygonize(&rows);
+        assert_eq!(geoms.len(), 1);
+        assert_eq!(checked_area(&geoms), n as f64);
+    }
+
+    #[test]
+    fn hole_pinched_at_a_corner_keeps_its_area() {
+        // Two nodata cells meeting diagonally inside a solid block.
+        let mut grid = block(4, 0);
+        grid[2][2] = None;
+        grid[3][3] = None;
+        let rows: Vec<&[Option<f64>]> = grid.iter().map(|r| r.as_slice()).collect();
+        let geoms = polygonize(&rows);
+        assert_eq!(geoms.len(), 1);
+        assert_eq!(checked_area(&geoms), 14.0);
+    }
+
+    fn square(x0: f64, y0: f64, s: f64, ccw: bool) -> Vec<(f64, f64)> {
+        let mut r = vec![(x0, y0), (x0 + s, y0), (x0 + s, y0 + s), (x0, y0 + s), (x0, y0)];
+        if !ccw {
+            r.reverse();
+        }
+        r
+    }
+
+    #[test]
+    fn grouping_does_not_depend_on_winding_convention() {
+        // A flipped (south-up) grid reverses every ring; the grouping must not
+        // care which way the exteriors wind.
+        for ccw in [true, false] {
+            let rings = vec![
+                square(4.0, 4.0, 2.0, !ccw), // hole
+                square(0.0, 0.0, 10.0, ccw), // shell
+                square(20.0, 0.0, 3.0, ccw), // second part
+            ];
+            let polys = group_traced_rings(&rings);
+            assert_eq!(polys.len(), 2, "ccw={ccw}");
+            assert_eq!(polys[0].0, rings[1]);
+            assert_eq!(polys[0].1, vec![rings[0].clone()]);
+            assert_eq!(polys[1].0, rings[2]);
+            assert!(polys[1].1.is_empty());
+        }
+    }
+
+    #[test]
+    fn grouping_lone_ring_is_never_its_own_hole() {
+        for ccw in [true, false] {
+            let polys = group_traced_rings(&[square(0.0, 0.0, 5.0, ccw)]);
+            assert_eq!(polys.len(), 1);
+            assert!(polys[0].1.is_empty(), "ccw={ccw}");
+        }
+        assert!(group_traced_rings(&[]).is_empty());
     }
 }

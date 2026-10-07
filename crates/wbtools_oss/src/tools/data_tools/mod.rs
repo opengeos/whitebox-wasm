@@ -1392,6 +1392,59 @@ fn ring_signed_area(points: &[(f64, f64)]) -> f64 {
     area * 0.5
 }
 
+/// A polygon assembled from traced rings: one exterior plus its holes.
+type TracedPolygon = (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>);
+
+/// Groups the boundary rings traced around one raster clump into polygons.
+///
+/// The tracer winds every exterior one way and every hole the other, but which
+/// way depends on the grid orientation (a south-up raster flips it), so the
+/// absolute sign of a ring's area cannot tell an exterior from a hole. The
+/// ring with the largest absolute area is always an exterior: rings winding the
+/// same way are exteriors too, and rings winding the other way are holes, each
+/// given to the smallest exterior that contains it. Zero-area rings are
+/// dropped. Each ring is used exactly once.
+fn group_traced_rings(rings: &[Vec<(f64, f64)>]) -> Vec<TracedPolygon> {
+    let areas: Vec<f64> = rings.iter().map(|r| ring_signed_area(r)).collect();
+    let Some(largest) = (0..rings.len())
+        .filter(|&i| areas[i] != 0.0)
+        .max_by(|&a, &b| areas[a].abs().total_cmp(&areas[b].abs()))
+    else {
+        return Vec::new();
+    };
+    let exterior_positive = areas[largest] > 0.0;
+
+    let mut polygons: Vec<TracedPolygon> = Vec::new();
+    let mut exterior_areas: Vec<f64> = Vec::new();
+    let mut holes: Vec<&Vec<(f64, f64)>> = Vec::new();
+    for (ring, &area) in rings.iter().zip(&areas) {
+        if area == 0.0 {
+            continue;
+        }
+        if (area > 0.0) == exterior_positive {
+            polygons.push((ring.clone(), Vec::new()));
+            exterior_areas.push(area.abs());
+        } else {
+            holes.push(ring);
+        }
+    }
+
+    for hole in holes {
+        // The midpoint of a hole edge is never on another ring: rings share
+        // corners at diagonal pinches, but never edges.
+        let test_pt = match (hole.first(), hole.get(1)) {
+            (Some(a), Some(b)) => ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5),
+            _ => continue,
+        };
+        let owner = (0..polygons.len())
+            .filter(|&i| point_in_ring(test_pt, &polygons[i].0))
+            .min_by(|&a, &b| exterior_areas[a].total_cmp(&exterior_areas[b]))
+            .unwrap_or(0);
+        polygons[owner].1.push(hole.clone());
+    }
+    polygons
+}
+
 fn point_in_ring(pt: (f64, f64), ring: &[(f64, f64)]) -> bool {
     if ring.len() < 3 {
         return false;
@@ -5219,57 +5272,25 @@ impl Tool for RasterToVectorPolygonsTool {
         let mut next_fid = 1i64;
         let total_clumps = (clump_val as usize).saturating_sub(1).max(1) as f64;
         for clump_id in 1..clump_val as usize {
-            let rings = &rings_by_clump[clump_id];
-            if rings.is_empty() {
+            let polygons = group_traced_rings(&rings_by_clump[clump_id]);
+            if polygons.is_empty() {
                 continue;
             }
 
-            let mut exteriors: Vec<Vec<(f64, f64)>> = Vec::new();
-            let mut holes: Vec<Vec<(f64, f64)>> = Vec::new();
-            for ring in rings {
-                if ring_signed_area(ring) < 0.0 {
-                    exteriors.push(ring.clone());
-                } else {
-                    holes.push(ring.clone());
-                }
-            }
-            if exteriors.is_empty() {
-                exteriors.push(rings[0].clone());
-            }
-
-            let mut hole_groups: Vec<Vec<Vec<(f64, f64)>>> = vec![Vec::new(); exteriors.len()];
-            for hole in holes {
-                let test_pt = hole[0];
-                let mut assigned = false;
-                for (i, ext) in exteriors.iter().enumerate() {
-                    if point_in_ring(test_pt, ext) {
-                        hole_groups[i].push(hole.clone());
-                        assigned = true;
-                        break;
-                    }
-                }
-                if !assigned {
-                    hole_groups[0].push(hole);
-                }
-            }
-
-            let geom = if exteriors.len() == 1 {
+            let geom = if polygons.len() == 1 {
+                let (exterior, holes) = &polygons[0];
                 Geometry::Polygon {
-                    exterior: Ring(normalize_ring(&exteriors[0])),
-                    interiors: hole_groups[0]
-                        .iter()
-                        .map(|r| Ring(normalize_ring(r)))
-                        .collect(),
+                    exterior: Ring(normalize_ring(exterior)),
+                    interiors: holes.iter().map(|r| Ring(normalize_ring(r))).collect(),
                 }
             } else {
                 Geometry::MultiPolygon(
-                    exteriors
+                    polygons
                         .iter()
-                        .enumerate()
-                        .map(|(i, ext)| {
+                        .map(|(exterior, holes)| {
                             (
-                                Ring(normalize_ring(ext)),
-                                hole_groups[i].iter().map(|r| Ring(normalize_ring(r))).collect(),
+                                Ring(normalize_ring(exterior)),
+                                holes.iter().map(|r| Ring(normalize_ring(r))).collect(),
                             )
                         })
                         .collect(),
@@ -7579,5 +7600,165 @@ mod ring_boundary_line_tests {
         let mut parts: Vec<Vec<Coord>> = Vec::new();
         geometry_line_parts(&geom, &mut parts);
         assert_eq!(parts, vec![vec![c(0.0, 0.0), c(1.0, 1.0), c(2.0, 0.0)]]);
+    }
+}
+
+#[cfg(test)]
+mod raster_to_vector_polygons_tests {
+    use super::*;
+    use wbcore::{AllowAllCapabilities, ProgressSink};
+
+    struct NoopProgress;
+    impl ProgressSink for NoopProgress {}
+
+    fn make_ctx() -> ToolContext<'static> {
+        static PROGRESS: NoopProgress = NoopProgress;
+        static CAPS: AllowAllCapabilities = AllowAllCapabilities;
+        ToolContext { progress: &PROGRESS, capabilities: &CAPS }
+    }
+
+    /// Polygonizes a grid (row 0 = north, `None` = nodata) and returns its
+    /// features' geometries.
+    fn polygonize(grid: &[&[Option<f64>]]) -> Vec<Geometry> {
+        let rows = grid.len();
+        let cols = grid[0].len();
+        let mut raster = Raster::new(RasterConfig {
+            rows,
+            cols,
+            bands: 1,
+            nodata: -9999.0,
+            cell_size: 1.0,
+            ..Default::default()
+        });
+        for (r, line) in grid.iter().enumerate() {
+            for (c, v) in line.iter().enumerate() {
+                raster.set(0, r as isize, c as isize, v.unwrap_or(-9999.0)).unwrap();
+            }
+        }
+        // The tool reads its input with `Raster::read`, which takes files only.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let input = std::env::temp_dir().join(format!("r2vp_{}_{n}.tif", std::process::id()));
+        let input = input.to_string_lossy().to_string();
+        raster.write(&input, RasterFormat::GeoTiff).unwrap();
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(input));
+        let result = RasterToVectorPolygonsTool.run(&args, &make_ctx()).unwrap();
+        let _ = std::fs::remove_file(&input);
+        let path = result.outputs.get("path").unwrap().as_str().unwrap();
+        read_vector_layer(path, "output")
+            .unwrap()
+            .features
+            .into_iter()
+            .map(|f| f.geometry.unwrap())
+            .collect()
+    }
+
+    fn ring_area(ring: &Ring) -> f64 {
+        let pts: Vec<(f64, f64)> = ring.0.iter().map(|c| (c.x, c.y)).collect();
+        ring_signed_area(&pts).abs()
+    }
+
+    /// A `size` x `size` block of 1s with a `hole` x `hole` nodata gap in the
+    /// middle (no gap when `hole` is 0), inside a one-cell nodata margin.
+    fn block(size: usize, hole: usize) -> Vec<Vec<Option<f64>>> {
+        let n = size + 2;
+        let lo = 1 + (size - hole) / 2;
+        (0..n)
+            .map(|r| {
+                (0..n)
+                    .map(|c| {
+                        let inside = (1..=size).contains(&r) && (1..=size).contains(&c);
+                        let in_hole = hole > 0 && (lo..lo + hole).contains(&r) && (lo..lo + hole).contains(&c);
+                        (inside && !in_hole).then_some(1.0)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn polygonize_block(size: usize, hole: usize) -> Vec<Geometry> {
+        let grid = block(size, hole);
+        let rows: Vec<&[Option<f64>]> = grid.iter().map(|r| r.as_slice()).collect();
+        polygonize(&rows)
+    }
+
+    #[test]
+    fn solid_region_has_one_ring() {
+        // Issue opengeos/geolibre-rust#569: the shell came back a second time
+        // as a hole, cancelling the polygon's area to zero.
+        let geoms = polygonize_block(4, 0);
+        assert_eq!(geoms.len(), 1);
+        let Geometry::Polygon { exterior, interiors } = &geoms[0] else {
+            panic!("expected Polygon, got {:?}", geoms[0]);
+        };
+        assert!(interiors.is_empty(), "spurious holes: {interiors:?}");
+        assert_eq!(ring_area(exterior), 16.0);
+    }
+
+    #[test]
+    fn region_with_hole_keeps_outline_as_exterior() {
+        // The hole used to become the exterior and the outline its "hole".
+        let geoms = polygonize_block(6, 2);
+        assert_eq!(geoms.len(), 1);
+        let Geometry::Polygon { exterior, interiors } = &geoms[0] else {
+            panic!("expected Polygon, got {:?}", geoms[0]);
+        };
+        assert_eq!(ring_area(exterior), 36.0);
+        assert_eq!(interiors.len(), 1);
+        assert_eq!(ring_area(&interiors[0]), 4.0);
+    }
+
+    #[test]
+    fn separate_regions_are_separate_features() {
+        let geoms = polygonize(&[
+            &[Some(1.0), None, Some(2.0)],
+            &[Some(1.0), None, Some(2.0)],
+        ]);
+        assert_eq!(geoms.len(), 2);
+        for g in &geoms {
+            let Geometry::Polygon { exterior, interiors } = g else {
+                panic!("expected Polygon, got {g:?}");
+            };
+            assert!(interiors.is_empty());
+            assert_eq!(ring_area(exterior), 2.0);
+        }
+    }
+
+    fn square(x0: f64, y0: f64, s: f64, ccw: bool) -> Vec<(f64, f64)> {
+        let mut r = vec![(x0, y0), (x0 + s, y0), (x0 + s, y0 + s), (x0, y0 + s), (x0, y0)];
+        if !ccw {
+            r.reverse();
+        }
+        r
+    }
+
+    #[test]
+    fn grouping_does_not_depend_on_winding_convention() {
+        // A flipped (south-up) grid reverses every ring; the grouping must not
+        // care which way the exteriors wind.
+        for ccw in [true, false] {
+            let rings = vec![
+                square(4.0, 4.0, 2.0, !ccw), // hole
+                square(0.0, 0.0, 10.0, ccw), // shell
+                square(20.0, 0.0, 3.0, ccw), // second part
+            ];
+            let polys = group_traced_rings(&rings);
+            assert_eq!(polys.len(), 2, "ccw={ccw}");
+            assert_eq!(polys[0].0, rings[1]);
+            assert_eq!(polys[0].1, vec![rings[0].clone()]);
+            assert_eq!(polys[1].0, rings[2]);
+            assert!(polys[1].1.is_empty());
+        }
+    }
+
+    #[test]
+    fn grouping_lone_ring_is_never_its_own_hole() {
+        for ccw in [true, false] {
+            let polys = group_traced_rings(&[square(0.0, 0.0, 5.0, ccw)]);
+            assert_eq!(polys.len(), 1);
+            assert!(polys[0].1.is_empty(), "ccw={ccw}");
+        }
+        assert!(group_traced_rings(&[]).is_empty());
     }
 }

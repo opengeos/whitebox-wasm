@@ -12,7 +12,7 @@ use wbcore::{
     param_schema_map,
 };
 use rand::RngExt;
-use wbraster::{DataType, Raster, RasterFormat};
+use wbraster::{DataType, Raster, RasterConfig, RasterFormat};
 
 use crate::memory_store;
 
@@ -175,6 +175,28 @@ fn write_or_store_output(output: Raster, output_path: Option<std::path::PathBuf>
         let id = memory_store::put_raster(output);
         Ok(memory_store::make_raster_memory_path(&id))
     }
+}
+
+/// Creates an output raster on `input`'s grid, CRS and metadata, with a fresh
+/// `data_type` buffer filled with `nodata`.
+///
+/// Cloning the input and relabelling `data_type` is not enough: the clone keeps
+/// the input's typed buffer, so float accumulations written into a cloned int16
+/// pointer (or an integer DEM) saturate at 32767.
+fn output_raster_like(input: &Raster, data_type: DataType, nodata: f64) -> Raster {
+    Raster::new(RasterConfig {
+        cols: input.cols,
+        rows: input.rows,
+        bands: input.bands,
+        x_min: input.x_min,
+        y_min: input.y_min,
+        cell_size: input.cell_size_x,
+        cell_size_y: Some(input.cell_size_y),
+        nodata,
+        data_type,
+        crs: input.crs.clone(),
+        metadata: input.metadata.clone(),
+    })
 }
 
 fn build_result(path: String) -> ToolRunResult {
@@ -2557,9 +2579,7 @@ Compare to D-Infinity (continuous angles, better sediment transport) or FD8 (mul
 
         let dirs = d8_dir_from_dem(&input);
 
-        let mut out = input.as_ref().clone();
-        out.data_type = DataType::I16;
-        out.nodata = -32768.0;
+        let mut out = output_raster_like(&input, DataType::I16, -32768.0);
         for r in 0..input.rows {
             for c in 0..input.cols {
                 let i = idx(r, c, input.cols);
@@ -2698,9 +2718,7 @@ impl Tool for D8FlowAccumTool {
         let mut accum = d8_flow_accum_core(&flow_dir, input.rows, input.cols, -32768.0);
 
         // Fuse post-processing + copy into output raster — eliminates one full-grid pass.
-        let mut out = input.as_ref().clone();
-        out.data_type = DataType::F32;
-        out.nodata = -32768.0;
+        let mut out = output_raster_like(&input, DataType::F32, -32768.0);
 
         if !raster_is_geographic(&input) {
             let mut cell_area = input.cell_size_x * input.cell_size_y;
@@ -2785,8 +2803,7 @@ D-Infinity has higher computational cost than D8 but better represents true grad
     fn run(&self, args: &ToolArgs, _ctx: &ToolContext) -> Result<ToolRunResult, ToolError> {
         let (input, output_path) = parse_input_and_output(args)?;
         let values = dinf_pointer_from_dem(&input);
-        let mut out = input.as_ref().clone();
-        out.data_type = DataType::F32;
+        let mut out = output_raster_like(&input, DataType::F32, input.nodata);
         for r in 0..input.rows {
             for c in 0..input.cols {
                 out.set_unchecked(0, r as isize, c as isize, values[idx(r, c, input.cols)]);
@@ -2894,8 +2911,7 @@ impl Tool for DInfFlowAccumTool {
         let mut accum = dinf_flow_accum_core(&flow_dir, input.rows, input.cols, input.nodata, convergence_threshold);
         apply_dinf_output_type(&mut accum, &input, out_type, log_transform);
 
-        let mut out = input.as_ref().clone();
-        out.data_type = DataType::F32;
+        let mut out = output_raster_like(&input, DataType::F32, input.nodata);
         for r in 0..input.rows {
             for c in 0..input.cols {
                 out.set_unchecked(0, r as isize, c as isize, accum[idx(r, c, input.cols)]);
@@ -2996,8 +3012,7 @@ Slope exponent (default 1.1) controls flow sensitivity to gradient magnitude—h
         let mut accum = mdinf_flow_accum_core(&input, exponent, convergence_threshold);
         apply_dinf_output_type(&mut accum, &input, out_type, log_transform);
 
-        let mut out = input.as_ref().clone();
-        out.data_type = DataType::F32;
+        let mut out = output_raster_like(&input, DataType::F32, input.nodata);
         for r in 0..input.rows {
             for c in 0..input.cols {
                 out.set_unchecked(0, r as isize, c as isize, accum[idx(r, c, input.cols)]);
@@ -3099,8 +3114,7 @@ impl Tool for QinFlowAccumulationTool {
         let mut accum = qin_flow_accum_core(&input, exponent, max_slope, convergence_threshold);
 
         // Fuse post-processing + copy — eliminates one full-grid pass for projected CRS.
-        let mut out = input.as_ref().clone();
-        out.data_type = DataType::F32;
+        let mut out = output_raster_like(&input, DataType::F32, input.nodata);
 
         if !raster_is_geographic(&input) {
             let mut cell_area = input.cell_size_x * input.cell_size_y;
@@ -3218,8 +3232,7 @@ impl Tool for QuinnFlowAccumulationTool {
         let mut accum = quinn_flow_accum_core(&input, exponent, convergence_threshold);
 
         // Fuse post-processing + copy — eliminates one full-grid pass for projected CRS.
-        let mut out = input.as_ref().clone();
-        out.data_type = DataType::F32;
+        let mut out = output_raster_like(&input, DataType::F32, input.nodata);
 
         if !raster_is_geographic(&input) {
             let mut cell_area = input.cell_size_x * input.cell_size_y;
@@ -3359,9 +3372,7 @@ impl Tool for MinimalDispersionFlowAlgorithmTool {
         let (pntr_modified, mut accum, _d8_primary, interior_pit_found) =
             minimal_dispersion_core(&input, p, out_type, esri);
 
-        let mut dir_out = input.as_ref().clone();
-        dir_out.data_type = DataType::I16;
-        dir_out.nodata = -32768.0;
+        let mut dir_out = output_raster_like(&input, DataType::I16, -32768.0);
         for r in 0..input.rows {
             for c in 0..input.cols {
                 let i = idx(r, c, input.cols);
@@ -3373,8 +3384,7 @@ impl Tool for MinimalDispersionFlowAlgorithmTool {
             }
         }
 
-        let mut accum_out = input.as_ref().clone();
-        accum_out.data_type = DataType::F32;
+        let mut accum_out = output_raster_like(&input, DataType::F32, input.nodata);
 
         if debug_stats {
             let mut valid_cells = 0usize;
@@ -3540,9 +3550,7 @@ Computationally more expensive than D8 but generates accumulation patterns close
         let (input, output_path) = parse_input_and_output(args)?;
         let values = fd8_pointer_from_dem(&input);
 
-        let mut out = input.as_ref().clone();
-        out.data_type = DataType::I16;
-        out.nodata = -32768.0;
+        let mut out = output_raster_like(&input, DataType::I16, -32768.0);
         for r in 0..input.rows {
             for c in 0..input.cols {
                 out.set_unchecked(0, r as isize, c as isize, values[idx(r, c, input.cols)]);
@@ -3614,9 +3622,7 @@ Requires multiple runs (typically 50-100) with ensemble averaging for statistica
         } else {
             [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]
         };
-        let mut out = input.as_ref().clone();
-        out.data_type = DataType::I16;
-        out.nodata = -32768.0;
+        let mut out = output_raster_like(&input, DataType::I16, -32768.0);
         for r in 0..input.rows {
             for c in 0..input.cols {
                 let i = idx(r, c, input.cols);
@@ -3726,9 +3732,7 @@ impl Tool for Rho8FlowAccumTool {
         let mut accum = d8_flow_accum_core(&flow_dir, input.rows, input.cols, -32768.0);
 
         // Fuse post-processing + copy — eliminates one full-grid pass for projected CRS.
-        let mut out = input.as_ref().clone();
-        out.data_type = DataType::F32;
-        out.nodata = -32768.0;
+        let mut out = output_raster_like(&input, DataType::F32, -32768.0);
 
         if !raster_is_geographic(&input) {
             let mut cell_area = input.cell_size_x * input.cell_size_y;
@@ -3845,8 +3849,7 @@ impl Tool for FD8FlowAccumTool {
 
         let mut accum = fd8_flow_accum_core(&input, exponent, convergence_threshold);
 
-        let mut out = input.as_ref().clone();
-        out.data_type = DataType::F32;
+        let mut out = output_raster_like(&input, DataType::F32, input.nodata);
         if !raster_is_geographic(&input) {
             let mut area = input.cell_size_x * input.cell_size_y;
             let mut grid_size = (input.cell_size_x + input.cell_size_y) / 2.0;
@@ -3878,5 +3881,65 @@ impl Tool for FD8FlowAccumTool {
         }
 
         Ok(build_result(write_or_store_output(out, output_path)?))
+    }
+}
+
+#[cfg(test)]
+mod integer_input_tests {
+    use super::*;
+    use wbcore::{AllowAllCapabilities, ProgressSink};
+
+    struct NoopProgress;
+    impl ProgressSink for NoopProgress {}
+
+    fn make_ctx() -> ToolContext<'static> {
+        static PROGRESS: NoopProgress = NoopProgress;
+        static CAPS: AllowAllCapabilities = AllowAllCapabilities;
+        ToolContext { progress: &PROGRESS, capabilities: &CAPS }
+    }
+
+    /// More cells than an int16 can count.
+    const COLS: usize = 40_000;
+
+    /// A one-row int16 raster with `value(col)` in each cell.
+    fn i16_row(value: impl Fn(usize) -> f64) -> String {
+        let mut raster = Raster::new(RasterConfig {
+            rows: 1,
+            cols: COLS,
+            nodata: -32768.0,
+            data_type: DataType::I16,
+            ..Default::default()
+        });
+        for c in 0..COLS {
+            raster.set(0, 0, c as isize, value(c)).unwrap();
+        }
+        memory_store::make_raster_memory_path(&memory_store::put_raster(raster))
+    }
+
+    fn outlet_cells(input: String, input_is_pointer: bool) -> f64 {
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(input));
+        args.insert("input_is_pointer".to_string(), json!(input_is_pointer));
+        args.insert("out_type".to_string(), json!("cells"));
+        let result = D8FlowAccumTool.run(&args, &make_ctx()).unwrap();
+        let out = load_raster(result.outputs["path"].as_str().unwrap()).unwrap();
+        assert_eq!(out.data_type, DataType::F32);
+        out.get(0, 0, (COLS - 1) as isize)
+    }
+
+    #[test]
+    fn d8_flow_accum_from_int16_pointer_does_not_saturate() {
+        // Issue opengeos/geolibre-rust#568: the output reused the pointer's
+        // int16 buffer, so accumulation stopped at 32767. Every cell drains
+        // east (pointer 2) into the outlet (pointer 0) at the end of the row.
+        let pointer = i16_row(|c| if c + 1 == COLS { 0.0 } else { 2.0 });
+        assert_eq!(outlet_cells(pointer, true), COLS as f64);
+    }
+
+    #[test]
+    fn d8_flow_accum_from_int16_dem_does_not_saturate() {
+        // An int16 DEM sloping east hits the same buffer reuse.
+        let dem = i16_row(|c| 30_000.0 - c as f64);
+        assert_eq!(outlet_cells(dem, false), COLS as f64);
     }
 }

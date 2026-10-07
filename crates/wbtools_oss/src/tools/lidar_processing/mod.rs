@@ -3865,8 +3865,18 @@ fn run_dsm_tile(
         lidar_crs_to_raster_crs(cloud.crs.as_ref()),
         DataType::F64,
     )?;
-    let topo_points: Vec<TopoCoord> = samples.iter().map(|(x, y, _)| TopoCoord::xy(*x, *y)).collect();
-    let triangulation = delaunay_triangulation(&topo_points, 1.0e-12);
+    // The O(n log n) delaunator backend, as TIN gridding uses by default. The
+    // incremental wbtopology triangulator is far slower, and on a full USGS 3DEP
+    // tile (3.5M points) its triangle store outgrew wasm32's 4 GB memory.
+    let mut topo_points: Vec<TopoCoord> = samples.iter().map(|(x, y, _)| TopoCoord::xy(*x, *y)).collect();
+    let mut triangulation = delaunay_triangulation_fast(&topo_points, 1.0e-12);
+    if triangulation.triangles.is_empty() {
+        // Same fallback as TIN gridding for duplicate-XY-heavy clouds.
+        samples = deduplicate_xy_samples(&samples);
+        topo_points = samples.iter().map(|(x, y, _)| TopoCoord::xy(*x, *y)).collect();
+        triangulation = delaunay_triangulation_fast(&topo_points, 1.0e-12);
+    }
+    drop(topo_points);
     if triangulation.triangles.is_empty() {
         return Err(ToolError::Execution("failed to build triangulation from input lidar points".to_string()));
     }

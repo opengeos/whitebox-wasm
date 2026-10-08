@@ -525,7 +525,9 @@ impl CogWriter {
             push_longs(&mut tags, tag::TileByteCounts, &tile_bc_u32);
         }
         push_short(&mut tags, tag::PlanarConfiguration, 1);
-        push_short(&mut tags, tag::SampleFormat, self.sample_format.tag_value() as u32);
+        // One SampleFormat value per sample, like BitsPerSample: readers such
+        // as geotiff.js index it by sample and fail on band 2+ of a short array.
+        push_shorts(&mut tags, tag::SampleFormat, &vec![self.sample_format.tag_value(); spp]);
 
         if include_geo {
             if let Some(gt) = &self.geo_transform {
@@ -904,6 +906,32 @@ mod tests {
         assert!(tiff.height() > 0);
         let read_back = tiff.read_band_f32(0).unwrap();
         assert_eq!(read_back.len(), (tiff.width() * tiff.height()) as usize);
+    }
+
+    #[test]
+    fn cog_writes_one_sample_format_per_band() {
+        // TIFF 6.0 sizes SampleFormat by SamplesPerPixel; geotiff.js indexes it
+        // by sample, so a single value made band 2+ of a multi-band COG fail.
+        let (w, h, bands) = (32u32, 32u32, 3u16);
+        let data = vec![7u8; (w * h) as usize * bands as usize];
+        let bytes = CogWriter::new(w, h, bands)
+            .compression(Compression::None)
+            .tile_size(16)
+            .write_u8_to_vec(&data)
+            .unwrap();
+        assert_eq!(&bytes[0..2], b"II", "expected a little-endian classic TIFF");
+        let u16_at = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+        let u32_at = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        let ifd = u32_at(4) as usize;
+        let entries = u16_at(ifd) as usize;
+        let count_of = |code: u16| {
+            (0..entries)
+                .map(|i| ifd + 2 + i * 12)
+                .find(|&e| u16_at(e) == code)
+                .map(|e| u32_at(e + 4))
+        };
+        assert_eq!(count_of(tag::BitsPerSample), Some(bands as u32));
+        assert_eq!(count_of(tag::SampleFormat), Some(bands as u32));
     }
 
     #[test]

@@ -9869,13 +9869,20 @@ impl Tool for ImageSegmentationTool {
             }
         }
 
-        let mut seg_size = vec![0usize; seg_cells.len()];
+        // Rebuild each segment's cell list from the final labels: the BFS fill
+        // above assigns cells that the grow loop never recorded, and the merge
+        // below relabels a segment by its cell list, so a stale list left those
+        // cells behind as orphan fragments under a retired label.
+        for cells in seg_cells.iter_mut() {
+            cells.clear();
+        }
         for idx in 0..n {
             let sid = seg[idx];
             if sid >= 0 {
-                seg_size[sid as usize] += 1;
+                seg_cells[sid as usize].push(idx);
             }
         }
+        let mut seg_size: Vec<usize> = seg_cells.iter().map(Vec::len).collect();
 
         // Merge undersized segments into the most similar neighboring segment.
         // Queue-based processing avoids repeated full passes over all segment IDs.
@@ -9938,9 +9945,13 @@ impl Tool for ImageSegmentationTool {
                     seg_center[nid][d] = (seg_center[nid][d] * n1 + seg_center[sid][d] * n2)
                         / (n1 + n2).max(1.0);
                 }
-                for &idx in &seg_cells[sid] {
+                let moved = std::mem::take(&mut seg_cells[sid]);
+                for &idx in &moved {
                     seg[idx] = nid as isize;
                 }
+                // Keep the destination's cell list complete so a later merge of
+                // `nid` carries these cells along too.
+                seg_cells[nid].extend(moved);
                 seg_size[nid] += seg_size[sid];
                 seg_size[sid] = 0;
 
@@ -12690,6 +12701,45 @@ mod tests {
             }
         }
         r
+    }
+
+    #[test]
+    fn image_segmentation_min_area_leaves_no_small_fragments() {
+        // Noisy input yields many tiny seed regions plus BFS-filled cells; every
+        // segment that survives the min_area merge must be at least min_area
+        // cells, with no orphan fragments left under a retired label.
+        let (rows, cols) = (40usize, 40usize);
+        let mut state: u64 = 42;
+        let vals: Vec<f64> = (0..rows * cols)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((state >> 33) % 100) as f64
+            })
+            .collect();
+        let id = memory_store::put_raster(make_raster(rows, cols, 1, &vals));
+        let mut args = ToolArgs::new();
+        args.insert(
+            "inputs".to_string(),
+            json!([memory_store::make_raster_memory_path(&id)]),
+        );
+        args.insert("threshold".to_string(), json!(0.3));
+        args.insert("min_area".to_string(), json!(20));
+        let result = ImageSegmentationTool.run(&args, &make_ctx()).unwrap();
+        let out_path = result.outputs["output"]["path"].as_str().unwrap().to_string();
+        let out = memory_store::get_raster_by_id(memory_store::raster_path_to_id(&out_path).unwrap())
+            .unwrap();
+        let mut sizes: HashMap<i64, usize> = HashMap::new();
+        for row in 0..rows as isize {
+            for col in 0..cols as isize {
+                let v = out.get(0, row, col);
+                if !out.is_nodata(v) {
+                    *sizes.entry(v as i64).or_insert(0) += 1;
+                }
+            }
+        }
+        assert!(sizes.len() > 1, "expected more than one segment");
+        let smallest = sizes.values().copied().min().unwrap();
+        assert!(smallest >= 20, "found a {smallest}-cell segment below min_area=20");
     }
 
     fn make_packed_rgb_raster(rows: usize, cols: usize, vals: &[u32]) -> Raster {

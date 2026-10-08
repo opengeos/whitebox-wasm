@@ -40,9 +40,28 @@ fn parse_raster_list_arg(args: &ToolArgs, name: &str) -> Result<Vec<String>, Too
     let value = args
         .get(name)
         .ok_or_else(|| ToolError::Validation(format!("missing required parameter '{name}'")))?;
-    let arr = value
-        .as_array()
-        .ok_or_else(|| ToolError::Validation(format!("parameter '{name}' must be an array of raster paths")))?;
+    // Command-line hosts (the WASI runner) can only pass strings, so accept a
+    // comma- or semicolon-delimited list as well as a JSON array, matching the
+    // other raster-list parsers in this crate.
+    if let Some(s) = value.as_str() {
+        let out: Vec<String> = s
+            .split(|c| c == ',' || c == ';')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        if out.is_empty() {
+            return Err(ToolError::Validation(format!(
+                "parameter '{name}' must contain at least one raster path"
+            )));
+        }
+        return Ok(out);
+    }
+    let arr = value.as_array().ok_or_else(|| {
+        ToolError::Validation(format!(
+            "parameter '{name}' must be an array or a delimited list of raster paths"
+        ))
+    })?;
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         let Some(s) = item.as_str() else {

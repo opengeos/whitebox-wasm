@@ -1828,9 +1828,8 @@ fn build_segment_hierarchy_csv(
     write_csv(output_csv, &header, &rows_out)
 }
 
-fn count_unique_positive_segments(path: &str) -> Result<usize, ToolError> {
-    let seg = Raster::read(path)
-        .map_err(|e| ToolError::Execution(format!("failed reading segments raster: {e}")))?;
+/// Number of distinct positive labels in a segment raster.
+fn count_unique_positive_labels(seg: &Raster) -> usize {
     let rows = seg.rows as isize;
     let cols = seg.cols as isize;
     let mut ids = std::collections::BTreeSet::new();
@@ -1843,7 +1842,7 @@ fn count_unique_positive_segments(path: &str) -> Result<usize, ToolError> {
             ids.insert(z.round() as i64);
         }
     }
-    Ok(ids.len())
+    ids.len()
 }
 
 fn adjacency_from_segments(segments_path: &str) -> Result<HashMap<i64, HashMap<i64, usize>>, ToolError> {
@@ -2106,27 +2105,29 @@ impl Tool for SegmentScaleParameterOptimizerTool {
             .unwrap_or(total_cells.sqrt().max(25.0));
         let mut scored = Vec::<(f64, usize, f64)>::new();
 
-        for (i, k) in candidates.iter().enumerate() {
-            // Scratch segmentations go beside the first input rather than in
-            // `std::env::temp_dir()`, and are named without
-            // `std::process::id()`: both panic under WASI. The input's directory
-            // is always readable and writable, and the file is removed below.
-            let scratch_dir = Path::new(&inputs[0])
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let tmp = scratch_dir.join(format!("wb_obia_scale_opt_{i}.tif"));
-            let tmp_path = tmp.to_string_lossy().to_string();
+        for k in candidates.iter() {
+            // Segment into the in-memory raster store rather than a scratch
+            // file: no file is left behind on failure, concurrent runs cannot
+            // collide, and nothing is written beside the user's input (and
+            // `std::env::temp_dir()` panics under WASI anyway).
             let mut seg_args = ToolArgs::new();
             seg_args.insert("inputs".to_string(), serde_json::json!(inputs.clone()));
             seg_args.insert("k".to_string(), serde_json::json!(*k));
-            seg_args.insert("output".to_string(), serde_json::json!(tmp_path.clone()));
             let res = SegmentGraphFelzenszwalbTool.run(&seg_args, ctx)?;
-            let seg_path = result_path_from_outputs(&res.outputs).unwrap_or(tmp_path.clone());
-            let n = count_unique_positive_segments(&seg_path)?;
+            let seg_path = res
+                .outputs
+                .get("output")
+                .and_then(|v| v.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    ToolError::Execution(format!("segmentation at scale {k} returned no raster"))
+                })?;
+            let seg = crate::memory_store::remove_raster_by_path(seg_path).ok_or_else(|| {
+                ToolError::Execution(format!("segmentation at scale {k} was not kept in memory"))
+            })?;
+            let n = count_unique_positive_labels(&seg);
             let score = ((n as f64) - target_objects).abs();
             scored.push((*k, n, score));
-            let _ = std::fs::remove_file(tmp_path);
         }
 
         scored.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal));
@@ -3494,6 +3495,44 @@ mod raster_list_arg_tests {
         // Larger k must give a larger growth threshold (fewer, larger segments).
         assert!(felzenszwalb_threshold(1000.0, 0.8) > felzenszwalb_threshold(100.0, 0.8));
         assert!((felzenszwalb_threshold(500.0, 0.8) - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scale_optimizer_runs_without_scratch_files() {
+        struct NoopProgress;
+        impl ProgressSink for NoopProgress {}
+        static PROGRESS: NoopProgress = NoopProgress;
+        static CAPS: AllowAllCapabilities = AllowAllCapabilities;
+        let ctx = ToolContext { progress: &PROGRESS, capabilities: &CAPS };
+        let mut raster = Raster::new(wbraster::RasterConfig {
+            rows: 20,
+            cols: 20,
+            bands: 1,
+            nodata: -9999.0,
+            ..Default::default()
+        });
+        for row in 0..20isize {
+            for col in 0..20isize {
+                raster.set(0, row, col, if col < 10 { 10.0 } else { 90.0 } + (row % 3) as f64).unwrap();
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wb_obia_opt_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("input.tif");
+        raster.write_auto(&file).unwrap();
+        let path = file.to_string_lossy().to_string();
+        let mut args = ToolArgs::new();
+        args.insert("inputs".to_string(), serde_json::json!(path));
+        args.insert("candidate_scales".to_string(), serde_json::json!([100.0, 900.0]));
+        let result = SegmentScaleParameterOptimizerTool.run(&args, &ctx).unwrap();
+        assert!(result.outputs["best_segment_count"].as_u64().unwrap() >= 1);
+        // Only the input remains: the candidate segmentations stayed in memory.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(names, vec!["input.tif".to_string()]);
     }
 
     #[test]

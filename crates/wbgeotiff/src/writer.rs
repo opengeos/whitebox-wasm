@@ -453,7 +453,9 @@ impl GeoTiffWriter {
         push_rational(&mut tags, tag::XResolution, 72, 1);
         push_rational(&mut tags, tag::YResolution,  72, 1);
         push_short(&mut tags, tag::PlanarConfiguration, self.planar_config.tag_value() as u32);
-        push_short(&mut tags, tag::SampleFormat, self.sample_format.tag_value() as u32);
+        // One SampleFormat value per sample, like BitsPerSample: readers such
+        // as geotiff.js index it by sample and fail on band 2+ of a short array.
+        push_shorts(&mut tags, tag::SampleFormat, &vec![self.sample_format.tag_value(); spp]);
 
         if let Some(sw) = &self.software {
             push_ascii(&mut tags, tag::Software, sw);

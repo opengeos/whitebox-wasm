@@ -26,7 +26,7 @@ flatbuffers = "24.12.23"
 wbprojection = { path = "../wbprojection", version = "0.3.0" }
 zip = { version = "0.6", optional = true, default-features = false, features = ["deflate"] }
 osmpbfreader = { version = "0.16", optional = true }
-parquet = { version = "58.3", optional = true }
+parquet = { version = "60.0", optional = true }
 serde_json = { version = "1", optional = true }
 # In-memory parquet reader source so GeoParquet reads work under WASI, which
 # cannot clone/seek a std::fs::File the way parquet's File ChunkReader needs.

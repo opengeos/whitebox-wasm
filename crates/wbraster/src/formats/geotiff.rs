@@ -167,10 +167,7 @@ pub fn read(path: &str) -> Result<Raster> {
         y_min = y_max + gtx.pixel_height * rows as f64;
     }
 
-    let crs = CrsInfo {
-        epsg: tiff.epsg().map(|v| v as u32),
-        ..Default::default()
-    };
+    let crs = crs_from_geotiff(&tiff);
 
     let nodata = tiff.no_data().unwrap_or(-9999.0);
     let mut data_type = map_data_type(tiff.sample_format(), tiff.bits_per_sample())?;
@@ -247,6 +244,32 @@ pub fn read(path: &str) -> Result<Raster> {
     Raster::from_data_native(cfg, data)
 }
 
+/// CRS of a GeoTIFF: its EPSG code, or for a user-defined projected CRS (no
+/// EPSG code, e.g. ESRI:102567 Lo29) the PROJ string and WKT built from its
+/// projection GeoKeys, so tools keep measuring it in metres.
+fn crs_from_geotiff(tiff: &gt::GeoTiff) -> CrsInfo {
+    if let Some(code) = tiff.epsg() {
+        return CrsInfo {
+            epsg: Some(code as u32),
+            ..Default::default()
+        };
+    }
+    match tiff.proj_string() {
+        Some(proj) => CrsInfo {
+            epsg: None,
+            wkt: wbprojection::from_proj_string(&proj).ok().map(|c| c.to_wkt()),
+            proj4: Some(proj),
+        },
+        None => CrsInfo::default(),
+    }
+}
+
+/// GeoKeys for a raster's CRS when it has no EPSG code but a PROJ string the
+/// GeoKey encoder supports, so a user-defined projection survives a write.
+fn user_defined_geo_keys(raster: &Raster) -> Option<gt::geo_keys::GeoKeyDirectory> {
+    gt::geo_keys::GeoKeyDirectory::from_proj_string(raster.crs.proj4.as_deref()?)
+}
+
 /// Write GeoTIFF / BigTIFF / COG to `path`.
 pub fn write(raster: &Raster, path: &str) -> Result<()> {
     // Default GeoTIFF output is a Cloud Optimized GeoTIFF (tiled + overviews +
@@ -299,6 +322,8 @@ pub fn write_with_options(raster: &Raster, path: &str, opts: &GeoTiffWriteOption
         writer = writer.tile_size(tile_size);
         if let Some(e) = epsg {
             writer = writer.epsg(e);
+        } else if let Some(gkd) = user_defined_geo_keys(raster) {
+            writer = writer.geo_key_directory(gkd);
         }
         return write_with_cog(writer, path, raster);
     }
@@ -314,6 +339,8 @@ pub fn write_with_options(raster: &Raster, path: &str, opts: &GeoTiffWriteOption
 
     if let Some(e) = epsg {
         writer = writer.epsg(e);
+    } else if let Some(gkd) = user_defined_geo_keys(raster) {
+        writer = writer.geo_key_directory(gkd);
     }
 
     match layout {

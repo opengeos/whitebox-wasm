@@ -2518,10 +2518,11 @@ fn read_vector_layer_aligned_to_dem(dem: &Raster, path: &str, input_name: &str) 
 
 	let dem_epsg = dem.crs.epsg;
 	let dem_wkt = dem.crs.wkt.as_deref().map(str::trim).filter(|s| !s.is_empty());
+	let dem_proj = dem.crs.proj4.as_deref().map(str::trim).filter(|s| !s.is_empty());
 	let layer_epsg = layer.crs_epsg();
 	let layer_wkt = layer.crs_wkt().map(str::trim).filter(|s| !s.is_empty());
 
-	if dem_epsg.is_none() && dem_wkt.is_none() {
+	if dem_epsg.is_none() && dem_wkt.is_none() && dem_proj.is_none() {
 		return Ok(layer);
 	}
 
@@ -2548,6 +2549,27 @@ fn read_vector_layer_aligned_to_dem(dem: &Raster, path: &str, input_name: &str) 
 				input_name, dst_epsg, e
 			))
 		})?;
+		return Ok(reprojected);
+	}
+
+	// A DEM in a user-defined projection (no EPSG code) still carries its CRS
+	// as WKT or a PROJ string, which is enough to reproject the vector onto it.
+	let dem_crs = dem_wkt
+		.and_then(|w| wbprojection::from_wkt(w).ok())
+		.or_else(|| dem_proj.and_then(|p| wbprojection::from_proj_string(p).ok()));
+	let layer_crs = match (layer_epsg, layer_wkt) {
+		(Some(code), _) => Crs::from_epsg(code).ok(),
+		(None, Some(w)) => wbprojection::from_wkt(w).ok(),
+		(None, None) => None,
+	};
+	if let (Some(dst), Some(src)) = (dem_crs, layer_crs) {
+		let mut reprojected = wbvector::reproject::layer_with_crs(&layer, &src, &dst, None).map_err(|e| {
+			ToolError::Validation(format!(
+				"{} vector CRS does not match DEM CRS; automatic reprojection failed: {}",
+				input_name, e
+			))
+		})?;
+		reprojected.set_crs_wkt(Some(dem_wkt.map(str::to_string).unwrap_or_else(|| dst.to_wkt())));
 		return Ok(reprojected);
 	}
 
@@ -9702,6 +9724,7 @@ impl Tool for WatershedTool {
 		let mut out = vec![low_value; rows * cols];
 
 		// Seed basin IDs from vector feature coordinates (1-based sequential IDs)
+		let mut seeded = 0usize;
 		for (feat_idx, feature) in layer.features.iter().enumerate() {
 			let Some(ref geom) = feature.geometry else { continue };
 			let coord = match geom {
@@ -9714,9 +9737,19 @@ impl Tool for WatershedTool {
 				if let Some((col, row)) = pntr.world_to_pixel(x, y) {
 					if in_bounds(row, col, rows, cols) {
 						out[idx(row as usize, col as usize, cols)] = (feat_idx + 1) as f64;
+						seeded += 1;
 					}
 				}
 			}
+		}
+		if seeded == 0 {
+			// Usually a CRS mix-up: GeoJSON without a `crs` member is WGS 84 by
+			// spec, so coordinates in the DEM's own units land off the grid.
+			return Err(ToolError::Validation(
+				"no pour points fall on the D8 pointer raster; check that the pour points' CRS \
+				 matches their coordinates (GeoJSON without a `crs` member is read as WGS 84)"
+					.to_string(),
+			));
 		}
 		// Build flow_dir and mark NoData cells in output
 		let flow_dir = build_flow_dir_and_mark_nodata(&pntr, esri_style, &mut out, out_nodata, cols);

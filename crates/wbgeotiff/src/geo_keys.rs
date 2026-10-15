@@ -46,6 +46,8 @@ pub mod key {
     pub const ProjFalseNorthingGeoKey: u16 = 3083;
     pub const ProjFalseProjOriginLongGeoKey: u16 = 3084;
     pub const ProjFalseProjOriginLatGeoKey: u16 = 3085;
+    pub const ProjFalseOriginEastingGeoKey: u16 = 3086;
+    pub const ProjFalseOriginNorthingGeoKey: u16 = 3087;
     pub const ProjCenterLongGeoKey: u16 = 3088;
     pub const ProjCenterLatGeoKey: u16 = 3089;
     pub const ProjScaleAtNatOriginGeoKey: u16 = 3092;
@@ -245,9 +247,18 @@ impl GeoKeyDirectory {
 
     /// Return the EPSG code for the projected CRS (`ProjectedCSTypeGeoKey`),
     /// or for the geographic CRS (`GeographicTypeGeoKey`), whichever is set.
+    ///
+    /// A projected model whose `ProjectedCSTypeGeoKey` is user-defined (32767)
+    /// or missing has no EPSG code: its `GeographicTypeGeoKey` only names the
+    /// datum the projection is based on, so returning it would mislabel a grid
+    /// in metres as degrees. Use [`to_proj_string`](Self::to_proj_string) for
+    /// those.
     pub fn epsg(&self) -> Option<u16> {
         if let Some(GeoKeyValue::Short(n)) = self.get(key::ProjectedCSTypeGeoKey) {
-            if *n != 32767 { return Some(*n); }
+            if *n != 32767 && *n != 0 { return Some(*n); }
+        }
+        if self.model_type() == Some(ModelType::Projected) {
+            return None;
         }
         if let Some(GeoKeyValue::Short(n)) = self.get(key::GeographicTypeGeoKey) {
             if *n != 32767 { return Some(*n); }
@@ -307,8 +318,8 @@ impl GeoKeyDirectory {
         if let Some(v) = lon0 { s.push_str(&format!(" +lon_0={v}")); }
         if let Some(v) = d(ProjScaleAtNatOriginGeoKey) { s.push_str(&format!(" +k_0={v}")); }
         s.push_str(&format!(" +x_0={} +y_0={}",
-            d(ProjFalseEastingGeoKey).unwrap_or(0.0),
-            d(ProjFalseNorthingGeoKey).unwrap_or(0.0)));
+            d(ProjFalseEastingGeoKey).or_else(|| d(ProjFalseOriginEastingGeoKey)).unwrap_or(0.0),
+            d(ProjFalseNorthingGeoKey).or_else(|| d(ProjFalseOriginNorthingGeoKey)).unwrap_or(0.0)));
         match self.get(GeographicTypeGeoKey) {
             Some(GeoKeyValue::Short(4326)) => s.push_str(" +datum=WGS84"),
             Some(GeoKeyValue::Short(4269)) => s.push_str(" +datum=NAD83"),
@@ -320,6 +331,107 @@ impl GeoKeyDirectory {
         }
         s.push_str(" +units=m +no_defs");
         Some(s)
+    }
+
+    /// Build the GeoKeys of a *user-defined* projected CRS from a PROJ string,
+    /// the inverse of [`to_proj_string`](Self::to_proj_string). Covers the same
+    /// projections. Returns `None` for a string without a supported `+proj`
+    /// or with a non-metre `+units`.
+    pub fn from_proj_string(proj: &str) -> Option<Self> {
+        use key::*;
+        let params: Vec<(&str, &str)> = proj
+            .split_whitespace()
+            .filter_map(|t| t.strip_prefix('+'))
+            .map(|t| t.split_once('=').unwrap_or((t, "")))
+            .collect();
+        let get = |k: &str| params.iter().find(|(name, _)| *name == k).map(|(_, v)| *v);
+        let num = |k: &str| get(k).and_then(|v| v.parse::<f64>().ok());
+        if get("units").is_some_and(|u| u != "m") {
+            return None;
+        }
+        // No GeoKey here carries a latitude of true scale, and a value this
+        // parser cannot read (e.g. PROJ's `1r` radians) must not become 0.
+        const NUMERIC: [&str; 11] =
+            ["lat_0", "lon_0", "lat_1", "lat_2", "k_0", "k", "x_0", "y_0", "a", "rf", "lat_ts"];
+        if get("lat_ts").is_some() || NUMERIC.iter().any(|k| get(k).is_some() && num(k).is_none()) {
+            return None;
+        }
+        let ct: u16 = match get("proj")? {
+            "tmerc" => 1,
+            "merc" => 7,
+            "lcc" => 8,
+            "laea" => 10,
+            "aea" => 11,
+            "aeqd" => 12,
+            // Only the oblique form; polar stereographic is code 15, whose
+            // keys `to_proj_string` does not read.
+            "stere" if num("lat_0").is_none_or(|lat| lat.abs() < 90.0) => 14,
+            "eqc" => 17,
+            "mill" => 20,
+            "ortho" => 21,
+            "sinu" => 24,
+            _ => return None,
+        };
+        let mut b = GeoKeyBuilder::new()
+            .model_type(ModelType::Projected)
+            .raster_type(RasterType::PixelIsArea)
+            .short(ProjectedCSTypeGeoKey, 32767)
+            .short(ProjectionGeoKey, 32767)
+            .short(ProjCoordTransGeoKey, ct)
+            .short(ProjLinearUnitsGeoKey, 9001);
+        // An ellipsoid the keys below cannot express is rejected rather than
+        // silently written as WGS84.
+        if get("b").is_some() {
+            return None;
+        }
+        match get("datum") {
+            Some("WGS84") => b = b.short(GeographicTypeGeoKey, 4326),
+            Some("NAD83") => b = b.short(GeographicTypeGeoKey, 4269),
+            Some("NAD27") => b = b.short(GeographicTypeGeoKey, 4267),
+            Some(_) => return None,
+            None => {
+                let (a, rf) = match (num("a"), num("rf"), get("ellps")) {
+                    (Some(a), Some(rf), _) => (a, rf),
+                    (None, None, Some("GRS80")) => (6_378_137.0, 298.257_222_101),
+                    (None, None, Some("WGS84") | None) => (6_378_137.0, 298.257_223_563),
+                    _ => return None,
+                };
+                b = b
+                    .short(GeographicTypeGeoKey, 32767)
+                    .short(GeogGeodeticDatumGeoKey, 32767)
+                    .short(GeogEllipsoidGeoKey, 32767)
+                    .short(GeogAngularUnitsGeoKey, 9102)
+                    .double(GeogSemiMajorAxisGeoKey, a)
+                    .double(GeogInvFlatteningGeoKey, rf);
+            }
+        }
+        // Key choice follows what GDAL writes for each method: centre keys for
+        // the azimuthal ones, false-origin keys for the two-parallel conics.
+        let centred = matches!(ct, 10 | 12 | 21);
+        let (lat_key, lon_key) = if centred {
+            (ProjCenterLatGeoKey, ProjCenterLongGeoKey)
+        } else if ct == 8 || ct == 11 {
+            (ProjFalseProjOriginLatGeoKey, ProjFalseProjOriginLongGeoKey)
+        } else {
+            (ProjNatOriginLatGeoKey, ProjNatOriginLongGeoKey)
+        };
+        if let Some(v) = num("lat_1") { b = b.double(ProjStdParallel1GeoKey, v); }
+        if let Some(v) = num("lat_2") { b = b.double(ProjStdParallel2GeoKey, v); }
+        b = b.double(lat_key, num("lat_0").unwrap_or(0.0));
+        b = b.double(lon_key, num("lon_0").unwrap_or(0.0));
+        if let Some(v) = num("k_0").or_else(|| num("k")) {
+            b = b.double(ProjScaleAtNatOriginGeoKey, v);
+        }
+        let (fe, fn_) = (num("x_0").unwrap_or(0.0), num("y_0").unwrap_or(0.0));
+        let (fe_key, fn_key) = if ct == 8 || ct == 11 {
+            (ProjFalseOriginEastingGeoKey, ProjFalseOriginNorthingGeoKey)
+        } else {
+            (ProjFalseEastingGeoKey, ProjFalseNorthingGeoKey)
+        };
+        b = b.double(fe_key, fe).double(fn_key, fn_);
+        let mut gkd = b.build();
+        gkd.entries.sort_by_key(|e| e.key_id);
+        Some(gkd)
     }
 
     // ── Serialisation ────────────────────────────────────────────────────────
@@ -428,5 +540,77 @@ impl GeoKeyBuilder {
             minor_revision: 0,
             entries: self.entries,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GeoKeys as GDAL writes ESRI:102567 (Hartebeesthoek94 Lo29, E-N).
+    fn lo29_keys() -> GeoKeyDirectory {
+        use key::*;
+        GeoKeyBuilder::new()
+            .model_type(ModelType::Projected)
+            .raster_type(RasterType::PixelIsArea)
+            .short(GeographicTypeGeoKey, 4148)
+            .double(GeogSemiMajorAxisGeoKey, 6_378_137.0)
+            .double(GeogInvFlatteningGeoKey, 298.257_223_563)
+            .short(ProjectedCSTypeGeoKey, 32767)
+            .short(ProjectionGeoKey, 32767)
+            .short(ProjCoordTransGeoKey, 1)
+            .short(ProjLinearUnitsGeoKey, 9001)
+            .double(ProjNatOriginLongGeoKey, 29.0)
+            .double(ProjNatOriginLatGeoKey, 0.0)
+            .double(ProjFalseEastingGeoKey, 0.0)
+            .double(ProjFalseNorthingGeoKey, 0.0)
+            .double(ProjScaleAtNatOriginGeoKey, 1.0)
+            .build()
+    }
+
+    #[test]
+    fn user_defined_projected_has_no_epsg() {
+        let gk = lo29_keys();
+        assert_eq!(gk.epsg(), None, "the datum code 4148 must not stand in for the projection");
+        let proj = gk.to_proj_string().unwrap();
+        assert!(proj.starts_with("+proj=tmerc"), "{proj}");
+        assert!(proj.contains("+lon_0=29"), "{proj}");
+        assert!(proj.contains("+k_0=1"), "{proj}");
+    }
+
+    #[test]
+    fn epsg_codes_still_resolve() {
+        assert_eq!(GeoKeyBuilder::new().projected_epsg(32735).build().epsg(), Some(32735));
+        assert_eq!(GeoKeyBuilder::new().geographic_epsg(4148).build().epsg(), Some(4148));
+    }
+
+    #[test]
+    fn proj_string_round_trips_through_geokeys() {
+        for proj in [
+            "+proj=tmerc +lat_0=0 +lon_0=29 +k_0=1 +x_0=0 +y_0=0 +a=6378137 +rf=298.257223563 +units=m +no_defs",
+            "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs",
+            "+proj=lcc +lat_1=33 +lat_2=45 +lat_0=39 +lon_0=-96 +x_0=500000 +y_0=0 +datum=WGS84 +units=m +no_defs",
+            "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +datum=WGS84 +units=m +no_defs",
+        ] {
+            let gk = GeoKeyDirectory::from_proj_string(proj).unwrap();
+            assert_eq!(gk.epsg(), None);
+            assert_eq!(gk.to_proj_string().as_deref(), Some(proj));
+            let ids: Vec<u16> = gk.entries.iter().map(|e| e.key_id).collect();
+            assert!(ids.windows(2).all(|w| w[0] < w[1]), "keys must be sorted: {ids:?}");
+        }
+    }
+
+    #[test]
+    fn from_proj_string_rejects_unsupported() {
+        assert!(GeoKeyDirectory::from_proj_string("+proj=longlat +datum=WGS84").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=tmerc +lon_0=0 +units=us-ft").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=tmerc +lon_0=0 +ellps=intl").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=tmerc +lon_0=0 +a=6378137 +b=6356752").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=tmerc +lon_0=0 +datum=ED50").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=stere +lat_0=90 +lon_0=-45").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=stere +lat_0=52 +lon_0=5").is_some());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=merc +lat_ts=56.5 +datum=WGS84").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=stere +lat_0=1r +datum=WGS84").is_none());
     }
 }

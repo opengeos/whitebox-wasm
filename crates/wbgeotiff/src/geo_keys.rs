@@ -349,6 +349,13 @@ impl GeoKeyDirectory {
         if get("units").is_some_and(|u| u != "m") {
             return None;
         }
+        // No GeoKey here carries a latitude of true scale, and a value this
+        // parser cannot read (e.g. PROJ's `1r` radians) must not become 0.
+        const NUMERIC: [&str; 11] =
+            ["lat_0", "lon_0", "lat_1", "lat_2", "k_0", "k", "x_0", "y_0", "a", "rf", "lat_ts"];
+        if get("lat_ts").is_some() || NUMERIC.iter().any(|k| get(k).is_some() && num(k).is_none()) {
+            return None;
+        }
         let ct: u16 = match get("proj")? {
             "tmerc" => 1,
             "merc" => 7,
@@ -356,10 +363,9 @@ impl GeoKeyDirectory {
             "laea" => 10,
             "aea" => 11,
             "aeqd" => 12,
-            // Only the oblique form: polar stereographic (code 15) carries its
-            // latitude of true scale in keys `to_proj_string` does not read.
-            "stere" if get("lat_ts").is_none()
-                && num("lat_0").is_none_or(|lat| lat.abs() < 90.0) => 14,
+            // Only the oblique form; polar stereographic is code 15, whose
+            // keys `to_proj_string` does not read.
+            "stere" if num("lat_0").is_none_or(|lat| lat.abs() < 90.0) => 14,
             "eqc" => 17,
             "mill" => 20,
             "ortho" => 21,
@@ -602,6 +608,9 @@ mod tests {
         assert!(GeoKeyDirectory::from_proj_string("+proj=tmerc +lon_0=0 +a=6378137 +b=6356752").is_none());
         assert!(GeoKeyDirectory::from_proj_string("+proj=tmerc +lon_0=0 +datum=ED50").is_none());
         assert!(GeoKeyDirectory::from_proj_string("+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=stere +lat_0=90 +lon_0=-45").is_none());
         assert!(GeoKeyDirectory::from_proj_string("+proj=stere +lat_0=52 +lon_0=5").is_some());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=merc +lat_ts=56.5 +datum=WGS84").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=stere +lat_0=1r +datum=WGS84").is_none());
     }
 }

@@ -356,7 +356,10 @@ impl GeoKeyDirectory {
             "laea" => 10,
             "aea" => 11,
             "aeqd" => 12,
-            "stere" => 14,
+            // Only the oblique form: polar stereographic (code 15) carries its
+            // latitude of true scale in keys `to_proj_string` does not read.
+            "stere" if get("lat_ts").is_none()
+                && num("lat_0").is_none_or(|lat| lat.abs() < 90.0) => 14,
             "eqc" => 17,
             "mill" => 20,
             "ortho" => 21,
@@ -370,15 +373,22 @@ impl GeoKeyDirectory {
             .short(ProjectionGeoKey, 32767)
             .short(ProjCoordTransGeoKey, ct)
             .short(ProjLinearUnitsGeoKey, 9001);
+        // An ellipsoid the keys below cannot express is rejected rather than
+        // silently written as WGS84.
+        if get("b").is_some() {
+            return None;
+        }
         match get("datum") {
             Some("WGS84") => b = b.short(GeographicTypeGeoKey, 4326),
             Some("NAD83") => b = b.short(GeographicTypeGeoKey, 4269),
             Some("NAD27") => b = b.short(GeographicTypeGeoKey, 4267),
-            _ => {
+            Some(_) => return None,
+            None => {
                 let (a, rf) = match (num("a"), num("rf"), get("ellps")) {
                     (Some(a), Some(rf), _) => (a, rf),
-                    (_, _, Some("GRS80")) => (6_378_137.0, 298.257_222_101),
-                    _ => (6_378_137.0, 298.257_223_563),
+                    (None, None, Some("GRS80")) => (6_378_137.0, 298.257_222_101),
+                    (None, None, Some("WGS84") | None) => (6_378_137.0, 298.257_223_563),
+                    _ => return None,
                 };
                 b = b
                     .short(GeographicTypeGeoKey, 32767)
@@ -588,5 +598,10 @@ mod tests {
     fn from_proj_string_rejects_unsupported() {
         assert!(GeoKeyDirectory::from_proj_string("+proj=longlat +datum=WGS84").is_none());
         assert!(GeoKeyDirectory::from_proj_string("+proj=tmerc +lon_0=0 +units=us-ft").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=tmerc +lon_0=0 +ellps=intl").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=tmerc +lon_0=0 +a=6378137 +b=6356752").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=tmerc +lon_0=0 +datum=ED50").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45").is_none());
+        assert!(GeoKeyDirectory::from_proj_string("+proj=stere +lat_0=52 +lon_0=5").is_some());
     }
 }

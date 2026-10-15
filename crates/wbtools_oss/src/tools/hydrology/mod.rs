@@ -2569,7 +2569,7 @@ fn read_vector_layer_aligned_to_dem(dem: &Raster, path: &str, input_name: &str) 
 				input_name, e
 			))
 		})?;
-		reprojected.set_crs_wkt(dem_wkt.map(str::to_string));
+		reprojected.set_crs_wkt(Some(dem_wkt.map(str::to_string).unwrap_or_else(|| dst.to_wkt())));
 		return Ok(reprojected);
 	}
 

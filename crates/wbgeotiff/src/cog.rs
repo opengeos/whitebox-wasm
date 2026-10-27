@@ -805,24 +805,41 @@ impl CogWriter {
                 }
             }
             Resampling::Average => {
-                // 2x2 box average using f64 arithmetic
+                // Box average using f64 arithmetic. NoData (and NaN) samples are
+                // skipped, as GDAL's AVERAGE overviews do: averaging a -9999
+                // sentinel into its valid neighbours would write finite outliers
+                // along every NoData edge. A block with no valid sample stays
+                // NoData. The sentinel is compared after a round trip through the
+                // sample type, so a value such as 0.1 still matches its f32 form.
+                let nodata = self.no_data.map(|nd| {
+                    let mut buf = vec![0u8; bps_b];
+                    f64_to_bytes(nd, self.sample_format, &mut buf);
+                    bytes_to_f64(&buf, self.sample_format)
+                });
+                let is_nodata = |v: f64| v.is_nan() || nodata.is_some_and(|nd| v == nd);
                 for dy in 0..dh {
                     for dx in 0..dw {
                         let x0 = dx * sw / dw;
                         let y0 = dy * sh / dh;
                         let x1 = ((dx + 1) * sw / dw).min(sw);
                         let y1 = ((dy + 1) * sh / dh).min(sh);
-                        let count = ((x1 - x0) * (y1 - y0)).max(1) as f64;
-
                         for band in 0..spp {
                             let mut acc = 0f64;
+                            let mut count = 0usize;
                             for sy in y0..y1 {
                                 for sx in x0..x1 {
                                     let off = (sy * sw + sx) * spp * bps_b + band * bps_b;
-                                    acc += bytes_to_f64(&src[off..off + bps_b], self.sample_format);
+                                    let v = bytes_to_f64(&src[off..off + bps_b], self.sample_format);
+                                    if is_nodata(v) { continue; }
+                                    acc += v;
+                                    count += 1;
                                 }
                             }
-                            let avg = acc / count;
+                            let avg = if count > 0 {
+                                acc / count as f64
+                            } else {
+                                nodata.unwrap_or(f64::NAN)
+                            };
                             let dst_off = (dy * dw + dx) * spp * bps_b + band * bps_b;
                             f64_to_bytes(avg, self.sample_format, &mut out[dst_off..dst_off + bps_b]);
                         }
@@ -941,6 +958,46 @@ mod tests {
         // Should give [2, 4, 8] for a 4096×4096 image with 512 tiles
         assert!(!levels.is_empty());
         assert!(levels.iter().all(|&l| l > 1 && l.is_power_of_two()));
+    }
+
+    fn average_overview_f32(src: &[f32], w: u32, h: u32, factor: u32, no_data: Option<f64>) -> Vec<f32> {
+        let mut cog = CogWriter::new(w, h, 1).resampling(Resampling::Average);
+        if let Some(nd) = no_data { cog = cog.no_data(nd); }
+        cog.bits_per_sample = 32;
+        cog.sample_format = SampleFormat::IeeeFloat;
+        let bytes: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let (ow, oh) = ((w + factor - 1) / factor, (h + factor - 1) / factor);
+        let out = cog.resample_overview(&bytes, w, h, 1, 4, ow, oh, factor).unwrap();
+        out.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    }
+
+    #[test]
+    fn average_overview_skips_nodata() {
+        // One valid pixel in a 4x4 block of -9999 NoData used to average to
+        // -9374.06, a finite outlier that wrecked auto stretches (GeoLibre#3255).
+        let nd = -9999.0f32;
+        let mut src = vec![nd; 16];
+        src[5] = 0.5;
+        assert_eq!(average_overview_f32(&src, 4, 4, 4, Some(nd as f64)), vec![0.5]);
+
+        // Mixed block: the mean of the valid samples only.
+        let src = [0.2f32, nd, 0.4, nd];
+        let out = average_overview_f32(&src, 2, 2, 2, Some(nd as f64));
+        assert!((out[0] - 0.3).abs() < 1e-6, "got {}", out[0]);
+
+        // An all-NoData block stays NoData.
+        assert_eq!(average_overview_f32(&[nd; 4], 2, 2, 2, Some(nd as f64)), vec![nd]);
+
+        // A sentinel that is inexact in f32 still matches its stored form.
+        let src = [0.1f32, 0.1, 0.1, 0.9];
+        assert_eq!(average_overview_f32(&src, 2, 2, 2, Some(0.1)), vec![0.9]);
+
+        // NaN is skipped even without a declared NoData value.
+        let src = [f32::NAN, 1.0, 3.0, f32::NAN];
+        assert_eq!(average_overview_f32(&src, 2, 2, 2, None), vec![2.0]);
+
+        // Without NoData, a plain average is unchanged.
+        assert_eq!(average_overview_f32(&[1.0, 2.0, 3.0, 6.0], 2, 2, 2, None), vec![3.0]);
     }
 
     #[test]

@@ -809,14 +809,23 @@ impl CogWriter {
                 // skipped, as GDAL's AVERAGE overviews do: averaging a -9999
                 // sentinel into its valid neighbours would write finite outliers
                 // along every NoData edge. A block with no valid sample stays
-                // NoData. The sentinel is compared after a round trip through the
-                // sample type, so a value such as 0.1 still matches its f32 form.
-                let nodata = self.no_data.map(|nd| {
+                // NoData. Samples are matched against the sentinel's encoded
+                // bytes, so a float sentinel such as 0.1 matches its f32 form and
+                // 64-bit integers compare exactly (no f64 rounding). An integer
+                // sentinel the sample type cannot hold (e.g. -9999 for u8) would
+                // encode as a clamped valid value, so it filters nothing.
+                let is_float = self.sample_format == SampleFormat::IeeeFloat;
+                let nodata_bytes = self.no_data.and_then(|nd| {
                     let mut buf = vec![0u8; bps_b];
                     f64_to_bytes(nd, self.sample_format, &mut buf);
-                    bytes_to_f64(&buf, self.sample_format)
+                    let representable = is_float || bytes_to_f64(&buf, self.sample_format) == nd;
+                    representable.then_some(buf)
                 });
-                let is_nodata = |v: f64| v.is_nan() || nodata.is_some_and(|nd| v == nd);
+                let nodata = nodata_bytes.as_ref().map(|b| bytes_to_f64(b, self.sample_format));
+                let is_nodata = |raw: &[u8]| {
+                    nodata_bytes.as_deref() == Some(raw)
+                        || (is_float && bytes_to_f64(raw, self.sample_format).is_nan())
+                };
                 for dy in 0..dh {
                     for dx in 0..dw {
                         let x0 = dx * sw / dw;
@@ -829,9 +838,9 @@ impl CogWriter {
                             for sy in y0..y1 {
                                 for sx in x0..x1 {
                                     let off = (sy * sw + sx) * spp * bps_b + band * bps_b;
-                                    let v = bytes_to_f64(&src[off..off + bps_b], self.sample_format);
-                                    if is_nodata(v) { continue; }
-                                    acc += v;
+                                    let raw = &src[off..off + bps_b];
+                                    if is_nodata(raw) { continue; }
+                                    acc += bytes_to_f64(raw, self.sample_format);
                                     count += 1;
                                 }
                             }
@@ -998,6 +1007,35 @@ mod tests {
 
         // Without NoData, a plain average is unchanged.
         assert_eq!(average_overview_f32(&[1.0, 2.0, 3.0, 6.0], 2, 2, 2, None), vec![3.0]);
+    }
+
+    fn average_overview_int(src: &[u8], bps_b: usize, fmt: SampleFormat, no_data: f64) -> Vec<u8> {
+        let mut cog = CogWriter::new(2, 2, 1).resampling(Resampling::Average).no_data(no_data);
+        cog.bits_per_sample = (bps_b * 8) as u16;
+        cog.sample_format = fmt;
+        cog.resample_overview(src, 2, 2, 1, bps_b, 1, 1, 2).unwrap()
+    }
+
+    #[test]
+    fn average_overview_integer_nodata_is_exact() {
+        // A sentinel u8 cannot hold (-9999 clamps to 0) must not drop valid zeros.
+        assert_eq!(average_overview_int(&[0, 0, 100, 100], 1, SampleFormat::Uint, -9999.0), vec![50]);
+        // A representable u8 sentinel is skipped.
+        assert_eq!(average_overview_int(&[0, 0, 100, 100], 1, SampleFormat::Uint, 0.0), vec![100]);
+
+        // u64 values past 2^53 compare exactly: 2^53 + 1 is not the 2^53 sentinel.
+        let nd = 1u64 << 53;
+        // Comparing in f64 would skip both and average to 0; the valid 2^53 + 1
+        // must count, giving (2^53 + 1 + 0 + 0) / 3.
+        let src: Vec<u8> = [nd, nd + 1, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let out = average_overview_int(&src, 8, SampleFormat::Uint, nd as f64);
+        let mean = u64::from_le_bytes(out.try_into().unwrap());
+        assert_eq!(mean, ((nd + 1) as f64 / 3.0) as u64);
+        let all_nodata: Vec<u8> = [nd; 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            u64::from_le_bytes(average_overview_int(&all_nodata, 8, SampleFormat::Uint, nd as f64).try_into().unwrap()),
+            nd
+        );
     }
 
     #[test]

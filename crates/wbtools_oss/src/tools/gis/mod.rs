@@ -57,7 +57,8 @@ fn max_distance_squared(
     let d31_sq = (x3 - x1).powi(2) + (y3 - y1).powi(2) + (z3 - z1).powi(2);
     d12_sq.max(d23_sq).max(d31_sq)
 }
-use evalexpr::{build_operator_tree, ContextWithMutableFunctions, ContextWithMutableVariables, Function, HashMapContext, Value};
+use crate::expression::build_operator_tree;
+use evalexpr::{ContextWithMutableFunctions, ContextWithMutableVariables, Function, HashMapContext, Value};
 use kdtree::distance::squared_euclidean;
 use kdtree::KdTree;
 use nalgebra::{DMatrix, DVector, Matrix5, RowVector5, Vector5};
@@ -14102,7 +14103,7 @@ impl Tool for ExtractByAttributeTool {
             ));
         }
         let normalized_statement = normalize_extract_by_attribute_statement(statement)?;
-        build_operator_tree::<evalexpr::DefaultNumericTypes>(&normalized_statement).map_err(|e| {
+        build_operator_tree(&normalized_statement).map_err(|e| {
             ToolError::Validation(format!("invalid statement expression: {e}"))
         })?;
         let _ = parse_vector_path_arg(args, "output")?;
@@ -14118,7 +14119,7 @@ impl Tool for ExtractByAttributeTool {
             .map(str::trim)
             .ok_or_else(|| ToolError::Validation("parameter 'statement' is required".to_string()))?;
         let normalized_statement = normalize_extract_by_attribute_statement(statement)?;
-        let tree = build_operator_tree::<evalexpr::DefaultNumericTypes>(&normalized_statement)
+        let tree = build_operator_tree(&normalized_statement)
             .map_err(|e| ToolError::Validation(format!("invalid statement expression: {e}")))?;
         let output_path = parse_vector_path_arg(args, "output")?;
 
@@ -22759,7 +22760,7 @@ fn add_field_calculator_functions(context: &mut HashMapContext) -> Result<(), To
     Ok(())
 }
 
-fn cast_evalexpr_value_to_i64(value: &Value) -> Result<i64, evalexpr::EvalexprError<evalexpr::DefaultNumericTypes>> {
+fn cast_evalexpr_value_to_i64(value: &Value) -> Result<i64, evalexpr::EvalexprError> {
     match value {
         Value::Tuple(values) if values.len() == 1 => cast_evalexpr_value_to_i64(&values[0]),
         Value::Int(v) => Ok(*v),
@@ -22776,7 +22777,7 @@ fn cast_evalexpr_value_to_i64(value: &Value) -> Result<i64, evalexpr::EvalexprEr
     }
 }
 
-fn cast_evalexpr_value_to_f64(value: &Value) -> Result<f64, evalexpr::EvalexprError<evalexpr::DefaultNumericTypes>> {
+fn cast_evalexpr_value_to_f64(value: &Value) -> Result<f64, evalexpr::EvalexprError> {
     match value {
         Value::Tuple(values) if values.len() == 1 => cast_evalexpr_value_to_f64(&values[0]),
         Value::Int(v) => Ok(*v as f64),
@@ -22793,7 +22794,7 @@ fn cast_evalexpr_value_to_f64(value: &Value) -> Result<f64, evalexpr::EvalexprEr
     }
 }
 
-fn cast_evalexpr_value_to_string(value: &Value) -> Result<String, evalexpr::EvalexprError<evalexpr::DefaultNumericTypes>> {
+fn cast_evalexpr_value_to_string(value: &Value) -> Result<String, evalexpr::EvalexprError> {
     match value {
         Value::Tuple(values) if values.len() == 1 => cast_evalexpr_value_to_string(&values[0]),
         Value::String(v) => Ok(v.clone()),
@@ -22808,7 +22809,7 @@ fn cast_evalexpr_value_to_string(value: &Value) -> Result<String, evalexpr::Eval
     }
 }
 
-fn cast_evalexpr_value_to_bool(value: &Value) -> Result<bool, evalexpr::EvalexprError<evalexpr::DefaultNumericTypes>> {
+fn cast_evalexpr_value_to_bool(value: &Value) -> Result<bool, evalexpr::EvalexprError> {
     match value {
         Value::Tuple(values) if values.len() == 1 => cast_evalexpr_value_to_bool(&values[0]),
         Value::Boolean(v) => Ok(*v),
@@ -24647,14 +24648,14 @@ Applications: (1) Feature classification—assigning categories based on attribu
 
         let expression = parse_string_arg(args, "expression")?;
         let normalized_expression = normalize_field_calculator_expression(expression)?;
-        build_operator_tree::<evalexpr::DefaultNumericTypes>(
+        build_operator_tree(
             normalized_expression.assignment_expr.as_str(),
         )
         .map_err(|e| {
             ToolError::Validation(format!("invalid expression: {}", e))
         })?;
         if let Some(where_expression) = normalized_expression.where_expr.as_ref() {
-            build_operator_tree::<evalexpr::DefaultNumericTypes>(where_expression.as_str()).map_err(
+            build_operator_tree(where_expression.as_str()).map_err(
                 |e| {
                     ToolError::Validation(format!("invalid WHERE expression: {}", e))
                 },
@@ -24705,13 +24706,13 @@ Applications: (1) Feature classification—assigning categories based on attribu
         let output_path = parse_optional_output_path(args, "output")?
             .map(|p| p.to_string_lossy().to_string());
 
-        let tree = build_operator_tree::<evalexpr::DefaultNumericTypes>(
+        let tree = build_operator_tree(
             normalized_expression.assignment_expr.as_str(),
         )
         .map_err(|e| ToolError::Validation(format!("invalid expression: {}", e)))?;
         let where_tree = if let Some(where_expression) = normalized_expression.where_expr.as_ref() {
             Some(
-                build_operator_tree::<evalexpr::DefaultNumericTypes>(where_expression.as_str())
+                build_operator_tree(where_expression.as_str())
                     .map_err(|e| ToolError::Validation(format!("invalid WHERE expression: {}", e)))?,
             )
         } else {
@@ -35641,6 +35642,109 @@ mod tests {
             classify_one_way_direction(&wbvector::FieldValue::Boolean(false), None, None),
             OneWayDirection::Bidirectional
         );
+    }
+
+    /// Runs `tool` on `args` with every capability allowed.
+    fn run_vector_tool(tool: &dyn Tool, args: &ToolArgs) -> Result<ToolRunResult, ToolError> {
+        let sink = RecordingProgressSink::new();
+        let ctx = ToolContext {
+            progress: &sink,
+            capabilities: &AllowAllCapabilities,
+        };
+        tool.run(args, &ctx)
+    }
+
+    /// A memory layer with integer `POP`, text `NAME` (null in the third
+    /// feature) and float `AREA` attributes, for the expression tools.
+    fn expression_test_layer() -> String {
+        let mut layer = wbvector::Layer::new("places".to_string());
+        layer.geom_type = Some(wbvector::GeometryType::Point);
+        layer.add_field(wbvector::FieldDef::new("POP", wbvector::FieldType::Integer));
+        layer.add_field(wbvector::FieldDef::new("NAME", wbvector::FieldType::Text));
+        layer.add_field(wbvector::FieldDef::new("AREA", wbvector::FieldType::Float));
+        for (pop, name, area) in [(1500, Some("Memphis"), 12.5), (800, Some("Bartlett"), 3.0), (2000, None, 0.5)] {
+            layer.push(wbvector::Feature {
+                fid: 0,
+                geometry: Some(wbvector::Geometry::point(0.0, 0.0)),
+                attributes: vec![
+                    wbvector::FieldValue::Integer(pop),
+                    name.map_or(wbvector::FieldValue::Null, |n| wbvector::FieldValue::Text(n.to_string())),
+                    wbvector::FieldValue::Float(area),
+                ],
+            });
+        }
+        vector_memory_store::make_vector_memory_path(&vector_memory_store::put_vector(layer))
+    }
+
+    /// Previews `field_calculator` over [`expression_test_layer`] and returns
+    /// each row's computed value (null where a WHERE clause skipped the row).
+    fn field_calculator_values(expression: &str, field_type: &str) -> Result<Vec<serde_json::Value>, ToolError> {
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(expression_test_layer()));
+        args.insert("field".to_string(), json!("RESULT"));
+        args.insert("field_type".to_string(), json!(field_type));
+        args.insert("expression".to_string(), json!(expression));
+        args.insert("preview_rows".to_string(), json!(3));
+        let result = run_vector_tool(&FieldCalculatorTool, &args)?;
+        Ok(result.outputs["preview"]
+            .as_array()
+            .expect("preview rows")
+            .iter()
+            .map(|row| row["computed_value"].clone())
+            .collect())
+    }
+
+    #[test]
+    fn field_calculator_keeps_expression_semantics() {
+        // Integer division stays integer; casts, functions and radix literals work.
+        assert_eq!(field_calculator_values("POP / 7", "float").unwrap(), [json!(214.0), json!(114.0), json!(285.0)]);
+        assert_eq!(
+            field_calculator_values("CAST(AREA AS integer) + 0b10", "integer").unwrap(),
+            [json!(14), json!(5), json!(2)]
+        );
+        assert_eq!(
+            field_calculator_values("if(NAME == null, -1, math::pow(AREA, 2))", "float").unwrap(),
+            [json!(156.25), json!(9.0), json!(-1.0)]
+        );
+        assert_eq!(
+            field_calculator_values(
+                "CASE WHEN POP >= 1500 AND NAME IS NOT NULL THEN 'large' WHEN POP > 1000 THEN 'mid' ELSE 'small' END",
+                "text"
+            )
+            .unwrap(),
+            [json!("large"), json!("small"), json!("mid")]
+        );
+        assert_eq!(
+            field_calculator_values(
+                "UPDATE places SET RESULT = str::to_uppercase(NAME) + '!' WHERE NAME IS NOT NULL",
+                "text"
+            )
+            .unwrap(),
+            [json!("MEMPHIS!"), json!("BARTLETT!"), serde_json::Value::Null]
+        );
+        // A type error fails the run instead of writing a value.
+        let err = field_calculator_values("NAME * 2", "text").unwrap_err();
+        assert!(err.to_string().contains("expression evaluation failed"), "{err}");
+    }
+
+    #[test]
+    fn extract_by_attribute_keeps_expression_semantics() {
+        let extract = |statement: &str| -> Vec<wbvector::FieldValue> {
+            let mut args = ToolArgs::new();
+            args.insert("input".to_string(), json!(expression_test_layer()));
+            args.insert("statement".to_string(), json!(statement));
+            let result = run_vector_tool(&ExtractByAttributeTool, &args).expect("extract_by_attribute runs");
+            let path = result.outputs["path"].as_str().expect("output path");
+            let output = vector_memory_store::get_vector_arc_by_path(path).expect("output layer");
+            output.features.iter().map(|f| f.attributes[0].clone()).collect()
+        };
+        let pops = |values: &[i64]| -> Vec<wbvector::FieldValue> {
+            values.iter().map(|v| wbvector::FieldValue::Integer(*v)).collect()
+        };
+        assert_eq!(extract("POP > 1000 AND NAME <> 'Memphis'"), pops(&[2000]));
+        assert_eq!(extract("NAME IS NULL OR AREA = 3.0"), pops(&[800, 2000]));
+        assert_eq!(extract("POP / 1000 == 1 && AREA > 1.5"), pops(&[1500]));
+        assert_eq!(extract("str::substring(NAME, 0, 3) == 'Mem'"), pops(&[1500]));
     }
 }
 

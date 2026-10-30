@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use evalexpr::{build_operator_tree, ContextWithMutableVariables, DefaultNumericTypes, HashMapContext, Value as EvalValue};
+use crate::expression::build_operator_tree;
+use evalexpr::{ContextWithMutableVariables, HashMapContext, Value as EvalValue};
 use nalgebra::{DMatrix, DVector};
 use kdtree::distance::squared_euclidean;
 use kdtree::KdTree;
@@ -619,7 +620,7 @@ fn parse_conditional_value_source(
     }
 
     let expr = normalize_conditional_expression(s);
-    let tree = build_operator_tree::<DefaultNumericTypes>(&expr)
+    let tree = build_operator_tree(&expr)
         .map_err(|e| ToolError::Validation(format!("invalid '{}' expression: {e}", key)))?;
     Ok(ConditionalValueSource::Expr(tree))
 }
@@ -5690,7 +5691,7 @@ impl Tool for ConditionalEvaluationTool {
             return Err(ToolError::Validation("statement must be non-empty".to_string()));
         }
         let normalized = normalize_conditional_expression(statement);
-        build_operator_tree::<DefaultNumericTypes>(&normalized)
+        build_operator_tree(&normalized)
             .map_err(|e| ToolError::Validation(format!("invalid statement expression: {e}")))?;
         let _ = parse_optional_output_path(args, "output")?;
         Ok(())
@@ -5717,7 +5718,7 @@ impl Tool for ConditionalEvaluationTool {
 
         let normalized_statement = normalize_conditional_expression(statement);
         let statement_contains_nodata = normalized_statement.contains("nodata");
-        let condition_tree = build_operator_tree::<DefaultNumericTypes>(&normalized_statement)
+        let condition_tree = build_operator_tree(&normalized_statement)
             .map_err(|e| ToolError::Validation(format!("invalid statement expression: {e}")))?;
 
         let true_source = parse_conditional_value_source(args, "true", &input)?;
@@ -8038,7 +8039,7 @@ impl Tool for RasterCalculatorTool {
 
         let statement_contains_nodata = expression.contains("nodata") || expression.contains("null");
         let normalized = normalize_conditional_expression(&stmt);
-        let expr_tree = build_operator_tree::<DefaultNumericTypes>(&normalized)
+        let expr_tree = build_operator_tree(&normalized)
             .map_err(|e| ToolError::Validation(format!("invalid expression: {e}")))?;
 
         let north = inputs[0].y_min + inputs[0].rows as f64 * inputs[0].cell_size_y;
@@ -8629,13 +8630,13 @@ mod tests {
 
     #[test]
     fn normalized_equality_evaluates_true_against_float_context() {
-        let mut context = HashMapContext::<DefaultNumericTypes>::new();
+        let mut context = HashMapContext::new();
         context
             .set_value("value0".to_string(), EvalValue::Float(1.0))
             .unwrap();
         for expr in ["value0 == 1", "value0 = 1"] {
             let normalized = normalize_conditional_expression(expr);
-            let tree = build_operator_tree::<DefaultNumericTypes>(&normalized).unwrap();
+            let tree = build_operator_tree(&normalized).unwrap();
             assert_eq!(
                 tree.eval_with_context(&context).unwrap(),
                 EvalValue::Boolean(true),
@@ -8643,7 +8644,7 @@ mod tests {
             );
         }
         let normalized = normalize_conditional_expression("value0 != 1");
-        let tree = build_operator_tree::<DefaultNumericTypes>(&normalized).unwrap();
+        let tree = build_operator_tree(&normalized).unwrap();
         assert_eq!(tree.eval_with_context(&context).unwrap(), EvalValue::Boolean(false));
     }
 
@@ -8698,5 +8699,51 @@ mod tests {
         let out = run_raster_calculator("'clusters' != 1");
         let values: Vec<f64> = (0..4).map(|c| out.get(0, 0, c as isize)).collect();
         assert_eq!(values, vec![1.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn raster_calculator_keeps_expression_language() {
+        let cells = |expression: &str| -> Vec<f64> {
+            let out = run_raster_calculator(expression);
+            (0..4).map(|c| out.get(0, 0, c as isize)).collect()
+        };
+        // The input cells are 0, 1, 2 and 3.
+        assert_eq!(cells("if('c' > 1.5, math::sqrt('c' * 'c'), -1)"), [-1.0, -1.0, 2.0, 3.0]);
+        assert_eq!(cells("max('c', 2) + 7 / 2"), [5.5, 5.5, 5.5, 6.5]);
+        assert_eq!(cells("'c' >= 2 AND NOT ('c' == 3)"), [0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(cells("'c' + bitand(0b110, 0o3)"), [2.0, 3.0, 4.0, 5.0]);
+        // A non-numeric result becomes NoData rather than failing the run.
+        assert_eq!(cells("str::from('c')"), [-32768.0; 4]);
+    }
+
+    #[test]
+    fn conditional_evaluation_evaluates_true_and_false_expressions() {
+        let mut input = Raster::new(RasterConfig {
+            rows: 1,
+            cols: 4,
+            bands: 1,
+            nodata: -9999.0,
+            cell_size: 10.0,
+            ..Default::default()
+        });
+        for (col, v) in [0.0, 1.0, 2.0, 3.0].into_iter().enumerate() {
+            input.set(0, 0, col as isize, v).unwrap();
+        }
+        let id = memory_store::put_raster(input);
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(memory_store::make_raster_memory_path(&id)));
+        args.insert("statement".to_string(), json!("value > 1 && value < 3 && row == 0"));
+        args.insert("true".to_string(), json!("value * 10 + math::abs(-0.5)"));
+        args.insert("false".to_string(), json!("if(value == 0, nodata, -value)"));
+
+        let result = ConditionalEvaluationTool.run(&args, &make_ctx()).unwrap();
+        memory_store::remove_raster_by_id(&id);
+        let locator = result.outputs["output"]["path"].as_str().unwrap().to_string();
+        let out = memory_store::raster_path_to_id(&locator)
+            .and_then(memory_store::get_raster_by_id)
+            .expect("output raster should be in the memory store");
+        memory_store::remove_raster_by_path(&locator);
+        let values: Vec<f64> = (0..4).map(|c| out.get(0, 0, c as isize)).collect();
+        assert_eq!(values, vec![-9999.0, -1.0, 20.5, -3.0]);
     }
 }

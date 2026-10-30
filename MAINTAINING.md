@@ -72,6 +72,7 @@ must be re-applied. All are small, additive, and backward-compatible.
 | `wbraster/src/formats/geotiff.rs` | `geotiff::write` defaults to `GeoTiffLayout::Cog` + `Deflate` | tool raster outputs are tiled COGs (open in geotiff.js / GeoLibre); affects every tool that writes a `.tif` |
 | `wbhdf/Cargo.toml` | `thiserror = "1"` instead of `{ workspace = true }` | optional now that the root defines `[workspace.dependencies]` |
 | `crates/kdtree-wasm/Cargo.toml` | remove the `criterion` dependency + `[[bench]]` | issue 2 above |
+| `wbtools_oss/Cargo.toml`, `wbtools_oss/src/expression.rs` | `evalexpr = "11.3.1"` instead of `13.1.0`; the raster, vector and LiDAR tools parse expressions through `crate::expression::build_operator_tree` (drop the `DefaultNumericTypes` arguments upstream's calls pass) | 11.3.1 is the last MIT-licensed `evalexpr`; 12.0 and later are AGPL-3.0-only. `expression.rs` keeps the `0b`/`0o` literals 13.1 added |
 
 > Tip for future maintainability: prefer putting new functions in a **separate
 > file** (e.g. `wbgeotiff/src/wasm_ext.rs` with `pub mod wasm_ext;`) so that
@@ -103,6 +104,9 @@ updates never touch them.
    different nearest-neighbour crate), drop `crates/kdtree-wasm` and the
    `[patch.crates-io]`. Re-run the getrandom/ureq checks if `rand`/`ureq` versions
    changed.
+   Run `cargo deny check licenses` (CI runs it too): every dependency must be
+   usable under MIT OR Apache-2.0, and upstream's `wbtools_oss` requires the
+   AGPL-licensed `evalexpr` 13.
 4. **Build and test both targets:**
    ```bash
    # browser package

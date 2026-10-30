@@ -40,3 +40,13 @@ jobs:
           for f in svf noflow planc pennock; do
             test -s "work/$f.tif" || { echo "::error::$f.tif was not written"; exit 1; }
           done
+      - name: Smoke test (expression tools)
+        run: |
+          cp examples/sample.geojson examples/sample.las work/
+          wasm=target/wasm32-wasip1/release/whitebox.wasm
+          run() { ~/.wasmtime/bin/wasmtime run --dir work::/work "$wasm" "$@"; }
+          run raster_calculator "--expression=if('dem' > 0, 'dem' * 2, 0)" --inputs=/work/dem.tif --output=/work/calc.tif
+          run field_calculator --input=/work/sample.geojson --field=big "--expression=if(pop > 600000, 1, 0)" --field_type=integer --output=/work/fc.geojson
+          run filter_lidar "--statement=z > mid_z" --input=/work/sample.las --output=/work/filt.las
+          test -s work/calc.tif && test -s work/filt.las
+          test "$(grep -o '"big":1' work/fc.geojson | wc -l)" -eq 2

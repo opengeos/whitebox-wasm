@@ -30,3 +30,12 @@ jobs:
         run: wasm-pack build crates/whitebox-wasm --release --target web --out-dir pkg
       - name: Node smoke test
         run: node examples/node-demo.mjs
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Dependency licenses
+        run: cargo deny --locked check licenses

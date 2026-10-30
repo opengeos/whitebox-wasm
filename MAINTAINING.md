@@ -104,6 +104,9 @@ updates never touch them.
    different nearest-neighbour crate), drop `crates/kdtree-wasm` and the
    `[patch.crates-io]`. Re-run the getrandom/ureq checks if `rand`/`ureq` versions
    changed.
+   Run `cargo deny check licenses` (CI runs it too): every dependency must be
+   usable under MIT OR Apache-2.0, and upstream's `wbtools_oss` requires the
+   AGPL-licensed `evalexpr` 13.
 4. **Build and test both targets:**
    ```bash
    # browser package

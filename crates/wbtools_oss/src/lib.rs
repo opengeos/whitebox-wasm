@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use wbcore::*;
 
+pub(crate) mod expression;
 pub mod memory_store;
 pub mod palettes;
 pub mod rendering;

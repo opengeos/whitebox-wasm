@@ -15,7 +15,8 @@ use std::sync::Arc;
 use kdtree::distance::squared_euclidean;
 use kdtree::KdTree;
 use nalgebra::{linalg::SymmetricEigen, Matrix3, Vector3};
-use evalexpr::{build_operator_tree, Context, ContextWithMutableVariables, DefaultNumericTypes, HashMapContext, Value as EvalValue};
+use crate::expression::build_operator_tree;
+use evalexpr::{Context, ContextWithMutableVariables, HashMapContext, Value as EvalValue};
 use rand::{RngExt, SeedableRng};
 use rand::seq::IndexedRandom;
 use rayon::prelude::*;
@@ -2524,7 +2525,7 @@ fn build_filter_context(
     min_z: f64,
     max_z: f64,
 ) -> Result<HashMapContext, ToolError> {
-    let mut ctx = HashMapContext::<DefaultNumericTypes>::new();
+    let mut ctx = HashMapContext::new();
     let is_noise = point_is_noise(p);
     let is_withheld = point_is_withheld(p);
     let is_only = p.return_number == 1 && p.number_of_returns == 1;
@@ -2547,12 +2548,12 @@ fn build_filter_context(
     let n_pts = n_points as f64;
 
     let vars: [(&str, EvalValue); 41] = [
-        ("x", EvalValue::from_float(p.x)),
-        ("y", EvalValue::from_float(p.y)),
-        ("z", EvalValue::from_float(p.z)),
-        ("intensity", EvalValue::from_int(i64::from(p.intensity))),
-        ("ret", EvalValue::from_int(i64::from(p.return_number))),
-        ("nret", EvalValue::from_int(i64::from(p.number_of_returns))),
+        ("x", EvalValue::Float(p.x)),
+        ("y", EvalValue::Float(p.y)),
+        ("z", EvalValue::Float(p.z)),
+        ("intensity", EvalValue::Int(i64::from(p.intensity))),
+        ("ret", EvalValue::Int(i64::from(p.return_number))),
+        ("nret", EvalValue::Int(i64::from(p.number_of_returns))),
         ("is_only", EvalValue::from(is_only)),
         ("is_multiple", EvalValue::from(is_multiple)),
         ("is_early", EvalValue::from(is_early)),
@@ -2560,34 +2561,34 @@ fn build_filter_context(
         ("is_late", EvalValue::from(is_late)),
         ("is_first", EvalValue::from(is_first)),
         ("is_last", EvalValue::from(is_last)),
-        ("class", EvalValue::from_int(i64::from(p.classification))),
+        ("class", EvalValue::Int(i64::from(p.classification))),
         ("is_noise", EvalValue::from(is_noise)),
         ("is_synthetic", EvalValue::from(is_synthetic)),
         ("is_keypoint", EvalValue::from(is_keypoint)),
         ("is_withheld", EvalValue::from(is_withheld)),
         ("is_overlap", EvalValue::from(is_overlap)),
-        ("scan_angle", EvalValue::from_float(f64::from(p.scan_angle))),
+        ("scan_angle", EvalValue::Float(f64::from(p.scan_angle))),
         ("scan_direction", EvalValue::from(p.scan_direction_flag)),
         ("is_flightline_edge", EvalValue::from(p.edge_of_flight_line)),
-        ("user_data", EvalValue::from_int(i64::from(p.user_data))),
-        ("point_source_id", EvalValue::from_int(i64::from(p.point_source_id))),
-        ("scanner_channel", EvalValue::from_int(scanner_channel)),
-        ("time", EvalValue::from_float(time)),
-        ("red", EvalValue::from_int(red as i64)),
-        ("green", EvalValue::from_int(green as i64)),
-        ("blue", EvalValue::from_int(blue as i64)),
-        ("nir", EvalValue::from_int(i64::from(p.nir.unwrap_or(0)))),
-        ("pt_num", EvalValue::from_int(point_index as i64)),
-        ("n_pts", EvalValue::from_int(n_pts as i64)),
-        ("min_x", EvalValue::from_float(min_x)),
-        ("mid_x", EvalValue::from_float((min_x + max_x) / 2.0)),
-        ("max_x", EvalValue::from_float(max_x)),
-        ("min_y", EvalValue::from_float(min_y)),
-        ("mid_y", EvalValue::from_float((min_y + max_y) / 2.0)),
-        ("max_y", EvalValue::from_float(max_y)),
-        ("min_z", EvalValue::from_float(min_z)),
-        ("mid_z", EvalValue::from_float((min_z + max_z) / 2.0)),
-        ("max_z", EvalValue::from_float(max_z)),
+        ("user_data", EvalValue::Int(i64::from(p.user_data))),
+        ("point_source_id", EvalValue::Int(i64::from(p.point_source_id))),
+        ("scanner_channel", EvalValue::Int(scanner_channel)),
+        ("time", EvalValue::Float(time)),
+        ("red", EvalValue::Int(red as i64)),
+        ("green", EvalValue::Int(green as i64)),
+        ("blue", EvalValue::Int(blue as i64)),
+        ("nir", EvalValue::Int(i64::from(p.nir.unwrap_or(0)))),
+        ("pt_num", EvalValue::Int(point_index as i64)),
+        ("n_pts", EvalValue::Int(n_pts as i64)),
+        ("min_x", EvalValue::Float(min_x)),
+        ("mid_x", EvalValue::Float((min_x + max_x) / 2.0)),
+        ("max_x", EvalValue::Float(max_x)),
+        ("min_y", EvalValue::Float(min_y)),
+        ("mid_y", EvalValue::Float((min_y + max_y) / 2.0)),
+        ("max_y", EvalValue::Float(max_y)),
+        ("min_z", EvalValue::Float(min_z)),
+        ("mid_z", EvalValue::Float((min_z + max_z) / 2.0)),
+        ("max_z", EvalValue::Float(max_z)),
     ];
 
     for (name, value) in vars {
@@ -8746,7 +8747,7 @@ impl Tool for FilterLidarTool {
             return Err(ToolError::Validation("statement must be non-empty".to_string()));
         }
         let normalized_statement = normalize_filter_lidar_statement(statement);
-        let _ = build_operator_tree::<DefaultNumericTypes>(&normalized_statement)
+        let _ = build_operator_tree(&normalized_statement)
             .map_err(|e| ToolError::Validation(format!("invalid statement expression: {e}")))?;
         let _ = parse_optional_lidar_output_path(args)?;
         Ok(())
@@ -8761,7 +8762,7 @@ impl Tool for FilterLidarTool {
             .ok_or_else(|| ToolError::Validation("statement is required".to_string()))?
             .to_string();
         let normalized_statement = normalize_filter_lidar_statement(&statement);
-        let tree = build_operator_tree::<DefaultNumericTypes>(&normalized_statement)
+        let tree = build_operator_tree(&normalized_statement)
             .map_err(|e| ToolError::Validation(format!("invalid statement expression: {e}")))?;
         let output_path = parse_optional_lidar_output_path(args)?;
 
@@ -8855,7 +8856,7 @@ impl Tool for ModifyLidarTool {
                     found_assignment = true;
                 }
             }
-            let _ = build_operator_tree::<DefaultNumericTypes>(s)
+            let _ = build_operator_tree(s)
                 .map_err(|e| ToolError::Validation(format!("invalid statement expression '{}': {e}", s)))?;
         }
         if !found_assignment {
@@ -8877,7 +8878,7 @@ impl Tool for ModifyLidarTool {
         let statements = parse_modify_statements(statement_raw)?;
         let trees = statements
             .iter()
-            .map(|s| build_operator_tree::<DefaultNumericTypes>(s).map_err(|e| ToolError::Validation(format!("invalid statement expression '{}': {e}", s))))
+            .map(|s| build_operator_tree(s).map_err(|e| ToolError::Validation(format!("invalid statement expression '{}': {e}", s))))
             .collect::<Result<Vec<_>, _>>()?;
         let output_path = parse_optional_lidar_output_path(args)?;
 
@@ -8913,14 +8914,14 @@ impl Tool for ModifyLidarTool {
                 // Add tuple aliases for statement compatibility.
                 let _ = eval_ctx.set_value(
                     "xy".to_string(),
-                    EvalValue::Tuple(vec![EvalValue::from_float(point.x), EvalValue::from_float(point.y)]),
+                    EvalValue::Tuple(vec![EvalValue::Float(point.x), EvalValue::Float(point.y)]),
                 );
                 let _ = eval_ctx.set_value(
                     "xyz".to_string(),
                     EvalValue::Tuple(vec![
-                        EvalValue::from_float(point.x),
-                        EvalValue::from_float(point.y),
-                        EvalValue::from_float(point.z),
+                        EvalValue::Float(point.x),
+                        EvalValue::Float(point.y),
+                        EvalValue::Float(point.z),
                     ]),
                 );
                 let (r, g, b) = point
@@ -8930,9 +8931,9 @@ impl Tool for ModifyLidarTool {
                 let _ = eval_ctx.set_value(
                     "rgb".to_string(),
                     EvalValue::Tuple(vec![
-                        EvalValue::from_int(r),
-                        EvalValue::from_int(g),
-                        EvalValue::from_int(b),
+                        EvalValue::Int(r),
+                        EvalValue::Int(g),
+                        EvalValue::Int(b),
                     ]),
                 );
 
@@ -14843,4 +14844,56 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn filter_lidar_expression_selects_points() {
+        let in_path = lidar_memory_store::make_lidar_memory_path(&lidar_memory_store::put_lidar(make_test_point_cloud()));
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(in_path));
+        args.insert("statement".to_string(), json!("class == 5 AND NOT (x > 2) && is_only"));
+
+        let result = FilterLidarTool.run(&args, &make_ctx()).expect("filter_lidar runs");
+        let out_path = result.outputs["path"].as_str().expect("output path");
+        let out = load_lidar_cloud(Path::new(out_path), "output").expect("filtered output");
+        let mut kept: Vec<(f64, f64)> = out.points.iter().map(|p| (p.x, p.y)).collect();
+        kept.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(kept, [(0.0, 0.0), (0.0, 5.0), (1.0, 4.0), (2.0, 3.0)]);
+    }
+
+    #[test]
+    fn modify_lidar_expression_assignments_apply_in_order() {
+        let in_path = lidar_memory_store::make_lidar_memory_path(&lidar_memory_store::put_lidar(make_test_point_cloud()));
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(in_path));
+        args.insert(
+            "statement".to_string(),
+            json!("class = if(z > 101, 2, class); intensity += 0b11\nz = z * 2; user_data = pt_num % 4"),
+        );
+
+        let result = ModifyLidarTool.run(&args, &make_ctx()).expect("modify_lidar runs");
+        let out_path = result.outputs["path"].as_str().expect("output path");
+        let out = load_lidar_cloud(Path::new(out_path), "output").expect("modified output");
+        let input = make_test_point_cloud();
+        assert_eq!(out.points.len(), input.points.len());
+        for (i, (before, after)) in input.points.iter().zip(&out.points).enumerate() {
+            let class = if before.z > 101.0 { 2 } else { before.classification };
+            assert_eq!(after.classification, class, "point {i}");
+            assert_eq!(after.intensity, 123, "point {i}");
+            assert!((after.z - before.z * 2.0).abs() < 1.0e-6, "point {i}");
+            assert_eq!(after.user_data, (i % 4) as u8, "point {i}");
+        }
+    }
+
+    #[test]
+    fn modify_lidar_expression_errors_fail_the_run() {
+        let in_path = lidar_memory_store::make_lidar_memory_path(&lidar_memory_store::put_lidar(make_test_point_cloud()));
+        let run = |statement: &str| {
+            let mut args = ToolArgs::new();
+            args.insert("input".to_string(), json!(in_path));
+            args.insert("statement".to_string(), json!(statement));
+            ModifyLidarTool.run(&args, &make_ctx()).map(|_| ())
+        };
+        assert!(matches!(run("z = (1"), Err(ToolError::Validation(_))));
+        assert!(matches!(run("z = no_such_field"), Err(ToolError::Execution(_))));
+    }
 }

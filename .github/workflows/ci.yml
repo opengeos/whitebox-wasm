@@ -23,7 +23,19 @@ jobs:
         # Scope to our crates; the vendored wbprojection ships an authoritative
         # EPSG/datum fixture suite that needs data files we don't vendor.
         run: cargo test -p wbgeotiff -p whitebox-wasm
+      - name: cargo test (expression tools)
+        # The evaluator behind the raster, vector and LiDAR expression tools.
+        run: cargo test -p wbtools_oss --lib expression
       - name: wasm-pack build
         run: wasm-pack build crates/whitebox-wasm --release --target web --out-dir pkg
       - name: Node smoke test
         run: node examples/node-demo.mjs
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Dependency licenses
+        run: cargo deny --locked check licenses

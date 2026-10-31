@@ -1,0 +1,22 @@
+THIRD-PARTY NOTICES
+
+whitebox-wasm is distributed under the MIT License or the Apache License 2.0, at
+your option (see LICENSE-MIT and LICENSE-APACHE). Its WebAssembly artifacts are
+built from the Rust crates listed below, under these licenses.
+
+{{#each licenses}}
+================================================================================
+{{{name}}} ({{id}})
+
+Used by:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}{{#if crate.authors}} by {{#each crate.authors}}{{#unless @first}}, {{/unless}}{{{this}}}{{/each}}{{/if}}
+{{/each}}
+{{#if (eq id "IJG")}}
+
+This software is based in part on the work of the Independent JPEG Group.
+{{/if}}
+
+{{{text}}}
+
+{{/each}}

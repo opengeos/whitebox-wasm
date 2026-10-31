@@ -21,6 +21,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
       - name: Build the browser package and the WASI tool runner
         run: |
           wasm-pack build crates/whitebox-wasm --release --target web \
@@ -32,6 +35,9 @@ jobs:
           cp examples/sample.tif site/sample.tif
           cp examples/sample.geojson site/sample.geojson
           cp examples/sample.las site/sample.las
+          cp LICENSE-MIT site/LICENSE-MIT.txt
+          cp LICENSE-APACHE site/LICENSE-APACHE.txt
+          python3 scripts/third_party_notices.py site/THIRD-PARTY-NOTICES.txt
           rm -f site/.gitignore
           # cache-bust the glue + wasm together so returning visitors never
           # mix an old cached loader with a freshly built module

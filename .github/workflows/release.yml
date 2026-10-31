@@ -16,9 +16,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny
+          tool: cargo-deny,cargo-about
       - name: Dependency licenses
         run: cargo deny --locked check licenses
+      - name: Third-party notices
+        run: python3 scripts/third_party_notices.py target/THIRD-PARTY-NOTICES.txt
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - uses: actions/setup-node@v6
@@ -59,6 +61,7 @@ jobs:
           cp crates/whitebox-wasm/pkg/whitebox_wasm.js      dist/whitebox-wasm-${GITHUB_REF_NAME}.js
           cp crates/whitebox-wasm/pkg/whitebox_wasm.d.ts    dist/whitebox-wasm-${GITHUB_REF_NAME}.d.ts
           cp target/wasm32-wasip1/release/whitebox.wasm     dist/whitebox-cli-${GITHUB_REF_NAME}.wasm
+          cp LICENSE-MIT LICENSE-APACHE target/THIRD-PARTY-NOTICES.txt dist/
           (cd dist && sha256sum * > SHA256SUMS.txt)
 
       - name: Attach to GitHub Release

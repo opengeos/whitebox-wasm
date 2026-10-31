@@ -39,7 +39,8 @@ def crate_notices(about):
 
 def main():
     """Write the notices to the path given as the only argument."""
-    output = Path(sys.argv[1])
+    output = Path(sys.argv[1]).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run([*CARGO_ABOUT, "-o", str(output), "about.hbs"], cwd=ROOT, check=True)
     about = json.loads(
         subprocess.run(

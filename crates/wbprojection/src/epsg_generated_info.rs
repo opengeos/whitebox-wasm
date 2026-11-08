@@ -2400,6 +2400,12 @@ pub(crate) fn generated_epsg_info(code: u32) -> Option<EpsgInfo> {
             area_of_use: "Bangladesh - onshore and offshore.",
             unit: "metre",
         }),
+        10857 => Some(EpsgInfo {
+            code: 10857,
+            name: "SIRGAS 2000 / Brazil Albers",
+            area_of_use: "Brazil - onshore.",
+            unit: "metre",
+        }),
         21028 => Some(EpsgInfo {
             code: 21028,
             name: "GSK-2011 / Gauss-Kruger CM 165E",

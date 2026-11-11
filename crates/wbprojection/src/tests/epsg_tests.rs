@@ -258,6 +258,31 @@ fn epsg_generated_batch19_codes_build_ok() {
 fn epsg_generated_batch20_codes_build_ok() {
     assert!(Crs::from_epsg(9821).is_ok());
     assert!(Crs::from_epsg(10626).is_ok());
+    assert!(Crs::from_epsg(10857).is_ok());
+}
+
+#[test]
+fn epsg_10857_sirgas2000_brazil_albers_matches_proj() {
+    // EPSG:10857 = SIRGAS 2000 / Brazil Albers (IBGE), +proj=aea +lat_0=-12 +lon_0=-54
+    // +lat_1=-2 +lat_2=-22 +x_0=5000000 +y_0=10000000 +ellps=GRS80. Expected values from
+    // PROJ 9.5.1 (pyproj) with those parameters, from EPSG:4674 (SIRGAS 2000).
+    let crs = Crs::from_epsg(10857).unwrap();
+    assert_eq!(crs.name, "SIRGAS_2000_Brazil_Albers");
+    assert_eq!(epsg_info(10857).map(|i| i.name), Some("SIRGAS 2000 / Brazil Albers"));
+    assert!(known_epsg_codes().contains(&10857));
+    let cases = [
+        ((-54.0, -12.0), (5_000_000.0, 10_000_000.0)),
+        ((-42.8786, -20.7546), (6_153_607.9086, 8_997_042.0831)),
+        ((-35.2, -5.8), (7_061_609.8709, 10_625_495.4258)),
+        ((-51.23, -30.03), (5_277_368.0448, 8_005_468.6834)),
+        ((-60.67, 2.82), (4_245_415.9834, 11_636_710.8295)),
+    ];
+    for ((lon, lat), (x, y)) in cases {
+        let (e, n) = crs.forward(lon, lat).unwrap();
+        assert!((e - x).abs() < 0.01 && (n - y).abs() < 0.01, "({lon}, {lat}) -> ({e}, {n}), PROJ ({x}, {y})");
+        let (lon2, lat2) = crs.inverse(e, n).unwrap();
+        assert!((lon2 - lon).abs() < TOL && (lat2 - lat).abs() < TOL, "round trip: ({lon2}, {lat2})");
+    }
 }
 
 #[test]

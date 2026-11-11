@@ -49,7 +49,9 @@ impl LccProj {
             (m1.ln() - m2.ln()) / (t1.ln() - t2.ln())
         };
 
-        let f = m1 / (n * t1.powf(n));
+        // The scale factor k0 multiplies every radius (EPSG Guidance Note 7-2,
+        // LCC 1SP: rho = a F t^n k0). The two-parallel method has k0 = 1.
+        let f = m1 / (n * t1.powf(n)) * p.scale;
         let rho0 = a * f * t0.powf(n);
 
         Ok(LccProj {

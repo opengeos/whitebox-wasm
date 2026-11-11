@@ -234,6 +234,24 @@ fn lcc_one_standard_parallel() {
     round_trip(&proj, -90.0, 45.0);
 }
 
+/// LCC with a scale factor other than 1 (the 1SP method, and the US state
+/// systems with k > 1). The scale factor used to be ignored, which put
+/// EPSG:2085 about 3.5 m off. Reference values from PROJ 9.8.1.
+#[test]
+fn lcc_applies_the_scale_factor() {
+    for (code, lon, lat, x, y) in [
+        (2085u32, -80.5, 22.85, 551_317.148_018, 335_744.923_899),
+        (2192, 2.837_229_166_666_667, 47.3, 637_812.945_625, 2_255_701.944_731),
+        (6792, -120.75, 45.0 + 1.0 / 6.0, 119_314.923_632, 185_693.039_185),
+    ] {
+        let crs = crate::Crs::from_epsg(code).unwrap();
+        let (gx, gy) = crs.forward(lon, lat).unwrap();
+        assert!((gx - x).abs() < 1.0e-3 && (gy - y).abs() < 1.0e-3, "EPSG:{code}: ({gx}, {gy}) != ({x}, {y})");
+        let (glon, glat) = crs.inverse(gx, gy).unwrap();
+        assert!((glon - lon).abs() < 1.0e-9 && (glat - lat).abs() < 1.0e-9, "EPSG:{code} inverse");
+    }
+}
+
 // ─── Albers Equal-Area Conic ────────────────────────────────────────────
 
 #[test]

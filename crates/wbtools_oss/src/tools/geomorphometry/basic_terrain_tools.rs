@@ -734,7 +734,7 @@ Applications: (1) Valley/ridge identification without flow direction computation
         ToolMetadata {
             id: "hillshade",
             display_name: "Hillshade",
-            summary: r#"Produces shaded relief (hillshade) visualization from DEM using directional illumination model. Illumination from specified azimuth (0-360°) and altitude (0-90°) angles creates 3D appearance showing terrain relief. Output is grayscale 0-255 image where slopes facing light appear bright, slopes facing away appear dark.
+            summary: r#"Produces shaded relief (hillshade) visualization from DEM using directional illumination model. Illumination from specified azimuth (0-360°) and altitude (0-90°) angles creates 3D appearance showing terrain relief. Output is a grayscale image scaled 0-32767 (not 8-bit) where slopes facing light appear bright, slopes facing away appear dark.
 
 Hillshade is fundamental terrain visualization technique for qualitative relief display and analysis. Single light source variant (this tool) is fast, simple, and suitable for quick DEM inspection, map production, and terrain characterization. Azimuth parameter controls light direction (0°=North, 90°=East, 180°=South, 270°=West); altitude controls light angle above horizon (90°=overhead, 45°=typical, 0°=horizon grazing). Z-factor exaggerates relief for better visualization on gentle terrain.
 
@@ -749,7 +749,7 @@ Applications: (1) DEM quality assessment (visual inspection for artifacts), (2) 
         ToolManifest {
             id: "hillshade".to_string(),
             display_name: "Hillshade".to_string(),
-            summary: r#"Single-source directional hillshade visualization (grayscale 0-255). Azimuth & altitude parameters control light direction. Fast terrain visualization for DEM inspection and map display."#.to_string(),
+            summary: r#"Single-source directional hillshade visualization (grayscale 0-32767). Azimuth & altitude parameters control light direction. Fast terrain visualization for DEM inspection and map display."#.to_string(),
             category: ToolCategory::Raster,
             license_tier: LicenseTier::Open,
             params: vec![],
@@ -768,7 +768,7 @@ Applications: (1) DEM quality assessment (visual inspection for artifacts), (2) 
         ToolMetadata {
             id: "multidirectional_hillshade",
             display_name: "Multidirectional Hillshade",
-            summary: r#"Produces weighted multi-directional shaded relief combining illumination from multiple azimuth angles (typically 8 directions) to enhance feature visibility. Reduces shadow artifacts present in single-light hillshade by averaging contributions from multiple light sources. Output is grayscale 0-255 image where all terrain features are similarly enhanced regardless of light direction.
+            summary: r#"Produces weighted multi-directional shaded relief combining illumination from multiple azimuth angles (typically 8 directions) to enhance feature visibility. Reduces shadow artifacts present in single-light hillshade by averaging contributions from multiple light sources. Output is a grayscale image scaled 0-32767 (not 8-bit) where all terrain features are similarly enhanced regardless of light direction.
 
 Multidirectional hillshade overcomes single-light shadowing limitations: features perpendicular to single light source direction become nearly invisible. By combining multiple light sources, all features become visible, reducing perceptual bias toward specific terrain aspects. Particularly effective for complex terrain with ridges and valleys in varied directions. Slightly slower than single-light hillshade but produces more balanced relief visualization.
 
@@ -783,7 +783,7 @@ Applications: (1) Enhanced DEM visualization (better than single-light for compl
         ToolManifest {
             id: "multidirectional_hillshade".to_string(),
             display_name: "Multidirectional Hillshade".to_string(),
-            summary: r#"Multi-directional hillshade (8+ light sources) eliminating single-light shadowing artifacts. Balanced feature visibility for complex terrain; preferred for publications and detailed analysis."#.to_string(),
+            summary: r#"Multi-directional hillshade (8+ light sources, grayscale 0-32767) eliminating single-light shadowing artifacts. Balanced feature visibility for complex terrain; preferred for publications and detailed analysis."#.to_string(),
             category: ToolCategory::Raster,
             license_tier: LicenseTier::Open,
             params: vec![],
@@ -1077,5 +1077,77 @@ impl Tool for MultidirectionalHillshadeTool {
     }
     fn run(&self, args: &ToolArgs, ctx: &ToolContext) -> Result<ToolRunResult, ToolError> {
         TerrainCore::run_multidirectional_hillshade(args, ctx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wbcore::{AllowAllCapabilities, ProgressSink};
+
+    struct NoopProgress;
+    impl ProgressSink for NoopProgress {}
+
+    fn make_ctx() -> ToolContext<'static> {
+        static PROGRESS: NoopProgress = NoopProgress;
+        static CAPS: AllowAllCapabilities = AllowAllCapabilities;
+        ToolContext { progress: &PROGRESS, capabilities: &CAPS }
+    }
+
+    /// A projected DEM made of a cone: slopes face every direction, so one of
+    /// them faces the light and gets close to the brightest value.
+    fn cone_dem() -> Raster {
+        let (rows, cols) = (41usize, 41usize);
+        let mut dem = Raster::new(RasterConfig {
+            rows,
+            cols,
+            bands: 1,
+            nodata: -9999.0,
+            cell_size: 10.0,
+            ..Default::default()
+        });
+        for r in 0..rows {
+            for c in 0..cols {
+                let d = ((r as f64 - 20.0).powi(2) + (c as f64 - 20.0).powi(2)).sqrt();
+                dem.set(0, r as isize, c as isize, 1000.0 - 10.0 * d).unwrap();
+            }
+        }
+        dem
+    }
+
+    fn max_output(tool: &dyn Tool) -> f64 {
+        let id = memory_store::put_raster(cone_dem());
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(memory_store::make_raster_memory_path(&id)));
+        let result = tool.run(&args, &make_ctx()).unwrap();
+        let path = result.outputs.get("path").or_else(|| result.outputs.get("output")).unwrap();
+        let out = memory_store::get_raster_by_id(memory_store::raster_path_to_id(path.as_str().unwrap()).unwrap()).unwrap();
+        let mut max = f64::MIN;
+        for r in 2..out.rows as isize - 2 {
+            for c in 2..out.cols as isize - 2 {
+                let v = out.get(0, r, c);
+                if v != out.nodata {
+                    max = max.max(v);
+                }
+            }
+        }
+        max
+    }
+
+    /// The summaries promise 0-32767 (issue #42); the output must fit that
+    /// range and actually use it, so an 8-bit reading would be wrong.
+    #[test]
+    fn hillshade_summaries_match_output_range() {
+        let tools: [&dyn Tool; 2] = [&HillshadeTool, &MultidirectionalHillshadeTool];
+        for tool in tools {
+            let manifest = tool.manifest();
+            let metadata = tool.metadata();
+            for summary in [manifest.summary.as_str(), metadata.summary] {
+                assert!(summary.contains("0-32767"), "{}: {summary}", manifest.id);
+                assert!(!summary.contains("0-255"), "{}: {summary}", manifest.id);
+            }
+            let max = max_output(tool);
+            assert!(max > 255.0 && max <= 32767.0, "{}: max {max}", manifest.id);
+        }
     }
 }

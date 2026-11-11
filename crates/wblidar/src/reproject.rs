@@ -409,17 +409,23 @@ pub fn points_in_place_to_epsg_with_options(
 }
 
 fn source_proj_crs(src_crs: &Crs, op_name: &str) -> Result<ProjCrs> {
+    let wkt = src_crs.wkt.as_deref().map(str::trim).filter(|w| !w.is_empty());
+
     if let Some(src_epsg) = src_crs.epsg {
-        return ProjCrs::from_epsg(src_epsg)
-            .map_err(|e| Error::Projection(format!("invalid source EPSG {src_epsg}: {e}")));
+        return match ProjCrs::from_epsg(src_epsg) {
+            Ok(crs) => Ok(crs),
+            // A code missing from the built-in registry is not fatal when the
+            // CRS also carries its full definition as WKT (whitebox-wasm#43).
+            Err(e) => match wkt.and_then(|w| wbprojection::from_wkt(w).ok()) {
+                Some(crs) => Ok(crs),
+                None => Err(Error::Projection(format!("invalid source EPSG {src_epsg}: {e}"))),
+            },
+        };
     }
 
-    if let Some(wkt) = src_crs.wkt.as_deref() {
-        let trimmed = wkt.trim();
-        if !trimmed.is_empty() {
-            return wbprojection::from_wkt(trimmed)
-                .map_err(|e| Error::Projection(format!("invalid source CRS WKT: {e}")));
-        }
+    if let Some(trimmed) = wkt {
+        return wbprojection::from_wkt(trimmed)
+            .map_err(|e| Error::Projection(format!("invalid source CRS WKT: {e}")));
     }
 
     Err(Error::Projection(format!(

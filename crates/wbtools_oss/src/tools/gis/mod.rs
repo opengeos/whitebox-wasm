@@ -34936,7 +34936,8 @@ impl Tool for NetworkServiceAreaTool {
 
         let mut snapped_origins = Vec::<(i64, Vec<StartSeed>, wbvector::Coord)>::new();
         let mut snapped_origin_debug = Vec::<(i64, wbvector::Coord, wbvector::Coord, f64, i64, i64)>::new();
-        let mut start_nodes = Vec::<usize>::new();
+        // Seeds of every origin, with their partial costs along the snapped edge.
+        let mut all_seeds = Vec::<StartSeed>::new();
         for (origin_fid, origin) in &origin_points {
             let (idx, node_dist) = nearest_network_node(&graph.nodes, origin)
                 .ok_or_else(|| ToolError::Execution("failed locating nearest origin node".to_string()))?;
@@ -34958,14 +34959,25 @@ impl Tool for NetworkServiceAreaTool {
                     anchor_node_id = -1;
                 }
                 if edge_weight.is_finite() && edge_weight > 0.0 {
-                    seeds.push(StartSeed {
-                        node: u,
-                        cost: edge_weight * frac,
-                    });
+                    // The snapped edge u -> v exists, so the origin reaches v
+                    // along it. It reaches u only when the reverse edge
+                    // v -> u exists too (not on a one-way edge), at that
+                    // edge's own cost.
                     seeds.push(StartSeed {
                         node: v,
                         cost: edge_weight * (1.0 - frac),
                     });
+                    if let Some(reverse_weight) = graph.adjacency[v]
+                        .iter()
+                        .filter(|(next, w)| *next == u && w.is_finite())
+                        .map(|(_, w)| *w)
+                        .min_by(|a, b| a.total_cmp(b))
+                    {
+                        seeds.push(StartSeed {
+                            node: u,
+                            cost: reverse_weight * frac,
+                        });
+                    }
                 }
             }
 
@@ -34981,11 +34993,7 @@ impl Tool for NetworkServiceAreaTool {
                     continue;
                 }
             }
-            for seed in &seeds {
-                if !start_nodes.contains(&seed.node) {
-                    start_nodes.push(seed.node);
-                }
-            }
+            all_seeds.extend(seeds.iter().copied());
             snapped_origin_debug.push((
                 *origin_fid,
                 origin.clone(),
@@ -35053,7 +35061,7 @@ impl Tool for NetworkServiceAreaTool {
             let _ = write_vector_output(&debug_layer, debug_path.trim())?;
         }
 
-        let dist = dijkstra_all_costs(&graph, &start_nodes, &turn_costs);
+        let dist = dijkstra_all_costs_seeded(&graph, &all_seeds, &turn_costs);
 
         let mut output = wbvector::Layer::new(format!("{}_network_service_area", input.name));
         output.crs = input.crs.clone();
@@ -35745,6 +35753,78 @@ mod tests {
         assert_eq!(extract("NAME IS NULL OR AREA = 3.0"), pops(&[800, 2000]));
         assert_eq!(extract("POP / 1000 == 1 && AREA > 1.5"), pops(&[1500]));
         assert_eq!(extract("str::substring(NAME, 0, 3) == 'Mem'"), pops(&[1500]));
+    }
+
+    /// Three 100 m segments along the x axis; the first, 0 -> 100, is one-way
+    /// eastbound (`FT`).
+    fn service_area_network() -> String {
+        let mut layer = wbvector::Layer::new("net".to_string());
+        layer.geom_type = Some(wbvector::GeometryType::LineString);
+        layer.add_field(wbvector::FieldDef::new("oneway", wbvector::FieldType::Text));
+        for (x0, oneway) in [(0.0, "FT"), (100.0, ""), (200.0, "")] {
+            layer.push(wbvector::Feature {
+                fid: 0,
+                geometry: Some(wbvector::Geometry::line_string(vec![
+                    wbvector::Coord::xy(x0, 0.0),
+                    wbvector::Coord::xy(x0 + 100.0, 0.0),
+                ])),
+                attributes: vec![wbvector::FieldValue::Text(oneway.to_string())],
+            });
+        }
+        vector_memory_store::make_vector_memory_path(&vector_memory_store::put_vector(layer))
+    }
+
+    /// Runs `network_service_area` (nodes output, max cost 150) from one origin
+    /// at (`origin_x`, 0) and returns each reachable node as (x, COST).
+    fn service_area_costs(origin_x: f64, one_way: bool) -> Vec<(f64, f64)> {
+        let mut origins = wbvector::Layer::new("origins".to_string());
+        origins.geom_type = Some(wbvector::GeometryType::Point);
+        origins.push(wbvector::Feature {
+            fid: 0,
+            geometry: Some(wbvector::Geometry::point(origin_x, 0.0)),
+            attributes: Vec::new(),
+        });
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(service_area_network()));
+        args.insert(
+            "origins".to_string(),
+            json!(vector_memory_store::make_vector_memory_path(&vector_memory_store::put_vector(origins))),
+        );
+        args.insert("max_cost".to_string(), json!(150.0));
+        if one_way {
+            args.insert("one_way_field".to_string(), json!("oneway"));
+        }
+        let result = run_vector_tool(&NetworkServiceAreaTool, &args).expect("service area runs");
+        let output = vector_memory_store::get_vector_arc_by_path(result.outputs["path"].as_str().unwrap())
+            .expect("output layer");
+        let cost_idx = output.schema.field_index("COST").expect("COST field");
+        let mut costs: Vec<(f64, f64)> = output
+            .features
+            .iter()
+            .map(|f| {
+                let Some(wbvector::Geometry::Point(c)) = f.geometry.as_ref() else {
+                    panic!("expected a point");
+                };
+                (c.x, f.attributes[cost_idx].as_f64().expect("numeric COST"))
+            })
+            .collect();
+        costs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        costs
+    }
+
+    #[test]
+    fn service_area_seeds_the_origin_edge_with_partial_costs() {
+        // Both ends of the origin's edge used to start at cost 0 (issue #41).
+        assert_eq!(service_area_costs(0.0, false), [(0.0, 0.0), (100.0, 100.0)]);
+        assert_eq!(service_area_costs(150.0, false), [(0.0, 150.0), (100.0, 50.0), (200.0, 50.0), (300.0, 150.0)]);
+    }
+
+    #[test]
+    fn service_area_does_not_seed_against_a_one_way_edge() {
+        // From the east end of the eastbound edge, its west end is unreachable.
+        assert_eq!(service_area_costs(100.0, true), [(100.0, 0.0), (200.0, 100.0)]);
+        // From a point on the edge, only the downstream end is reachable.
+        assert_eq!(service_area_costs(25.0, true), [(100.0, 75.0)]);
     }
 }
 

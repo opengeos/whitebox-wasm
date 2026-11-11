@@ -4231,7 +4231,7 @@ fn from_wkt_parses_exported_ogc_tm_without_epsg_authority() {
 }
 
 #[test]
-fn from_wkt_parses_exported_ogc_swiss_oblique_stereographic() {
+fn from_wkt_parses_exported_ogc_swiss_oblique_mercator() {
     let wkt = to_ogc_wkt(2056).unwrap();
     let crs = from_wkt(&wkt).unwrap();
     let (x, y) = crs.forward(7.4386, 46.9511).unwrap();
@@ -4646,11 +4646,78 @@ fn wkt_vertical_us_foot_uses_foot_unit() {
 }
 
 #[test]
-fn wkt_swiss_codes_use_oblique_stereographic_method_name() {
+fn wkt_swiss_codes_use_hotine_oblique_mercator_method_name() {
     let esri = to_esri_wkt(2056).unwrap();
     let ogc = to_ogc_wkt(21781).unwrap();
-    assert!(esri.contains("Oblique_Stereographic"));
-    assert!(ogc.contains("Oblique_Stereographic"));
+    for wkt in [&esri, &ogc] {
+        assert!(wkt.contains("Hotine_Oblique_Mercator_Azimuth_Center"), "{wkt}");
+        assert!(!wkt.contains("Oblique_Stereographic"), "{wkt}");
+    }
+}
+
+/// EPSG:2056 / 21781 use the Swiss Oblique Mercator, not Oblique
+/// Stereographic. Reference values are PROJ 9 (`somerc` + CH1903+ Helmert)
+/// for a swissALTI3D tile corner ~110 km from the projection centre, where the
+/// old stereographic definition was off by ~180 m (geolibre-rust#605).
+#[test]
+fn swiss_lv95_and_lv03_match_proj_far_from_centre() {
+    let wgs84 = Crs::from_epsg(4326).unwrap();
+    for (code, x, y) in [(2056, 2_705_000.0, 1_115_000.0), (21781, 705_000.0, 115_000.0)] {
+        let crs = Crs::from_epsg(code).unwrap();
+        let (lon, lat) = crs.transform_to(x, y, &wgs84).unwrap();
+        assert!((lon - 8.798_435_34).abs() < 1e-7, "{code} lon {lon}");
+        assert!((lat - 46.178_284_16).abs() < 1e-7, "{code} lat {lat}");
+        // Projection only (CH1903+ geographic), against PROJ `somerc`.
+        let (plon, plat) = crs.inverse(x, y).unwrap();
+        assert!((plon - 8.799_578_72).abs() < 1e-8, "{code} plon {plon}");
+        assert!((plat - 46.179_502_24).abs() < 1e-8, "{code} plat {plat}");
+    }
+}
+
+/// A Swiss WKT read back from either the exported WKT1 or a PROJ-style WKT2
+/// `Hotine Oblique Mercator (variant B)` gives the same exact projection.
+#[test]
+fn swiss_wkt_round_trips_to_swiss_oblique_mercator() {
+    let exported = from_wkt(&to_ogc_wkt(2056).unwrap()).unwrap();
+    let wkt2 = concat!(
+        "PROJCRS[\"CH1903+ / LV95\",BASEGEOGCRS[\"CH1903+\",",
+        "DATUM[\"CH1903+\",ELLIPSOID[\"Bessel 1841\",6377397.155,299.1528128]],",
+        "PRIMEM[\"Greenwich\",0],ANGLEUNIT[\"degree\",0.0174532925199433]],",
+        "CONVERSION[\"Swiss Oblique Mercator 1995\",",
+        "METHOD[\"Hotine Oblique Mercator (variant B)\",ID[\"EPSG\",9815]],",
+        "PARAMETER[\"Latitude of projection centre\",46.9524055555556,ANGLEUNIT[\"degree\",0.0174532925199433]],",
+        "PARAMETER[\"Longitude of projection centre\",7.43958333333333,ANGLEUNIT[\"degree\",0.0174532925199433]],",
+        "PARAMETER[\"Azimuth of initial line\",90,ANGLEUNIT[\"degree\",0.0174532925199433]],",
+        "PARAMETER[\"Angle from Rectified to Skew Grid\",90,ANGLEUNIT[\"degree\",0.0174532925199433]],",
+        "PARAMETER[\"Scale factor on initial line\",1,SCALEUNIT[\"unity\",1]],",
+        "PARAMETER[\"Easting at projection centre\",2600000,LENGTHUNIT[\"metre\",1]],",
+        "PARAMETER[\"Northing at projection centre\",1200000,LENGTHUNIT[\"metre\",1]]],",
+        "CS[Cartesian,2],AXIS[\"(E)\",east],AXIS[\"(N)\",north],LENGTHUNIT[\"metre\",1]]"
+    );
+    let parsed = from_wkt(wkt2).unwrap();
+    for crs in [&exported, &parsed] {
+        let (lon, lat) = crs.inverse(2_705_000.0, 1_115_000.0).unwrap();
+        assert!((lon - 8.799_578_72).abs() < 1e-8, "lon {lon}");
+        assert!((lat - 46.179_502_24).abs() < 1e-8, "lat {lat}");
+    }
+}
+
+/// EPSG method 9809 (Oblique / Double Stereographic) codes, whether built in
+/// or generated from ESRI `Double_Stereographic` WKT, match PROJ `sterea`.
+/// Each point is 100 km from the false origin; the previous single
+/// stereographic was off by 100-250 m there.
+#[test]
+fn oblique_stereographic_codes_match_proj_sterea() {
+    for (code, x, y, lon, lat) in [
+        (28992, 235_000.0, 523_000.0, 6.571_025_651_812_82, 52.689_585_531_573_6),
+        (3120, 4_717_000.0, 5_527_000.0, 22.227_097_347_111_3, 51.158_868_193_110_6),
+        (31700, 580_000.0, 560_000.0, 26.043_083_786_091_1, 46.535_166_091_268_0),
+    ] {
+        let crs = Crs::from_epsg(code).unwrap();
+        let (lon2, lat2) = crs.inverse(x, y).unwrap();
+        assert!((lon2 - lon).abs() < 1e-8, "{code} lon {lon2} vs {lon}");
+        assert!((lat2 - lat).abs() < 1e-8, "{code} lat {lat2} vs {lat}");
+    }
 }
 
 #[test]

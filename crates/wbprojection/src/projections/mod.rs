@@ -35,6 +35,8 @@ mod hammer;
 mod hatano;
 mod hobo_dyer;
 mod hotine_oblique_mercator;
+mod oblique_stereographic;
+mod swiss_oblique_mercator;
 mod lagrange;
 mod kavrayskiy_v;
 mod kavrayskiy_vii;
@@ -171,6 +173,9 @@ pub enum ProjectionKind {
         /// Optional rectified grid angle in degrees.
         rectified_grid_angle: Option<f64>,
     },
+    /// Swiss Oblique Mercator (EPSG method 9815 with azimuth 90°, PROJ `somerc`),
+    /// used by CH1903 / LV03 and CH1903+ / LV95.
+    SwissObliqueMercator,
     /// Central Conic projection.
     CentralConic {
         /// Standard parallel in degrees.
@@ -606,6 +611,9 @@ impl Projection {
                     rectified_grid_angle.unwrap_or(*azimuth),
                 )?,
             ),
+            ProjectionKind::SwissObliqueMercator => Box::new(
+                swiss_oblique_mercator::SwissObliqueMercatorProj::new(&params)?,
+            ),
             ProjectionKind::CentralConic { lat1 } => Box::new(
                 central_conic::CentralConicProj::new(&params, *lat1)?,
             ),
@@ -652,7 +660,7 @@ impl Projection {
                 polar_stereographic::PolarStereographicProj::new(&params, *north, *lat_ts)?,
             ),
             ProjectionKind::ObliqueStereographic => Box::new(
-                stereographic::StereographicProj::new(&params)?,
+                oblique_stereographic::ObliqueStereographicProj::new(&params)?,
             ),
             ProjectionKind::Orthographic => Box::new(
                 orthographic::OrthographicProj::new(&params)?,
@@ -888,6 +896,7 @@ impl Projection {
             ProjectionKind::LambertAzimuthalEqualArea => "Lambert Azimuthal Equal-Area",
             ProjectionKind::Krovak => "Krovak",
             ProjectionKind::HotineObliqueMercator { .. } => "Hotine Oblique Mercator",
+            ProjectionKind::SwissObliqueMercator => "Swiss Oblique Mercator",
             ProjectionKind::CentralConic { .. } => "Central Conic",
             ProjectionKind::Lagrange { .. } => "Lagrange",
             ProjectionKind::Loximuthal { .. } => "Loximuthal",

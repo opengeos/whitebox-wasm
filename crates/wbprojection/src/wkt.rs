@@ -524,10 +524,38 @@ fn build_projection_params(
         },
         "lambertazimuthalequalarea" => ProjectionKind::LambertAzimuthalEqualArea,
         "krovak" => ProjectionKind::Krovak,
+        // With an azimuth (and rectified grid angle) of 90° at the projection
+        // centre this is the Swiss Oblique Mercator, which has an exact
+        // ellipsoidal implementation; the general HOM here is spherical.
+        "hotineobliquemercatorazimuthcenter"
+            if is_swiss_oblique_mercator(
+                param(params, &["azimuth"], 0.0),
+                param(params, &["xyplanerotation", "rectifiedgridangle"], 90.0),
+            ) =>
+        {
+            ProjectionKind::SwissObliqueMercator
+        }
         "hotineobliquemercatorazimuthcenter" => ProjectionKind::HotineObliqueMercator {
             azimuth: param(params, &["azimuth"], 0.0),
             rectified_grid_angle: None,
         },
+        // WKT2 / EPSG name of the same method (EPSG 9815).
+        "hotineobliquemercatorvariantb" | "swissobliquemercator" | "swissobliquecylindrical" => {
+            let azimuth = param(params, &["azimuthofinitialline", "azimuth"], 90.0);
+            let gamma = param(
+                params,
+                &["anglefromrectifiedtoskewgrid", "rectifiedgridangle", "xyplanerotation"],
+                azimuth,
+            );
+            if method_key != "hotineobliquemercatorvariantb" || is_swiss_oblique_mercator(azimuth, gamma) {
+                ProjectionKind::SwissObliqueMercator
+            } else {
+                ProjectionKind::HotineObliqueMercator {
+                    azimuth,
+                    rectified_grid_angle: Some(gamma),
+                }
+            }
+        }
         // Natural-origin variant: in the spherical approximation the natural origin
         // coincides with the projection centre, so we can reuse HOMAC unchanged.
         "hotineobliquemercatorazimuthnaturalorigin" => ProjectionKind::HotineObliqueMercator {
@@ -588,7 +616,8 @@ fn build_projection_params(
         "winkelii" => ProjectionKind::WinkelII,
         "kavrayskiyv" => ProjectionKind::KavrayskiyV,
         "stereographic" => ProjectionKind::Stereographic,
-        "obliquestereographic" => ProjectionKind::ObliqueStereographic,
+        // ESRI calls EPSG method 9809 Double_Stereographic.
+        "obliquestereographic" | "doublestereographic" => ProjectionKind::ObliqueStereographic,
         // Polar Stereographic — Variant A (k₀ at the pole, scale from scalefactor param)
         "polarstereographicvarianta" => ProjectionKind::PolarStereographic {
             north: latitude_of_origin >= 0.0,
@@ -708,6 +737,9 @@ fn build_projection_params(
             | "rectifiedskeworthomorphicnaturalorigin"
             | "labordeobliquemercator"
             | "krovak"
+            | "hotineobliquemercatorvariantb"
+            | "swissobliquemercator"
+            | "swissobliquecylindrical"
     ) {
         out = out
             .with_lon0(longitude_param(
@@ -720,6 +752,37 @@ fn build_projection_params(
                 params,
                 &["latitudeofcenter", "latitudeoforigin"],
                 latitude_of_origin,
+            ));
+    }
+    // EPSG 9815 names its centre, scale and offsets after the projection centre.
+    if matches!(
+        method_key,
+        "hotineobliquemercatorvariantb" | "swissobliquemercator" | "swissobliquecylindrical"
+    ) {
+        let (lon0, lat0, scale0, fe0, fn0) =
+            (out.lon0, out.lat0, out.scale, out.false_easting, out.false_northing);
+        out = out
+            .with_lon0(longitude_param(
+                params,
+                &["longitudeofprojectioncentre", "longitudeofprojectioncenter"],
+                prime_meridian_deg,
+                lon0,
+            ))
+            .with_lat0(param(
+                params,
+                &["latitudeofprojectioncentre", "latitudeofprojectioncenter"],
+                lat0,
+            ))
+            .with_scale(param(params, &["scalefactoroninitialline"], scale0))
+            .with_false_easting(param(
+                params,
+                &["eastingatprojectioncentre", "eastingatprojectioncenter"],
+                fe0,
+            ))
+            .with_false_northing(param(
+                params,
+                &["northingatprojectioncentre", "northingatprojectioncenter"],
+                fn0,
             ));
     }
     // IGAC Plano Cartesiano: apply height-based scale factor k = R/(R+H).
@@ -844,12 +907,27 @@ fn is_angular_parameter(name: &str) -> bool {
             | "azimuth"
             | "rectifiedgridangle"
             | "xyplanerotation"
+            | "latitudeofprojectioncentre"
+            | "latitudeofprojectioncenter"
+            | "longitudeofprojectioncentre"
+            | "longitudeofprojectioncenter"
+            | "azimuthofinitialline"
+            | "anglefromrectifiedtoskewgrid"
             | "w"
     )
 }
 
 fn is_linear_parameter(name: &str) -> bool {
-    matches!(name, "falseeasting" | "falsenorthing" | "satelliteheight")
+    matches!(
+        name,
+        "falseeasting"
+            | "falsenorthing"
+            | "satelliteheight"
+            | "eastingatprojectioncentre"
+            | "eastingatprojectioncenter"
+            | "northingatprojectioncentre"
+            | "northingatprojectioncenter"
+    )
 }
 
 fn datum_from_name(name: &str, ellipsoid: &Ellipsoid) -> Datum {
@@ -894,4 +972,10 @@ fn datum_from_name(name: &str, ellipsoid: &Ellipsoid) -> Datum {
             transform: DatumTransform::None,
         },
     }
+}
+
+/// True when Hotine Oblique Mercator parameters describe the Swiss Oblique
+/// Mercator: azimuth and rectified grid angle both 90° at the centre.
+fn is_swiss_oblique_mercator(azimuth: f64, rectified_grid_angle: f64) -> bool {
+    (azimuth - 90.0).abs() < 1e-9 && (rectified_grid_angle - 90.0).abs() < 1e-9
 }

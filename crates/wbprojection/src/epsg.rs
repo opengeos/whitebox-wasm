@@ -3033,6 +3033,18 @@ pub(crate) fn esri_projection_params(p: &ProjectionParams) -> (&'static str, Vec
                 ("false_northing", p.false_northing),
             ],
         ),
+        SwissObliqueMercator => (
+            "Hotine_Oblique_Mercator_Azimuth_Center",
+            vec![
+                ("latitude_of_center", p.lat0),
+                ("longitude_of_center", p.lon0),
+                ("azimuth", 90.0),
+                ("rectified_grid_angle", 90.0),
+                ("scale_factor", p.scale),
+                ("false_easting", p.false_easting),
+                ("false_northing", p.false_northing),
+            ],
+        ),
         CentralConic { lat1 } => (
             "Central_Conic",
             vec![
@@ -3898,6 +3910,18 @@ pub(crate) fn ogc_projection_params(p: &ProjectionParams) -> (&'static str, Vec<
                 ("longitude_of_center", p.lon0),
                 ("azimuth", azimuth),
                 ("rectified_grid_angle", rectified_grid_angle.unwrap_or(azimuth)),
+                ("scale_factor", p.scale),
+                ("false_easting", p.false_easting),
+                ("false_northing", p.false_northing),
+            ],
+        ),
+        SwissObliqueMercator => (
+            "Hotine_Oblique_Mercator_Azimuth_Center",
+            vec![
+                ("latitude_of_center", p.lat0),
+                ("longitude_of_center", p.lon0),
+                ("azimuth", 90.0),
+                ("rectified_grid_angle", 90.0),
                 ("scale_factor", p.scale),
                 ("false_easting", p.false_easting),
                 ("false_northing", p.false_northing),
@@ -6356,15 +6380,13 @@ fn build_crs(code: u32) -> Result<Crs> {
     if let Some(raw_wkt) = legacy_parity_wkt(code) {
         let wkt = raw_wkt
             .replace("\\\"", "\"")
-            .replace("Gauss_Kruger", "Transverse_Mercator")
-            .replace("Double_Stereographic", "Stereographic");
+            .replace("Gauss_Kruger", "Transverse_Mercator");
         return crate::wkt::parse_crs_from_wkt(&wkt);
     }
     if let Some(raw_wkt) = generated_epsg_wkt(code) {
         let wkt = raw_wkt
             .replace("\\\"", "\"")
-            .replace("Gauss_Kruger", "Transverse_Mercator")
-            .replace("Double_Stereographic", "Stereographic");
+            .replace("Gauss_Kruger", "Transverse_Mercator");
         return crate::wkt::parse_crs_from_wkt(&wkt);
     }
 
@@ -8014,7 +8036,7 @@ fn build_crs(code: u32) -> Result<Crs> {
                 name: "ATS77 / New Brunswick Stereographic (EPSG:2200)".into(),
                 datum: datum.clone(),
                 projection: crate::projections::Projection::new(
-                    ProjectionParams::new(ProjectionKind::Stereographic)
+                    ProjectionParams::new(ProjectionKind::ObliqueStereographic)
                         .with_lon0(-66.5)
                         .with_lat0(46.5)
                         .with_scale(0.999_912)
@@ -8652,7 +8674,7 @@ fn build_crs(code: u32) -> Result<Crs> {
                 name: "ATS77 / Prince Edward Island Stereographic (EPSG:2290)".into(),
                 datum: datum.clone(),
                 projection: crate::projections::Projection::new(
-                    ProjectionParams::new(ProjectionKind::Stereographic)
+                    ProjectionParams::new(ProjectionKind::ObliqueStereographic)
                         .with_lon0(-63.0)
                         .with_lat0(47.25)
                         .with_scale(0.999_912)
@@ -8667,7 +8689,7 @@ fn build_crs(code: u32) -> Result<Crs> {
             name: "NAD83(CSRS) / Prince Edward Island (EPSG:2291)".into(),
             datum: Datum::NAD83_CSRS,
             projection: crate::projections::Projection::new(
-                ProjectionParams::new(ProjectionKind::Stereographic)
+                ProjectionParams::new(ProjectionKind::ObliqueStereographic)
                     .with_lon0(-63.0)
                     .with_lat0(47.25)
                     .with_scale(0.999_912)
@@ -8681,7 +8703,7 @@ fn build_crs(code: u32) -> Result<Crs> {
             name: "NAD83(CSRS) / Prince Edward Island (EPSG:2292)".into(),
             datum: Datum::NAD83_CSRS,
             projection: crate::projections::Projection::new(
-                ProjectionParams::new(ProjectionKind::Stereographic)
+                ProjectionParams::new(ProjectionKind::ObliqueStereographic)
                     .with_lon0(-63.0)
                     .with_lat0(47.25)
                     .with_scale(0.999_912)
@@ -9186,7 +9208,7 @@ fn build_crs(code: u32) -> Result<Crs> {
             name: "Amersfoort / RD New (EPSG:28992)".into(),
             datum: Datum::AMERSFOORT,
             projection: crate::projections::Projection::new(
-                ProjectionParams::new(ProjectionKind::Stereographic)
+                ProjectionParams::new(ProjectionKind::ObliqueStereographic)
                     .with_lat0(52.156_160_556)
                     .with_lon0(5.387_638_889)
                     .with_scale(0.9999079)
@@ -10451,9 +10473,9 @@ fn build_crs(code: u32) -> Result<Crs> {
             name: "CH1903 / LV03 (EPSG:21781)".into(),
             datum: Datum::CH1903,
             projection: crate::projections::Projection::new(
-                ProjectionParams::new(ProjectionKind::ObliqueStereographic)
-                    .with_lat0(46.952_405_556)
-                    .with_lon0(7.439_583_333)
+                ProjectionParams::new(ProjectionKind::SwissObliqueMercator)
+                    .with_lat0(46.952_405_555_555_6)
+                    .with_lon0(7.439_583_333_333_33)
                     .with_scale(1.0)
                     .with_false_easting(600_000.0)
                     .with_false_northing(200_000.0)
@@ -10465,9 +10487,9 @@ fn build_crs(code: u32) -> Result<Crs> {
             name: "CH1903+ / LV95 (EPSG:2056)".into(),
             datum: Datum::CH1903_PLUS,
             projection: crate::projections::Projection::new(
-                ProjectionParams::new(ProjectionKind::ObliqueStereographic)
-                    .with_lat0(46.952_405_556)
-                    .with_lon0(7.439_583_333)
+                ProjectionParams::new(ProjectionKind::SwissObliqueMercator)
+                    .with_lat0(46.952_405_555_555_6)
+                    .with_lon0(7.439_583_333_333_33)
                     .with_scale(1.0)
                     .with_false_easting(2_600_000.0)
                     .with_false_northing(1_200_000.0)
@@ -10998,7 +11020,7 @@ fn build_crs(code: u32) -> Result<Crs> {
                 name: "Dealul Piscului 1970 / Stereo 70 (EPSG:31700)".into(),
                 datum,
                 projection: crate::projections::Projection::new(
-                    ProjectionParams::new(ProjectionKind::Stereographic)
+                    ProjectionParams::new(ProjectionKind::ObliqueStereographic)
                         .with_lat0(46.0)
                         .with_lon0(25.0)
                         .with_scale(0.99975)
@@ -12688,7 +12710,7 @@ fn pulkovo_adj1958_poland_stereographic(
         name: format!("{name} (EPSG:{code})"),
         datum: Datum::PULKOVO1942_58,
         projection: crate::projections::Projection::new(
-            ProjectionParams::new(ProjectionKind::Stereographic)
+            ProjectionParams::new(ProjectionKind::ObliqueStereographic)
                 .with_lon0(lon0)
                 .with_lat0(lat0)
                 .with_scale(scale)

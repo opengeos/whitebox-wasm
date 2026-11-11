@@ -159,7 +159,8 @@ pub(crate) fn parse_proj_string(s: &str) -> Result<ParsedProjString> {
         // (unreachable in practice after the early return above)
 
         // ── Oblique Mercator ─────────────────────────────────────────────────
-        "omerc" | "hotine" | "somerc" => {
+        "somerc" => ProjectionKind::SwissObliqueMercator,
+        "omerc" | "hotine" => {
             let azimuth = parse_angle(&tokens, "alpha")
                 .or_else(|| parse_angle(&tokens, "azimuth"))
                 .unwrap_or(0.0);

@@ -4791,3 +4791,126 @@ fn known_epsg_codes_have_wkt() {
     }
 }
 
+
+// ── Issue #45: a resolved code's parameters must match the WKT ──────────────
+//
+// The WKT below is ESRI WKT1 as PROJ 9 writes it (`to_wkt('WKT1_ESRI')`): no
+// AUTHORITY node, as in a `.prj`, so identification has to match parameters.
+
+/// EPSG:5070, NAD83 / Conus Albers, from this crate's ESRI WKT with the
+/// ` (EPSG:5070)` name suffix removed, as in the issue. (PROJ's ESRI WKT for
+/// 5070 ties 5070 with 6350, NAD83(2011) / Conus Albers, which has the same
+/// parameters; that tie is not what these tests are about.)
+fn issue45_conus_albers() -> String {
+    to_esri_wkt(5070).unwrap().replace(" (EPSG:5070)", "")
+}
+
+/// EPSG:10857, SIRGAS 2000 / Brazil Albers.
+const ISSUE45_BRAZIL_ALBERS: &str = r#"PROJCS["SIRGAS_2000_Brazil_Albers",GEOGCS["GCS_SIRGAS_2000",DATUM["D_SIRGAS_2000",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Albers"],PARAMETER["False_Easting",5000000.0],PARAMETER["False_Northing",10000000.0],PARAMETER["Central_Meridian",-54.0],PARAMETER["Standard_Parallel_1",-2.0],PARAMETER["Standard_Parallel_2",-22.0],PARAMETER["Latitude_Of_Origin",-12.0],UNIT["Meter",1.0]]"#;
+
+/// EPSG:10626, ECML14 Grid (UK).
+const ISSUE45_ECML14: &str = r#"PROJCS["ECML14_Grid",GEOGCS["ECML14-IRF",DATUM["ECML14_Intermediate_Reference_Frame",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",108021.121],PARAMETER["False_Northing",263196.8721],PARAMETER["Central_Meridian",-1.6],PARAMETER["Scale_Factor",1.0],PARAMETER["Latitude_Of_Origin",53.8],UNIT["Meter",1.0]]"#;
+
+/// EPSG:10732, ETRS89/DREF91/2016 / UTM zone 32N.
+const ISSUE45_DREF91_UTM32: &str = r#"PROJCS["ETRS89_DREF91_2016_UTM_zone_32N",GEOGCS["ETRS89_DREF91_2016",DATUM["ETRS89_DREF91_Realization_2016",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",9.0],PARAMETER["Scale_Factor",0.9996],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]"#;
+
+fn issue45_identify(wkt: &str) -> (Option<u32>, Option<u32>) {
+    (
+        identify_epsg_from_wkt_with_policy(wkt, EpsgIdentifyPolicy::Lenient),
+        identify_epsg_from_wkt_with_policy(wkt, EpsgIdentifyPolicy::Strict),
+    )
+}
+
+#[test]
+fn identify_rejects_candidates_with_another_false_origin_or_parallels() {
+    let conus = issue45_conus_albers();
+    let fe = conus.replace(r#""false_easting",0.000000000000"#, r#""false_easting",5000000.0"#);
+    let sp = conus
+        .replace(r#""standard_parallel_1",29.500000000000"#, r#""standard_parallel_1",20.0"#)
+        .replace(r#""standard_parallel_2",45.500000000000"#, r#""standard_parallel_2",60.0"#);
+    let both = sp.replace(r#""false_easting",0.000000000000"#, r#""false_easting",5000000.0"#);
+    for variant in [&fe, &sp, &both] {
+        assert_ne!(variant, &conus);
+    }
+    assert_ne!(both, sp);
+
+    assert_eq!(issue45_identify(&conus), (Some(5070), Some(5070)));
+    assert_eq!(issue45_identify(&fe), (None, None), "false easting 5,000,000");
+    assert_eq!(issue45_identify(&sp), (None, None), "standard parallels 20/60");
+    assert_eq!(issue45_identify(&both), (None, None), "both");
+}
+
+#[test]
+fn identify_compares_standard_parallels_in_either_order() {
+    let swapped = issue45_conus_albers()
+        .replace(r#""standard_parallel_1",29.500000000000"#, r#""standard_parallel_1",TMP"#)
+        .replace(r#""standard_parallel_2",45.500000000000"#, r#""standard_parallel_2",29.5"#)
+        .replace(r#""standard_parallel_1",TMP"#, r#""standard_parallel_1",45.5"#);
+    assert!(swapped.contains(r#""standard_parallel_1",45.5"#));
+    assert_eq!(issue45_identify(&swapped), (Some(5070), Some(5070)));
+}
+
+#[test]
+fn identify_resolves_generated_codes_whose_parameters_match() {
+    // Previously 2952 (NAD83(CSRS) / MTM zone 10, Canada) in Lenient.
+    assert_eq!(issue45_identify(ISSUE45_ECML14), (Some(10626), Some(10626)));
+    assert_eq!(issue45_identify(ISSUE45_BRAZIL_ALBERS), (Some(10857), Some(10857)));
+    // A hand-coded code with the same parameters still comes first.
+    assert_eq!(issue45_identify(ISSUE45_DREF91_UTM32), (Some(25832), Some(25832)));
+}
+
+#[test]
+fn identify_does_not_return_brazil_albers_for_its_variants() {
+    // The custom "Brazil Albers" without the false origin, which many
+    // datasets used before EPSG:10857 existed.
+    let no_false_origin = ISSUE45_BRAZIL_ALBERS
+        .replace(r#""False_Easting",5000000.0"#, r#""False_Easting",0.0"#)
+        .replace(r#""False_Northing",10000000.0"#, r#""False_Northing",0.0"#);
+    let other_parallels = ISSUE45_BRAZIL_ALBERS
+        .replace(r#""Standard_Parallel_1",-2.0"#, r#""Standard_Parallel_1",-5.0"#)
+        .replace(r#""Standard_Parallel_2",-22.0"#, r#""Standard_Parallel_2",-25.0"#);
+    // The same projection on SAD69 (GRS 1967 Truncated ellipsoid).
+    let sad69 = ISSUE45_BRAZIL_ALBERS
+        .replace("GCS_SIRGAS_2000", "GCS_South_American_1969")
+        .replace("D_SIRGAS_2000", "D_South_American_1969")
+        .replace(r#"SPHEROID["GRS_1980",6378137.0,298.257222101]"#, r#"SPHEROID["GRS_1967_Truncated",6378160.0,298.25]"#);
+    for variant in [&no_false_origin, &other_parallels, &sad69] {
+        assert_ne!(variant.as_str(), ISSUE45_BRAZIL_ALBERS);
+    }
+
+    assert_eq!(issue45_identify(&no_false_origin), (None, None), "false origin 0/0");
+    assert_eq!(issue45_identify(&other_parallels), (None, None), "standard parallels -5/-25");
+    assert_eq!(issue45_identify(&sad69), (None, None), "SAD69");
+}
+
+#[test]
+fn gda94_mga_zones_use_the_southern_false_northing() {
+    // EPSG:28349-28356 were built as northern UTM (false northing 0), so a
+    // point in Melbourne projected 10,000 km south of where PROJ puts it.
+    for code in 28349..=28356u32 {
+        let crs = Crs::from_epsg(code).unwrap();
+        assert_eq!(crs.projection.params().false_northing, 10_000_000.0, "EPSG:{code}");
+    }
+    let (x, y) = Crs::from_epsg(28355).unwrap().forward(147.0, -37.8).unwrap();
+    // PROJ 9: 500000.000, 5816375.018.
+    assert!((x - 500_000.0).abs() < 1.0e-3 && (y - 5_816_375.018).abs() < 1.0e-3, "({x}, {y})");
+}
+
+#[test]
+fn lcc_one_parallel_wkt_keeps_its_scale_factor() {
+    // EPSG:2085 (NAD27 / Cuba Norte) and 2192 (ED50 / France EuroLambert)
+    // have a scale factor below 1, which both WKT exporters dropped, so the
+    // registry no longer identified its own WKT once parameters had to match.
+    for code in [2085u32, 2192] {
+        let expected = Crs::from_epsg(code).unwrap().projection.params().scale;
+        assert!(expected < 1.0, "EPSG:{code}");
+        // Without the " (EPSG:nnnn)" name suffix, as a .prj written elsewhere.
+        let suffix = format!(" (EPSG:{code})");
+        for wkt in [to_esri_wkt(code).unwrap(), to_ogc_wkt(code).unwrap()] {
+            let wkt = wkt.replace(&suffix, "");
+            let got = from_wkt(&wkt).unwrap().projection.params().scale;
+            assert!((got - expected).abs() < 1.0e-12, "EPSG:{code}: scale {got} from {wkt}");
+            assert_eq!(identify_epsg_from_wkt_with_policy(&wkt, EpsgIdentifyPolicy::Lenient), Some(code), "{wkt}");
+        }
+    }
+}

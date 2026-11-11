@@ -23,6 +23,12 @@ jobs:
         # Scope to our crates; the vendored wbprojection ships an authoritative
         # EPSG/datum fixture suite that needs data files we don't vendor.
         run: cargo test -p wbgeotiff -p whitebox-wasm
+      - name: cargo test (wbprojection)
+        # Two tests read authoritative fixture files that are not vendored.
+        run: >-
+          cargo test -p wbprojection --lib --
+          --skip us_nsrs2007_to_nad83_2011_template_fixture_is_parseable
+          --skip epsg_csrs_utm_active_and_realization_codes_roundtrip
       - name: cargo test (expression tools)
         # The evaluator behind the raster, vector and LiDAR expression tools.
         run: cargo test -p wbtools_oss --lib expression

@@ -630,8 +630,30 @@ struct CrsCandidate {
     false_easting: f64,
     false_northing: f64,
     scale: f64,
+    /// Parameters carried by the projection kind itself (standard parallels,
+    /// azimuth, ...), from [`kind_shape_params`].
+    shape: Vec<ShapeParam>,
+    /// Whether the code comes from the generated WKT table rather than the
+    /// hand-coded registry; generated codes are only a fallback.
+    generated: bool,
     name_norm: String,
 }
+
+/// One projection-kind parameter and the tolerance used to compare it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ShapeParam {
+    value: Option<f64>,
+    /// `true` compares with the angle tolerance (angles in degrees, and
+    /// dimensionless values), `false` with the metre tolerance (lengths and
+    /// flags).
+    angular: bool,
+}
+
+/// Practical tolerances a winning candidate's parameters must meet: angles
+/// in degrees, false origin in metres, and scale factor.
+const MATCH_ANGLE_TOL: f64 = 1.0e-3;
+const MATCH_METER_TOL: f64 = 10.0;
+const MATCH_SCALE_TOL: f64 = 1.0e-6;
 
 static CRS_CANDIDATES: OnceLock<Vec<CrsCandidate>> = OnceLock::new();
 const IDENTIFY_MIN_SCORE: f64 = 70.0;
@@ -686,9 +708,7 @@ fn crs_candidates() -> &'static [CrsCandidate] {
     CRS_CANDIDATES.get_or_init(|| {
         let mut out = Vec::<CrsCandidate>::new();
         for code in known_epsg_codes() {
-            if generated_epsg_wkt(code).is_some() {
-                continue;
-            }
+            let generated = generated_epsg_wkt(code).is_some();
             let Ok(crs) = build_crs(code) else {
                 continue;
             };
@@ -698,18 +718,28 @@ fn crs_candidates() -> &'static [CrsCandidate] {
                 _ => (None, None),
             };
 
+            let mut datum_norm = normalize_datum_name(crs.datum.name);
+            if datum_norm == "custom" {
+                // The WKT parser names datums it does not know "Custom";
+                // the generated WKT still carries the real name.
+                if let Some(name) = generated_epsg_wkt(code).and_then(wkt_datum_name) {
+                    datum_norm = normalize_datum_name(&name);
+                }
+            }
             out.push(CrsCandidate {
                 code,
                 kind_label: projection_kind_label(&p.kind),
                 utm_zone: zone,
                 utm_south: south,
-                datum_norm: normalize_datum_name(crs.datum.name),
+                datum_norm,
                 ellipsoid: crs.datum.ellipsoid,
                 lon0: p.lon0,
                 lat0: p.lat0,
                 false_easting: p.false_easting,
                 false_northing: p.false_northing,
                 scale: p.scale,
+                shape: kind_shape_params(&p.kind),
+                generated,
                 name_norm: normalize_name(strip_epsg_suffix(&crs.name)),
             });
         }
@@ -766,6 +796,7 @@ pub fn identify_epsg_from_wkt_report(wkt: &str, policy: EpsgIdentifyPolicy) -> O
     Some(identify_epsg_from_crs_report_internal(
         &parsed,
         policy,
+        wkt_datum_name(wkt).map(|n| normalize_datum_name(&n)),
         datum_hint,
         ellipsoid_hint,
         name_hint,
@@ -785,19 +816,65 @@ pub fn identify_epsg_from_crs_with_policy(crs: &Crs, policy: EpsgIdentifyPolicy)
 
 /// Return a scored identification report for an already-parsed CRS.
 pub fn identify_epsg_from_crs_report(crs: &Crs, policy: EpsgIdentifyPolicy) -> EpsgIdentifyReport {
-    identify_epsg_from_crs_report_internal(crs, policy, None, None, None)
+    identify_epsg_from_crs_report_internal(crs, policy, None, None, None, None)
 }
 
 fn identify_epsg_from_crs_report_internal(
     crs: &Crs,
     policy: EpsgIdentifyPolicy,
+    wkt_datum: Option<String>,
     datum_hint: Option<String>,
     ellipsoid_hint: Option<String>,
     name_hint: Option<String>,
 ) -> EpsgIdentifyReport {
+    // The hand-coded registry is searched first. The codes from the
+    // generated WKT table are a fallback, searched only when no hand-coded
+    // code passes, so they add identifications without displacing one
+    // (e.g. 25832 stays ahead of 3044, ETRS89 / ETRS-TM32, which has the
+    // same parameters).
+    let hand_coded = identify_in_tier(
+        crs,
+        policy,
+        false,
+        wkt_datum.clone(),
+        datum_hint.clone(),
+        ellipsoid_hint.clone(),
+        name_hint.clone(),
+    );
+    if hand_coded.passed_threshold {
+        return hand_coded;
+    }
+    let generated = identify_in_tier(crs, policy, true, wkt_datum, datum_hint, ellipsoid_hint, name_hint);
+    if generated.passed_threshold {
+        generated
+    } else {
+        hand_coded
+    }
+}
+
+/// Identification among the hand-coded (`generated == false`) or the
+/// generated (`generated == true`) candidates.
+fn identify_in_tier(
+    crs: &Crs,
+    policy: EpsgIdentifyPolicy,
+    generated: bool,
+    wkt_datum: Option<String>,
+    datum_hint: Option<String>,
+    ellipsoid_hint: Option<String>,
+    name_hint: Option<String>,
+) -> EpsgIdentifyReport {
+    let candidates = || crs_candidates().iter().filter(move |c| c.generated == generated);
     let p = crs.projection.params();
     let src_kind = projection_kind_label(&p.kind);
+    let src_shape = kind_shape_params(&p.kind);
     let mut src_datum = normalize_datum_name(crs.datum.name);
+    if src_datum == "custom" {
+        // Same as for the generated candidates: use the datum name the WKT
+        // gives rather than the parser's "Custom".
+        if let Some(d) = wkt_datum.filter(|d| !d.is_empty()) {
+            src_datum = d;
+        }
+    }
     if let Some(h) = datum_hint {
         if src_datum.is_empty() || !src_datum.contains(&h) {
             src_datum = h;
@@ -819,7 +896,7 @@ fn identify_epsg_from_crs_report_internal(
 
     // Phase 1: strict structural match for high-confidence identification.
     let mut structural = Vec::<&CrsCandidate>::new();
-    for c in crs_candidates() {
+    for c in candidates() {
         if c.kind_label != src_kind {
             continue;
         }
@@ -834,7 +911,7 @@ fn identify_epsg_from_crs_report_internal(
                 continue;
             }
         }
-        if params_close(c, p, 1.0e-8, 1.0e-4, 1.0e-10) {
+        if params_close(c, p, &src_shape, 1.0e-8, 1.0e-4, 1.0e-10) {
             structural.push(c);
         }
     }
@@ -869,12 +946,7 @@ fn identify_epsg_from_crs_report_internal(
             })
             .collect::<Vec<_>>();
 
-        structural_scored.sort_by(|a, b| {
-            b.total_score
-                .partial_cmp(&a.total_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.code.cmp(&a.code))
-        });
+        structural_scored.sort_by(|a, b| rank_order(a, b));
 
         return EpsgIdentifyReport {
             resolved_code: structural_scored.first().map(|c| c.code),
@@ -886,8 +958,20 @@ fn identify_epsg_from_crs_report_internal(
     }
 
     // Phase 2+3: score all candidates and rank, with deterministic tie-break.
+    //
+    // The score ranks candidates, but only one whose projection method and
+    // parameters match the input within practical tolerances can be
+    // returned: a code with another false origin or other standard parallels
+    // would put the data somewhere else once the code is used (issue #45).
     let mut scored = Vec::<EpsgIdentifyCandidate>::new();
-    for c in crs_candidates() {
+    for c in candidates() {
+        if !(c.kind_label == src_kind || projection_kinds_compatible(&src_kind, &c.kind_label))
+            || !params_close(c, p, &src_shape, MATCH_ANGLE_TOL, MATCH_METER_TOL, MATCH_SCALE_TOL)
+            || (!matches!(src_kind.as_str(), "Geographic" | "Vertical")
+                && !ellipsoids_close(&c.ellipsoid, &crs.datum.ellipsoid))
+        {
+            continue;
+        }
         let candidate = score_candidate(
             c,
             p,
@@ -905,12 +989,7 @@ fn identify_epsg_from_crs_report_internal(
         scored.push(candidate);
     }
 
-    scored.sort_by(|a, b| {
-        b.total_score
-            .partial_cmp(&a.total_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.code.cmp(&a.code))
-    });
+    scored.sort_by(|a, b| rank_order(a, b));
 
     let best = scored.first();
     let best_score = best.map(|c| c.total_score).unwrap_or(f64::NEG_INFINITY);
@@ -1075,6 +1154,15 @@ fn ellipsoid_hint_from_wkt_text(norm_wkt: &str) -> Option<String> {
     }
 }
 
+/// Name of the first `DATUM[...]` in a WKT string, if any.
+fn wkt_datum_name(wkt: &str) -> Option<String> {
+    let upper = wkt.to_ascii_uppercase();
+    let start = upper.find("DATUM[")? + "DATUM[".len();
+    let rest = wkt[start..].trim_start().strip_prefix('"')?;
+    let name = rest[..rest.find('"')?].trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 fn crs_name_hint_from_wkt_text(wkt: &str) -> Option<String> {
     let start = wkt.find('"')? + 1;
     let rest = &wkt[start..];
@@ -1109,12 +1197,100 @@ fn projection_kinds_compatible(src_kind: &str, candidate_kind: &str) -> bool {
         || (src_kind == "Utm" && candidate_kind == "TransverseMercator")
 }
 
-fn params_close(c: &CrsCandidate, p: &ProjectionParams, angle_tol: f64, meter_tol: f64, scale_tol: f64) -> bool {
+fn params_close(
+    c: &CrsCandidate,
+    p: &ProjectionParams,
+    src_shape: &[ShapeParam],
+    angle_tol: f64,
+    meter_tol: f64,
+    scale_tol: f64,
+) -> bool {
     (c.lon0 - p.lon0).abs() <= angle_tol
         && (c.lat0 - p.lat0).abs() <= angle_tol
         && (c.false_easting - p.false_easting).abs() <= meter_tol
         && (c.false_northing - p.false_northing).abs() <= meter_tol
         && (c.scale - p.scale).abs() <= scale_tol
+        && shape_params_close(&c.shape, src_shape, angle_tol, meter_tol)
+}
+
+/// Whether two ellipsoids have the same size and shape (WGS 84 and GRS 80
+/// agree within these tolerances; GRS 1967 or Clarke 1866 do not). A sphere
+/// on either side is not compared, since some registry codes are defined on
+/// one (Web Mercator) while their WKT names an ellipsoid. Only projected and
+/// geocentric CRSs are compared: geographic and vertical coordinates do not
+/// depend on the ellipsoid through a projection, and tools rely on a
+/// geographic WKT resolving to some geographic code.
+fn ellipsoids_close(a: &Ellipsoid, b: &Ellipsoid) -> bool {
+    if a.f == 0.0 || b.f == 0.0 {
+        return true;
+    }
+    (a.a - b.a).abs() <= 1.0 && (a.f - b.f).abs() <= 1.0e-8
+}
+
+/// Compares two kinds' shape parameters. Kinds without parameters, or two
+/// kinds that are only compatible (UTM and Transverse Mercator), compare
+/// equal when either list is empty.
+fn shape_params_close(a: &[ShapeParam], b: &[ShapeParam], angle_tol: f64, meter_tol: f64) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return true;
+    }
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| match (x.value, y.value) {
+            (Some(u), Some(v)) => (u - v).abs() <= if x.angular { angle_tol } else { meter_tol },
+            (None, None) => true,
+            _ => false,
+        })
+}
+
+/// Parameters of a projection kind that `ProjectionParams` does not hold in
+/// its common fields: the standard parallels of the conics, an oblique
+/// projection's azimuth, a latitude of true scale, and so on. Kinds with no
+/// such parameters return an empty list.
+fn kind_shape_params(kind: &ProjectionKind) -> Vec<ShapeParam> {
+    let ang = |v: f64| ShapeParam { value: Some(v), angular: true };
+    let opt_ang = |v: Option<f64>| ShapeParam { value: v, angular: true };
+    let flag = |b: bool| ShapeParam { value: Some(if b { 1.0 } else { 0.0 }), angular: false };
+    // Two standard parallels define the same conic in either order.
+    let parallels = |a: f64, b: f64| if a <= b { vec![ang(a), ang(b)] } else { vec![ang(b), ang(a)] };
+    match *kind {
+        ProjectionKind::LambertConformalConic { lat1, lat2 } => match lat2 {
+            // One standard parallel, or two equal ones, is the same cone.
+            None => vec![ang(lat1), ang(lat1)],
+            Some(lat2) => parallels(lat1, lat2),
+        },
+        ProjectionKind::AlbersEqualAreaConic { lat1, lat2 }
+        | ProjectionKind::Euler { lat1, lat2 }
+        | ProjectionKind::Tissot { lat1, lat2 }
+        | ProjectionKind::MurdochI { lat1, lat2 }
+        | ProjectionKind::MurdochII { lat1, lat2 }
+        | ProjectionKind::MurdochIII { lat1, lat2 }
+        | ProjectionKind::PerspectiveConic { lat1, lat2 }
+        | ProjectionKind::VitkovskyI { lat1, lat2 } => parallels(lat1, lat2),
+        ProjectionKind::TwoPointEquidistant { lon1, lat1, lon2, lat2 } => {
+            vec![ang(lon1), ang(lat1), ang(lon2), ang(lat2)]
+        }
+        ProjectionKind::HotineObliqueMercator { azimuth, rectified_grid_angle } => {
+            vec![ang(azimuth), opt_ang(rectified_grid_angle)]
+        }
+        ProjectionKind::CentralConic { lat1 } | ProjectionKind::Loximuthal { lat1 } => vec![ang(lat1)],
+        ProjectionKind::Lagrange { lat1, w } => vec![ang(lat1), ShapeParam { value: Some(w), angular: true }],
+        ProjectionKind::PolarStereographic { north, lat_ts } => vec![flag(north), opt_ang(lat_ts)],
+        ProjectionKind::CylindricalEqualArea { lat_ts } | ProjectionKind::Equirectangular { lat_ts } => {
+            vec![ang(lat_ts)]
+        }
+        ProjectionKind::Geostationary { satellite_height, sweep_x } => {
+            vec![ShapeParam { value: Some(satellite_height), angular: false }, flag(sweep_x)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Ranking of scored candidates: highest score first, then highest code.
+fn rank_order(a: &EpsgIdentifyCandidate, b: &EpsgIdentifyCandidate) -> std::cmp::Ordering {
+    b.total_score
+        .partial_cmp(&a.total_score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| b.code.cmp(&a.code))
 }
 
 fn score_candidate(
@@ -2768,14 +2944,22 @@ pub(crate) fn esri_projection_params(p: &ProjectionParams) -> (&'static str, Vec
         ),
         LambertConformalConic { lat1, lat2 } => (
             "Lambert_Conformal_Conic",
-            vec![
-                ("standard_parallel_1", lat1),
-                ("standard_parallel_2", lat2.unwrap_or(lat1)),
-                ("latitude_of_origin", p.lat0),
-                ("central_meridian", p.lon0),
-                ("false_easting", p.false_easting),
-                ("false_northing", p.false_northing),
-            ],
+            {
+                let mut params = vec![
+                    ("standard_parallel_1", lat1),
+                    ("standard_parallel_2", lat2.unwrap_or(lat1)),
+                    ("latitude_of_origin", p.lat0),
+                    ("central_meridian", p.lon0),
+                    ("false_easting", p.false_easting),
+                    ("false_northing", p.false_northing),
+                ];
+                // A one-parallel cone with a reduced scale (e.g. EPSG:2192)
+                // loses its scale factor without this parameter.
+                if p.scale != 1.0 {
+                    params.push(("scale_factor", p.scale));
+                }
+                params
+            },
         ),
         AlbersEqualAreaConic { lat1, lat2 } => (
             "Albers",
@@ -3622,6 +3806,20 @@ pub(crate) fn ogc_projection_params(p: &ProjectionParams) -> (&'static str, Vec<
                 ("false_northing", p.false_northing),
             ],
         ),
+        LambertConformalConic { lat1, lat2 }
+            if p.scale != 1.0 && lat2.map_or(true, |lat2| lat2 == lat1) =>
+        {
+            (
+                "Lambert_Conformal_Conic_1SP",
+                vec![
+                    ("latitude_of_origin", p.lat0),
+                    ("central_meridian", p.lon0),
+                    ("scale_factor", p.scale),
+                    ("false_easting", p.false_easting),
+                    ("false_northing", p.false_northing),
+                ],
+            )
+        }
         LambertConformalConic { lat1, lat2 } => (
             "Lambert_Conformal_Conic_2SP",
             vec![
@@ -9053,8 +9251,10 @@ fn build_crs(code: u32) -> Result<Crs> {
             Ok(Crs {
                 name: format!("GDA94 / MGA zone {zone} (EPSG:{code})"),
                 datum: Datum::GDA94,
+                // MGA zones are southern-hemisphere UTM: false northing
+                // 10,000,000 m, like GDA2020 / MGA.
                 projection: crate::projections::Projection::new(
-                    ProjectionParams::utm(zone, false)
+                    ProjectionParams::utm(zone, true)
                         .with_ellipsoid(Ellipsoid::GRS80),
                 )?,
             })

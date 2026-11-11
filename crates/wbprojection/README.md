@@ -363,9 +363,19 @@ Policy behavior:
 - `Lenient`: resolve best candidate when confidence threshold is met.
 - `Strict`: require confident and unambiguous top candidate.
 
+A code is returned only when its projection method and parameters match the
+WKT within practical tolerances (1e-3° for angles, including standard
+parallels; 10 m for the false origin; 1e-6 for the scale factor) and, for a
+projected CRS, its ellipsoid has the same size and flattening. The score only ranks such
+candidates. When nothing matches, the result is `None` and callers keep the
+input WKT: a code with another false origin or other standard parallels would
+put the data somewhere else once it is used.
+
 The candidate search is built from `known_epsg_codes()`, so identification
 coverage automatically expands as additional EPSG entries are added to the
-registry.
+registry. The hand-coded registry is searched first; the codes defined by the
+generated WKT table are searched only when no hand-coded code matches, so they
+add identifications without displacing one with the same parameters.
 
 ### Calibration and verification tools
 

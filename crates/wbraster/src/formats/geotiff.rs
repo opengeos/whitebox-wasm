@@ -266,8 +266,47 @@ fn crs_from_geotiff(tiff: &gt::GeoTiff) -> CrsInfo {
 
 /// GeoKeys for a raster's CRS when it has no EPSG code but a PROJ string the
 /// GeoKey encoder supports, so a user-defined projection survives a write.
+/// A raster with only WKT (e.g. an ASCII grid's `.prj` that matches no EPSG
+/// code) gets its PROJ string from that WKT.
 fn user_defined_geo_keys(raster: &Raster) -> Option<gt::geo_keys::GeoKeyDirectory> {
-    gt::geo_keys::GeoKeyDirectory::from_proj_string(raster.crs.proj4.as_deref()?)
+    let proj = match raster.crs.proj4.as_deref() {
+        Some(proj) => proj.to_string(),
+        None => proj_string_from_wkt(raster.crs.wkt.as_deref()?)?,
+    };
+    gt::geo_keys::GeoKeyDirectory::from_proj_string(&proj)
+}
+
+/// PROJ string for a projected WKT whose method the GeoKey encoder supports
+/// (Transverse Mercator, two-parallel LCC, Albers, Lambert azimuthal),
+/// with the ellipsoid as `+a`/`+rf`. Parameters are in metres and degrees as
+/// `wbprojection` parses them. Anything else returns `None`.
+fn proj_string_from_wkt(wkt: &str) -> Option<String> {
+    use wbprojection::ProjectionKind as K;
+    let crs = wbprojection::from_wkt(wkt).ok()?;
+    let p = crs.projection.params();
+    let ellipsoid = &crs.datum.ellipsoid;
+    if ellipsoid.f <= 0.0 {
+        return None;
+    }
+    let method = match p.kind {
+        K::TransverseMercator | K::Utm { .. } => format!("+proj=tmerc +k_0={}", p.scale),
+        // GeoKeys write LCC as the two-parallel method, which has no scale.
+        K::LambertConformalConic { lat1, lat2 } if p.scale == 1.0 => {
+            format!("+proj=lcc +lat_1={lat1} +lat_2={}", lat2.unwrap_or(lat1))
+        }
+        K::AlbersEqualAreaConic { lat1, lat2 } => format!("+proj=aea +lat_1={lat1} +lat_2={lat2}"),
+        K::LambertAzimuthalEqualArea => "+proj=laea".to_string(),
+        _ => return None,
+    };
+    Some(format!(
+        "{method} +lat_0={} +lon_0={} +x_0={} +y_0={} +a={} +rf={} +units=m +no_defs",
+        p.lat0,
+        p.lon0,
+        p.false_easting,
+        p.false_northing,
+        ellipsoid.a,
+        1.0 / ellipsoid.f
+    ))
 }
 
 /// Write GeoTIFF / BigTIFF / COG to `path`.

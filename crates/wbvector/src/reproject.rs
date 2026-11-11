@@ -359,17 +359,23 @@ fn layer_bbox(layer: &Layer) -> Option<crate::geometry::BBox> {
 }
 
 fn source_crs_from_layer(layer: &Layer) -> Result<Crs> {
+    let wkt = layer.crs_wkt().map(str::trim).filter(|w| !w.is_empty());
+
     if let Some(src_epsg) = layer.crs_epsg() {
-        return Crs::from_epsg(src_epsg)
-            .map_err(|e| GeoError::Projection(format!("invalid source EPSG {src_epsg}: {e}")));
+        return match Crs::from_epsg(src_epsg) {
+            Ok(crs) => Ok(crs),
+            // A code missing from the built-in registry is not fatal when the
+            // layer also carries its full definition as WKT (whitebox-wasm#43).
+            Err(e) => match wkt.and_then(|w| wbprojection::from_wkt(w).ok()) {
+                Some(crs) => Ok(crs),
+                None => Err(GeoError::Projection(format!("invalid source EPSG {src_epsg}: {e}"))),
+            },
+        };
     }
 
-    if let Some(wkt) = layer.crs_wkt() {
-        let trimmed = wkt.trim();
-        if !trimmed.is_empty() {
-            return wbprojection::from_wkt(trimmed)
-                .map_err(|e| GeoError::Projection(format!("invalid source CRS WKT: {e}")));
-        }
+    if let Some(trimmed) = wkt {
+        return wbprojection::from_wkt(trimmed)
+            .map_err(|e| GeoError::Projection(format!("invalid source CRS WKT: {e}")));
     }
 
     Err(GeoError::Projection(

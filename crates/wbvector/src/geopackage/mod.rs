@@ -230,9 +230,9 @@ fn spatial_ref_wkt(db: &Db, srs_id: i64) -> Option<String> {
         return None;
     }
 
-    let rows = db.select_all("gpkg_spatial_ref_sys").ok()?;
-    for row in rows {
-        if row.get(1).and_then(|v| v.as_i64()) == Some(srs_id) {
+    let rows = db.select_all_with_rowid("gpkg_spatial_ref_sys").ok()?;
+    for (rowid, row) in rows {
+        if srs_row_id(rowid, &row) == srs_id {
             let definition = row.get(4).and_then(|v| v.as_str())?.trim();
             if definition.is_empty() || definition.eq_ignore_ascii_case("undefined") {
                 return None;
@@ -459,8 +459,16 @@ fn ensure_srs_row(db: &mut Db, layer: &Layer, srs_id: i64) -> Result<()> {
 }
 
 fn srs_row_exists(db: &Db, srs_id: i64) -> Result<bool> {
-    let rows = db.select_all("gpkg_spatial_ref_sys")?;
-    Ok(rows.iter().any(|row| row.get(1).and_then(|v| v.as_i64()) == Some(srs_id)))
+    let rows = db.select_all_with_rowid("gpkg_spatial_ref_sys")?;
+    Ok(rows.iter().any(|(rowid, row)| srs_row_id(*rowid, row) == srs_id))
+}
+
+/// `srs_id` of a `gpkg_spatial_ref_sys` row. The GeoPackage spec declares it
+/// `INTEGER PRIMARY KEY`, an alias of the rowid, so SQLite (and GDAL) store
+/// NULL in the record and the id is the rowid. Tables this crate writes keep
+/// it as an ordinary column.
+fn srs_row_id(rowid: i64, row: &Row) -> i64 {
+    row.get(1).and_then(|v| v.as_i64()).unwrap_or(rowid)
 }
 
 fn field_to_sqlval(v: &FieldValue) -> SqlVal {

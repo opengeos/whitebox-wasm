@@ -10,7 +10,7 @@ use wbcore::{
     ToolParamSpec, ToolRunResult, ToolStability,
 };
 use wbraster::color_math::{hsi2value, value2hsi, value2i};
-use wbraster::{Raster, RasterFormat};
+use wbraster::{DataType, Raster, RasterConfig, RasterFormat};
 
 use super::color_support;
 use crate::memory_store;
@@ -289,7 +289,12 @@ impl AdvancedFilters {
                 });
                 params.push(ToolParamSpec {
                     name: "c",
-                    description: "Frangi c parameter for structure sensitivity (default 15.0).",
+                    description: "Frangi c parameter for structure sensitivity (default 15.0). Set 0 or less to use half the largest Hessian norm at each scale.",
+                    required: false,
+                });
+                params.push(ToolParamSpec {
+                    name: "black_ridges",
+                    description: "Detect dark ridges such as valleys instead of bright ridges (default false).",
                     required: false,
                 });
             }
@@ -366,6 +371,7 @@ impl AdvancedFilters {
                 defaults.insert("scales".to_string(), json!([1.0, 2.0, 3.0]));
                 defaults.insert("beta".to_string(), json!(0.5));
                 defaults.insert("c".to_string(), json!(15.0));
+                defaults.insert("black_ridges".to_string(), json!(false));
             }
             AdvancedOp::SavitzkyGolay2d => {
                 defaults.insert("window_size".to_string(), json!(5));
@@ -1215,95 +1221,223 @@ impl AdvancedFilters {
         Ok(out)
     }
 
+    /// Frangi et al. (1998) vesselness, maximised over `scales`.
+    ///
+    /// For each scale σ the band is smoothed with a Gaussian of standard
+    /// deviation σ (reflected at the raster edges, NoData cells excluded by
+    /// normalised convolution), the Hessian is taken from central second
+    /// differences of the smoothed surface and scale-normalised by σ², and
+    /// the eigenvalues are ordered so that |λ1| ≤ |λ2|. Bright ridges need
+    /// λ2 < 0 and dark ridges (valleys) need λ2 > 0; other cells score 0.
+    /// `c <= 0` sets c per scale to half the largest Hessian norm, as
+    /// scikit-image does when `gamma` is left unset.
     fn run_frangi(
         input: &Raster,
         packed_rgb: bool,
         scales: &[f64],
         beta: f64,
         c: f64,
+        black_ridges: bool,
     ) -> Result<Raster, ToolError> {
         let rows = input.rows;
         let cols = input.cols;
         let bands = input.bands;
-        let nodata = input.nodata;
         let beta2 = 2.0 * beta.max(1e-6) * beta.max(1e-6);
-        let c2 = 2.0 * c.max(1e-6) * c.max(1e-6);
-        let mut out = input.clone();
+        // Vesselness lies in [0, 1], so write it as floats (an integer input's
+        // storage would truncate it) and move NoData out of that range.
+        let nodata = if (0.0..=1.0).contains(&input.nodata) {
+            -32768.0
+        } else {
+            input.nodata
+        };
+        let mut out = Raster::new(RasterConfig {
+            cols,
+            rows,
+            bands,
+            x_min: input.x_min,
+            y_min: input.y_min,
+            cell_size: input.cell_size_x,
+            cell_size_y: Some(input.cell_size_y),
+            nodata,
+            data_type: DataType::F32,
+            crs: input.crs.clone(),
+            metadata: input.metadata.clone(),
+        });
 
         for band_idx in 0..bands {
             let band = band_idx as isize;
-            let mut vals = vec![nodata; rows * cols];
+            let mut vals = vec![0.0; rows * cols];
+            let mut valid = vec![false; rows * cols];
             for r in 0..rows {
                 for c0 in 0..cols {
                     let z_raw = input.get(band, r as isize, c0 as isize);
                     if !input.is_nodata(z_raw) {
-                        vals[r * cols + c0] = if packed_rgb { value2i(z_raw) } else { z_raw };
+                        let idx = r * cols + c0;
+                        vals[idx] = if packed_rgb { value2i(z_raw) } else { z_raw };
+                        valid[idx] = true;
                     }
                 }
             }
 
-            let mut vessel = vec![nodata; rows * cols];
-            vessel.par_chunks_mut(cols).enumerate().for_each(|(r, out_row)| {
-                for c0 in 0..cols {
-                    let idx = r * cols + c0;
-                    if vals[idx] == nodata {
-                        continue;
-                    }
-                    let mut best = 0.0;
-                    for &s in scales {
-                        let rad = s.max(1.0).round() as isize;
-                        let mut sx = 0.0;
-                        let mut sy = 0.0;
-                        let mut n = 0.0;
-                        for dy in -rad..=rad {
-                            for dx in -rad..=rad {
-                                let y = r as isize + dy;
-                                let x = c0 as isize + dx;
-                                if y < 0 || x < 0 || y >= rows as isize || x >= cols as isize {
-                                    continue;
-                                }
-                                let z = vals[y as usize * cols + x as usize];
-                                if z == nodata {
-                                    continue;
-                                }
-                                sx += z * (dx as f64);
-                                sy += z * (dy as f64);
-                                n += 1.0;
-                            }
-                        }
-                        if n <= 0.0 {
-                            continue;
-                        }
-                        let ix = sx / n;
-                        let iy = sy / n;
-                        let ixx = ix * ix;
-                        let iyy = iy * iy;
-                        let ixy = ix * iy;
+            let max_abs = vals
+                .iter()
+                .zip(&valid)
+                .filter(|(_, &ok)| ok)
+                .fold(0.0f64, |m, (v, _)| m.max(v.abs()));
 
-                        let tr = ixx + iyy;
-                        let det_term = ((ixx - iyy) * (ixx - iyy) + 4.0 * ixy * ixy).sqrt();
-                        let l1 = 0.5 * (tr + det_term);
-                        let l2 = 0.5 * (tr - det_term);
-                        let (lam1, lam2) = if l1.abs() <= l2.abs() { (l1, l2) } else { (l2, l1) };
-
-                        if lam2 >= 0.0 {
-                            continue;
-                        }
-                        let rb = (lam1 / (lam2 + 1e-12)).powi(2);
-                        let s2 = lam1 * lam1 + lam2 * lam2;
-                        let v = (-rb / beta2).exp() * (1.0 - (-s2 / c2).exp());
-                        if v > best {
-                            best = v;
-                        }
-                    }
-                    out_row[c0] = best;
+            let mut best = vec![0.0f64; rows * cols];
+            for &sigma in scales {
+                if !(sigma.is_finite() && sigma > 0.0) {
+                    return Err(ToolError::Validation(format!(
+                        "frangi_filter scales must be positive numbers, got {sigma}"
+                    )));
                 }
-            });
+                let smooth = Self::gaussian_smooth(&vals, &valid, rows, cols, sigma);
+                let (l1, l2) = Self::hessian_eigenvalues(&smooth, rows, cols, sigma * sigma);
 
-            Self::set_band_from_values(input, &mut out, band_idx, &vessel, false)?;
+                let gamma = if c > 0.0 {
+                    c
+                } else {
+                    let max_s = l1
+                        .iter()
+                        .zip(&l2)
+                        .zip(&valid)
+                        .filter(|(_, &v)| v)
+                        .map(|((a, b), _)| (a * a + b * b).sqrt())
+                        .fold(0.0f64, f64::max);
+                    // On a flat band the Hessian is rounding residue; scaling c
+                    // to it would turn that residue into full-strength output.
+                    let floor = 1e-9 * max_abs * sigma * sigma;
+                    if max_s > floor { 0.5 * max_s } else { 1.0 }
+                };
+                let gamma2 = 2.0 * gamma * gamma;
+
+                best.par_iter_mut().enumerate().for_each(|(idx, b)| {
+                    let (lam1, lam2) = (l1[idx], l2[idx]);
+                    let ridge = if black_ridges { lam2 > 0.0 } else { lam2 < 0.0 };
+                    if !valid[idx] || !ridge {
+                        return;
+                    }
+                    let rb2 = (lam1 / lam2).powi(2);
+                    let s2 = lam1 * lam1 + lam2 * lam2;
+                    let v = (-rb2 / beta2).exp() * (1.0 - (-s2 / gamma2).exp());
+                    if v > *b {
+                        *b = v;
+                    }
+                });
+            }
+
+            let vessel: Vec<f64> = best
+                .iter()
+                .zip(&valid)
+                .map(|(&v, &ok)| if ok { v } else { nodata })
+                .collect();
+            for (r, row) in vessel.chunks(cols).enumerate() {
+                out.set_row_slice(band, r as isize, row).map_err(|e| {
+                    ToolError::Execution(format!("failed writing row {}: {}", r, e))
+                })?;
+            }
         }
 
         Ok(out)
+    }
+
+    /// Separable Gaussian smoothing with edge reflection (`d c b a | a b c d`)
+    /// and NoData cells left out of each weighted mean. Cells with no valid
+    /// neighbour inside the kernel come back as 0.
+    fn gaussian_smooth(
+        vals: &[f64],
+        valid: &[bool],
+        rows: usize,
+        cols: usize,
+        sigma: f64,
+    ) -> Vec<f64> {
+        let radius = (4.0 * sigma).ceil().max(1.0) as isize;
+        let kernel: Vec<f64> = (-radius..=radius)
+            .map(|i| (-(i * i) as f64 / (2.0 * sigma * sigma)).exp())
+            .collect();
+        let reflect = |i: isize, n: usize| -> usize {
+            let n = n as isize;
+            let period = 2 * n;
+            let mut m = i.rem_euclid(period);
+            if m >= n {
+                m = period - 1 - m;
+            }
+            m as usize
+        };
+
+        // Pass 1 along columns: weighted sums of values and of validity.
+        let mut num = vec![0.0; rows * cols];
+        let mut den = vec![0.0; rows * cols];
+        num.par_chunks_mut(cols)
+            .zip(den.par_chunks_mut(cols))
+            .enumerate()
+            .for_each(|(r, (num_row, den_row))| {
+                for c0 in 0..cols {
+                    let (mut s, mut w) = (0.0, 0.0);
+                    for (k, &kw) in kernel.iter().enumerate() {
+                        let x = reflect(c0 as isize + k as isize - radius, cols);
+                        let idx = r * cols + x;
+                        if valid[idx] {
+                            s += kw * vals[idx];
+                            w += kw;
+                        }
+                    }
+                    num_row[c0] = s;
+                    den_row[c0] = w;
+                }
+            });
+
+        // Pass 2 along rows, then divide.
+        let mut smooth = vec![0.0; rows * cols];
+        smooth.par_chunks_mut(cols).enumerate().for_each(|(r, out_row)| {
+            for c0 in 0..cols {
+                let (mut s, mut w) = (0.0, 0.0);
+                for (k, &kw) in kernel.iter().enumerate() {
+                    let y = reflect(r as isize + k as isize - radius, rows);
+                    let idx = y * cols + c0;
+                    s += kw * num[idx];
+                    w += kw * den[idx];
+                }
+                out_row[c0] = if w > 0.0 { s / w } else { 0.0 };
+            }
+        });
+        smooth
+    }
+
+    /// Eigenvalues of the scale-normalised Hessian of `f`, from central
+    /// second differences with edge reflection, ordered so |λ1| ≤ |λ2|.
+    fn hessian_eigenvalues(
+        f: &[f64],
+        rows: usize,
+        cols: usize,
+        norm: f64,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let at = |r: isize, c: isize| -> f64 {
+            let rr = r.clamp(0, rows as isize - 1) as usize;
+            let cc = c.clamp(0, cols as isize - 1) as usize;
+            f[rr * cols + cc]
+        };
+        let pairs: Vec<(f64, f64)> = (0..rows * cols)
+            .into_par_iter()
+            .map(|idx| {
+                let r = (idx / cols) as isize;
+                let c = (idx % cols) as isize;
+                let z = at(r, c);
+                let dxx = (at(r, c + 1) - 2.0 * z + at(r, c - 1)) * norm;
+                let dyy = (at(r + 1, c) - 2.0 * z + at(r - 1, c)) * norm;
+                let dxy = (at(r + 1, c + 1) - at(r + 1, c - 1) - at(r - 1, c + 1)
+                    + at(r - 1, c - 1))
+                    * 0.25
+                    * norm;
+                let half_tr = 0.5 * (dxx + dyy);
+                let disc = (0.25 * (dxx - dyy) * (dxx - dyy) + dxy * dxy).sqrt();
+                let a = half_tr + disc;
+                let b = half_tr - disc;
+                if a.abs() <= b.abs() { (a, b) } else { (b, a) }
+            })
+            .collect();
+        pairs.into_iter().unzip()
     }
 
     fn run_savgol2d(
@@ -1469,7 +1603,11 @@ impl AdvancedFilters {
                     .unwrap_or_else(|| vec![1.0, 2.0, 3.0]);
                 let beta = args.get("beta").and_then(|v| v.as_f64()).unwrap_or(0.5);
                 let c = args.get("c").and_then(|v| v.as_f64()).unwrap_or(15.0);
-                Self::run_frangi(&input, packed_rgb, &scales, beta, c)?
+                let black_ridges = args
+                    .get("black_ridges")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Self::run_frangi(&input, packed_rgb, &scales, beta, c, black_ridges)?
             }
             AdvancedOp::SavitzkyGolay2d => {
                 let window_size = args
@@ -1680,6 +1818,115 @@ mod tests {
         args.insert("c".to_string(), json!(15.0));
         let out = run_with_memory(&FrangiFilterTool, &mut args, make_constant_raster(25, 25, 10.0));
         assert!(out.get(0, 12, 12).abs() < 1e-9);
+    }
+
+    /// 61×61 raster with a Gaussian ridge (`sign = 1`) or valley (`sign = -1`)
+    /// of standard deviation `width` running down column 30.
+    fn make_ridge_raster(width: f64, sign: f64) -> Raster {
+        let mut r = make_constant_raster(61, 61, 0.0);
+        for row in 0..61isize {
+            for col in 0..61isize {
+                let d = (col - 30) as f64;
+                let z = 100.0 + sign * 50.0 * (-(d * d) / (2.0 * width * width)).exp();
+                r.set(0, row, col, z).unwrap();
+            }
+        }
+        r
+    }
+
+    fn frangi_args(scales: serde_json::Value, black_ridges: bool) -> ToolArgs {
+        let mut args = ToolArgs::new();
+        args.insert("scales".to_string(), scales);
+        args.insert("beta".to_string(), json!(0.5));
+        args.insert("c".to_string(), json!(15.0));
+        args.insert("black_ridges".to_string(), json!(black_ridges));
+        args
+    }
+
+    #[test]
+    fn frangi_responds_on_bright_ridge_only() {
+        let mut args = frangi_args(json!([2.0]), false);
+        let out = run_with_memory(&FrangiFilterTool, &mut args, make_ridge_raster(2.0, 1.0));
+        let on = out.get(0, 30, 30);
+        let off = out.get(0, 30, 5);
+        assert!(on > 0.3, "ridge response {on}");
+        assert!(off.abs() < 1e-9, "background response {off}");
+        // Along the ridge the response is the same away from the edges.
+        assert!((out.get(0, 20, 30) - on).abs() < 1e-9);
+
+        // A valley gives no bright-ridge response.
+        let mut args = frangi_args(json!([2.0]), false);
+        let out = run_with_memory(&FrangiFilterTool, &mut args, make_ridge_raster(2.0, -1.0));
+        assert!(out.get(0, 30, 30).abs() < 1e-9);
+    }
+
+    #[test]
+    fn frangi_black_ridges_detects_valleys() {
+        let mut args = frangi_args(json!([2.0]), true);
+        let out = run_with_memory(&FrangiFilterTool, &mut args, make_ridge_raster(2.0, -1.0));
+        assert!(out.get(0, 30, 30) > 0.3);
+        assert!(out.get(0, 30, 5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn frangi_scale_selects_ridge_width() {
+        // A wide ridge responds more strongly at a matching scale than at σ = 1.
+        let input = make_ridge_raster(6.0, 1.0);
+        let mut small = frangi_args(json!([1.0]), false);
+        let small = run_with_memory(&FrangiFilterTool, &mut small, input.clone());
+        let mut large = frangi_args(json!([6.0]), false);
+        let large = run_with_memory(&FrangiFilterTool, &mut large, input);
+        let (s, l) = (small.get(0, 30, 30), large.get(0, 30, 30));
+        assert!(l > s + 0.1, "sigma 6 response {l} vs sigma 1 response {s}");
+    }
+
+    #[test]
+    fn frangi_keeps_nodata() {
+        let mut input = make_ridge_raster(2.0, 1.0);
+        input.set(0, 10, 10, -9999.0).unwrap();
+        let mut args = frangi_args(json!([2.0]), false);
+        let out = run_with_memory(&FrangiFilterTool, &mut args, input);
+        assert_eq!(out.get(0, 10, 10), -9999.0);
+        assert!(out.get(0, 30, 30) > 0.3);
+    }
+
+    #[test]
+    fn frangi_integer_input_keeps_fractional_output() {
+        let mut input = Raster::new(RasterConfig {
+            rows: 61,
+            cols: 61,
+            bands: 1,
+            nodata: 0.0,
+            data_type: DataType::U8,
+            ..Default::default()
+        });
+        for row in 0..61isize {
+            for col in 0..61isize {
+                let d = (col - 30) as f64;
+                let z = 100.0 + 50.0 * (-(d * d) / 8.0).exp();
+                input.set(0, row, col, z.round()).unwrap();
+            }
+        }
+        let mut args = frangi_args(json!([2.0]), false);
+        let out = run_with_memory(&FrangiFilterTool, &mut args, input);
+        let on = out.get(0, 30, 30);
+        assert!(on > 0.3 && on < 1.0, "ridge response {on}");
+        // Zero response stays a valid value, distinct from NoData.
+        assert_eq!(out.get(0, 30, 5), 0.0);
+        assert!(!out.is_nodata(out.get(0, 30, 5)));
+    }
+
+    #[test]
+    fn frangi_adaptive_c_on_flat_band_is_zero() {
+        let mut args = frangi_args(json!([1.0, 2.5, 4.0]), false);
+        args.insert("c".to_string(), json!(0.0));
+        let mut input = make_constant_raster(25, 25, 1234.567);
+        input.set(0, 3, 3, -9999.0).unwrap();
+        let out = run_with_memory(&FrangiFilterTool, &mut args, input);
+        for (r, c) in [(12, 12), (4, 4), (0, 24)] {
+            assert!(out.get(0, r, c).abs() < 1e-9, "cell ({r}, {c})");
+        }
+        assert!(out.is_nodata(out.get(0, 3, 3)));
     }
 
     #[test]

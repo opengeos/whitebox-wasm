@@ -10,7 +10,7 @@ use wbcore::{
     ToolParamSpec, ToolRunResult, ToolStability,
 };
 use wbraster::color_math::{hsi2value, value2hsi, value2i};
-use wbraster::{Raster, RasterFormat};
+use wbraster::{DataType, Raster, RasterConfig, RasterFormat};
 
 use super::color_support;
 use crate::memory_store;
@@ -1242,9 +1242,27 @@ impl AdvancedFilters {
         let rows = input.rows;
         let cols = input.cols;
         let bands = input.bands;
-        let nodata = input.nodata;
         let beta2 = 2.0 * beta.max(1e-6) * beta.max(1e-6);
-        let mut out = input.clone();
+        // Vesselness lies in [0, 1], so write it as floats (an integer input's
+        // storage would truncate it) and move NoData out of that range.
+        let nodata = if (0.0..=1.0).contains(&input.nodata) {
+            -32768.0
+        } else {
+            input.nodata
+        };
+        let mut out = Raster::new(RasterConfig {
+            cols,
+            rows,
+            bands,
+            x_min: input.x_min,
+            y_min: input.y_min,
+            cell_size: input.cell_size_x,
+            cell_size_y: Some(input.cell_size_y),
+            nodata,
+            data_type: DataType::F32,
+            crs: input.crs.clone(),
+            metadata: input.metadata.clone(),
+        });
 
         for band_idx in 0..bands {
             let band = band_idx as isize;
@@ -1260,6 +1278,12 @@ impl AdvancedFilters {
                     }
                 }
             }
+
+            let max_abs = vals
+                .iter()
+                .zip(&valid)
+                .filter(|(_, &ok)| ok)
+                .fold(0.0f64, |m, (v, _)| m.max(v.abs()));
 
             let mut best = vec![0.0f64; rows * cols];
             for &sigma in scales {
@@ -1281,7 +1305,10 @@ impl AdvancedFilters {
                         .filter(|(_, &v)| v)
                         .map(|((a, b), _)| (a * a + b * b).sqrt())
                         .fold(0.0f64, f64::max);
-                    if max_s > 0.0 { 0.5 * max_s } else { 1.0 }
+                    // On a flat band the Hessian is rounding residue; scaling c
+                    // to it would turn that residue into full-strength output.
+                    let floor = 1e-9 * max_abs * sigma * sigma;
+                    if max_s > floor { 0.5 * max_s } else { 1.0 }
                 };
                 let gamma2 = 2.0 * gamma * gamma;
 
@@ -1305,7 +1332,11 @@ impl AdvancedFilters {
                 .zip(&valid)
                 .map(|(&v, &ok)| if ok { v } else { nodata })
                 .collect();
-            Self::set_band_from_values(input, &mut out, band_idx, &vessel, false)?;
+            for (r, row) in vessel.chunks(cols).enumerate() {
+                out.set_row_slice(band, r as isize, row).map_err(|e| {
+                    ToolError::Execution(format!("failed writing row {}: {}", r, e))
+                })?;
+            }
         }
 
         Ok(out)
@@ -1857,6 +1888,45 @@ mod tests {
         let out = run_with_memory(&FrangiFilterTool, &mut args, input);
         assert_eq!(out.get(0, 10, 10), -9999.0);
         assert!(out.get(0, 30, 30) > 0.3);
+    }
+
+    #[test]
+    fn frangi_integer_input_keeps_fractional_output() {
+        let mut input = Raster::new(RasterConfig {
+            rows: 61,
+            cols: 61,
+            bands: 1,
+            nodata: 0.0,
+            data_type: DataType::U8,
+            ..Default::default()
+        });
+        for row in 0..61isize {
+            for col in 0..61isize {
+                let d = (col - 30) as f64;
+                let z = 100.0 + 50.0 * (-(d * d) / 8.0).exp();
+                input.set(0, row, col, z.round()).unwrap();
+            }
+        }
+        let mut args = frangi_args(json!([2.0]), false);
+        let out = run_with_memory(&FrangiFilterTool, &mut args, input);
+        let on = out.get(0, 30, 30);
+        assert!(on > 0.3 && on < 1.0, "ridge response {on}");
+        // Zero response stays a valid value, distinct from NoData.
+        assert_eq!(out.get(0, 30, 5), 0.0);
+        assert!(!out.is_nodata(out.get(0, 30, 5)));
+    }
+
+    #[test]
+    fn frangi_adaptive_c_on_flat_band_is_zero() {
+        let mut args = frangi_args(json!([1.0, 2.5, 4.0]), false);
+        args.insert("c".to_string(), json!(0.0));
+        let mut input = make_constant_raster(25, 25, 1234.567);
+        input.set(0, 3, 3, -9999.0).unwrap();
+        let out = run_with_memory(&FrangiFilterTool, &mut args, input);
+        for (r, c) in [(12, 12), (4, 4), (0, 24)] {
+            assert!(out.get(0, r, c).abs() < 1e-9, "cell ({r}, {c})");
+        }
+        assert!(out.is_nodata(out.get(0, 3, 3)));
     }
 
     #[test]

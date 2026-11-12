@@ -168,6 +168,7 @@ pub fn remote_sensing_tool_param_schemas(tool_id: &str) -> Option<BTreeMap<Strin
 			("scales", ToolParamSchema::string()),
 			("beta", ToolParamSchema::scalar_float()),
 			("c", ToolParamSchema::scalar_float()),
+			("black_ridges", ToolParamSchema::bool()),
 			("output", ToolParamSchema::output_raster()),
 		])),
 		"gabor_filter_bank" => Some(param_schema_map(&[

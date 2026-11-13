@@ -180,6 +180,10 @@ fn molodensky_shift(
 /// Y_wgs84 = ty + (1 + ds) * (-rz*X + Y + rx*Z)
 /// Z_wgs84 = tz + (1 + ds) * (ry*X - rx*Y + Z)
 /// ```
+///
+/// This is the coordinate frame rotation convention (EPSG method 9607).
+/// Parameters published in the position vector convention (EPSG method 9606,
+/// PROJ `+towgs84`) need their rotations negated.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HelmertParams {
     /// Translation in X (meters).
@@ -1255,7 +1259,9 @@ impl Datum {
 
     /// OSGB36 – Ordnance Survey Great Britain 1936.
     ///
-    /// Uses a commonly cited 7-parameter Helmert approximation to WGS84.
+    /// Uses a commonly cited 7-parameter Helmert approximation to WGS84
+    /// (EPSG:1314, published in the position vector convention; the
+    /// rotations here are negated for the coordinate frame form `apply` uses).
     pub const OSGB36: Datum = Datum {
         name: "OSGB36",
         ellipsoid: Ellipsoid::AIRY1830,
@@ -1263,16 +1269,18 @@ impl Datum {
             tx: 446.448,
             ty: -125.157,
             tz: 542.060,
-            rx: 0.1502,
-            ry: 0.2470,
-            rz: 0.8421,
+            rx: -0.1502,
+            ry: -0.2470,
+            rz: -0.8421,
             ds: -20.4894,
         }),
     };
 
     /// DHDN (Potsdam) – Deutsches Hauptdreiecksnetz.
     ///
-    /// Uses a commonly cited 7-parameter Helmert approximation to WGS84.
+    /// Uses a commonly cited 7-parameter Helmert approximation to WGS84
+    /// (EPSG:1777, published in the position vector convention; the
+    /// rotations here are negated for the coordinate frame form `apply` uses).
     pub const DHDN: Datum = Datum {
         name: "DHDN",
         ellipsoid: Ellipsoid::BESSEL,
@@ -1280,9 +1288,9 @@ impl Datum {
             tx: 598.1,
             ty: 73.7,
             tz: 418.2,
-            rx: 0.202,
-            ry: 0.045,
-            rz: -2.455,
+            rx: -0.202,
+            ry: -0.045,
+            rz: 2.455,
             ds: 6.7,
         }),
     };
@@ -1374,7 +1382,9 @@ impl Datum {
 
     /// TM65 – Irish historical datum.
     ///
-    /// Uses a commonly cited 7-parameter Helmert approximation to WGS84.
+    /// Uses a commonly cited 7-parameter Helmert approximation to WGS84
+    /// (EPSG:1641, published in the position vector convention; the
+    /// rotations here are negated for the coordinate frame form `apply` uses).
     pub const TM65: Datum = Datum {
         name: "TM65",
         ellipsoid: Ellipsoid::AIRY1830_MOD,
@@ -1382,9 +1392,9 @@ impl Datum {
             tx: 482.53,
             ty: -130.596,
             tz: 564.557,
-            rx: -1.042,
-            ry: -0.214,
-            rz: -0.631,
+            rx: 1.042,
+            ry: 0.214,
+            rz: 0.631,
             ds: 8.15,
         }),
     };

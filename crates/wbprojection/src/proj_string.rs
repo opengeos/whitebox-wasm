@@ -587,9 +587,11 @@ fn resolve_datum(tokens: &HashMap<String, Option<String>>, ellipsoid: &Ellipsoid
             .filter_map(|p| p.trim().parse::<f64>().ok())
             .collect();
         if parts.len() >= 7 {
+            // PROJ gives +towgs84 rotations in the position vector convention;
+            // `HelmertParams` uses the coordinate frame form, so negate them.
             let hp = HelmertParams {
                 tx: parts[0], ty: parts[1], tz: parts[2],
-                rx: parts[3], ry: parts[4], rz: parts[5],
+                rx: -parts[3], ry: -parts[4], rz: -parts[5],
                 ds: parts[6],
             };
             return Datum {

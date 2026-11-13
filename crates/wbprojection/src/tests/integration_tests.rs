@@ -2193,6 +2193,37 @@ fn crs_transform_trace_strict_convenience_matches_strict_policy() {
     assert_eq!(via_policy.target_grid, via_helper.target_grid);
 }
 
+/// The datum step to WGS 84 against PROJ's EPSG operations, whose parameters
+/// are published in the position vector convention.
+#[test]
+fn position_vector_helmert_datums_match_epsg_operations() {
+    let osgb36 = crate::from_proj_string(
+        "+proj=longlat +ellps=airy +towgs84=446.448,-125.157,542.06,0.15,0.247,0.842,-20.489",
+    )
+    .unwrap()
+    .datum;
+    // (datum, lon, lat in the datum, lon, lat in WGS 84 from PROJ)
+    let cases = [
+        (Datum::OSGB36, -3.5_f64, 50.7_f64, -3.501193968, 50.700555775), // EPSG:1314
+        (osgb36, -3.5, 50.7, -3.501193968, 50.700555775),
+        (Datum::DHDN, 10.0, 51.0, 9.998802158, 50.998742873), // EPSG:1777
+        (Datum::TM65, -7.5, 53.3, -7.500800704, 53.300238157), // EPSG:1641
+    ];
+    for (datum, lon, lat, want_lon, want_lat) in cases {
+        let (lat_w, lon_w, _) = datum
+            .to_wgs84_geodetic(lat.to_radians(), lon.to_radians(), 0.0)
+            .unwrap();
+        // 1e-6 degrees is about 0.1 m; the wrong rotation sign is 30-100 m.
+        assert!(
+            (lon_w.to_degrees() - want_lon).abs() < 1e-6 && (lat_w.to_degrees() - want_lat).abs() < 1e-6,
+            "{}: got ({}, {}), want ({want_lon}, {want_lat})",
+            datum.name,
+            lon_w.to_degrees(),
+            lat_w.to_degrees()
+        );
+    }
+}
+
 #[test]
 fn datum_builder_with_grid_shift_sets_transform() {
     let datum = Datum::NAD27.with_grid_shift("NADCON_TEST_GRID");

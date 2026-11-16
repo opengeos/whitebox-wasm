@@ -35587,6 +35587,7 @@ mod tests {
 
         let z_idx = output.schema.field_index("CENTROID_Z").expect("CENTROID_Z field");
         let mut area = 0.0;
+        let mut triangles = Vec::with_capacity(output.features.len());
         for feature in &output.features {
             let Some(wbvector::Geometry::Polygon { exterior, .. }) = feature.geometry.as_ref() else {
                 panic!("TIN triangles are polygons");
@@ -35597,11 +35598,32 @@ mod tests {
             let expected: f64 = c.iter().map(|p| p.x + 2.0 * p.y).sum::<f64>() / 3.0;
             let got = feature.attributes[z_idx].as_f64().expect("numeric CENTROID_Z");
             assert!((got - expected).abs() < 1e-9, "CENTROID_Z {got} != {expected}");
+            triangles.push([(c[0].x, c[0].y), (c[1].x, c[1].y), (c[2].x, c[2].y)]);
         }
-        // No overlap: the triangles cannot cover more than the hull. (The
-        // triangulator can drop a few thin hull-edge slivers, so the cover is
-        // allowed to fall slightly short; before the fix it was ~5x the hull.)
-        assert!(area <= 10_000.0 + 1e-6, "triangles overlap: they cover {area}, hull is 10000");
+
+        // No overlap: no sample point lies strictly inside two triangles. The
+        // samples sit off the 100 x 100 corners and away from round coordinates,
+        // so landing exactly on an edge is vanishingly unlikely; the tolerance
+        // keeps a point on a shared edge from counting for both triangles.
+        let strictly_inside = |t: &[(f64, f64); 3], (px, py): (f64, f64)| {
+            let side = |(ax, ay): (f64, f64), (bx, by): (f64, f64)| {
+                (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+            };
+            let (d0, d1, d2) = (side(t[0], t[1]), side(t[1], t[2]), side(t[2], t[0]));
+            let eps = 1e-9;
+            (d0 > eps && d1 > eps && d2 > eps) || (d0 < -eps && d1 < -eps && d2 < -eps)
+        };
+        for i in 0..60 {
+            for j in 0..60 {
+                let p = ((i as f64 + 0.371) * 100.0 / 60.0, (j as f64 + 0.629) * 100.0 / 60.0);
+                let hits = triangles.iter().filter(|t| strictly_inside(t, p)).count();
+                assert!(hits <= 1, "point {p:?} lies inside {hits} triangles: they overlap");
+            }
+        }
+        // Approximate hull coverage. (The triangulator can drop a few thin
+        // hull-edge slivers, so the cover may fall slightly short; before the
+        // fix it was ~46x the hull.)
+        assert!(area <= 10_000.0 + 1e-6, "triangles cover {area}, more than the 10000 hull");
         assert!(area > 9_900.0, "triangles cover only {area} of 10000");
     }
 

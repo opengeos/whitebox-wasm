@@ -19,9 +19,18 @@ jobs:
       - name: Build the WASI tool runner
         run: cargo build -p whitebox-cli --target wasm32-wasip1 --release
       - name: Install wasmtime
-        run: curl https://wasmtime.dev/install.sh -sSf | bash
+        # Pin the version: resolving "latest" makes the installer call the
+        # unauthenticated GitHub API, which is rate limited on shared runners;
+        # when it is, the script tries to download version "{" and fails.
+        run: |
+          curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version v36.0.0
+          ~/.wasmtime/bin/wasmtime --version
       - name: Smoke test (list tools)
-        run: ~/.wasmtime/bin/wasmtime run target/wasm32-wasip1/release/whitebox.wasm list | head -1
+        # No pipe into `head`: it hid the exit status, so this step passed
+        # even when wasmtime was missing.
+        run: |
+          ~/.wasmtime/bin/wasmtime run target/wasm32-wasip1/release/whitebox.wasm list > tools.txt
+          head -1 tools.txt
       - name: Smoke test (tools that fan work out to worker threads)
         # wasm32 cannot spawn threads: `wasm32-wasip1` fails with errno 58
         # (Unsupported), which std unwraps into a panic and therefore an

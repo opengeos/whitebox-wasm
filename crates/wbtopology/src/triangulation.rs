@@ -53,13 +53,16 @@ impl DelaunayTriangulation {
     ///
     /// # Panics
     ///
-    /// If `input` is not the slice this triangulation was built from.
+    /// If a triangulation point has no bit-identical point in `input`, which
+    /// happens when `input` is not the slice this triangulation was built from.
     ///
     /// [`delaunay_triangulation_with_precision`], and
     /// [`delaunay_triangulation_with_options`] with a precision model, build
-    /// from snapped copies of the input. Passing the original, unsnapped input
-    /// for those results panics as soon as snapping changed any coordinate:
-    /// pass the snapped coordinates instead, or work from [`Self::points`].
+    /// from snapped copies of the input, so pass the snapped coordinates (or
+    /// work from [`Self::points`]). Passing the original, unsnapped input is
+    /// wrong even when it does not panic: a snapped point can land exactly on
+    /// another original point, and the lookup then returns that point's index,
+    /// silently attaching the wrong per-point data.
     pub fn triangles_in_input_order(&self, input: &[Coord]) -> Vec<[usize; 3]> {
         let mut first_index = HashMap::<(u64, u64), usize>::with_capacity(input.len());
         for (i, p) in input.iter().enumerate() {

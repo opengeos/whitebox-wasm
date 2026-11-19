@@ -12607,7 +12607,9 @@ impl Tool for LidarContourTool {
             layer.add_field(wbvector::FieldDef::new("HEIGHT", wbvector::FieldType::Float));
 
             let mut fid = 1i64;
-            for tri in &triangulation.triangles {
+            // Indices into `samples`, not into the triangulation's own
+            // deduplicated, reordered point list.
+            for tri in &triangulation.triangles_in_input_order(&topo_points) {
                 let (x1, y1, z1) = samples[tri[0]];
                 let (x2, y2, z2) = samples[tri[1]];
                 let (x3, y3, z3) = samples[tri[2]];
@@ -12939,7 +12941,9 @@ impl Tool for LidarConstructVectorTinTool {
                     layer.add_field(wbvector::FieldDef::new("AVG_Z", wbvector::FieldType::Float));
 
                     let mut fid = 1i64;
-                    for tri in &triangulation.triangles {
+                    // Indices into `samples`, not into the triangulation's own
+                    // deduplicated, reordered point list.
+                    for tri in &triangulation.triangles_in_input_order(&topo_points) {
                         let a = samples[tri[0]];
                         let b = samples[tri[1]];
                         let c = samples[tri[2]];

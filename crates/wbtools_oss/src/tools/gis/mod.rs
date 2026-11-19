@@ -21305,6 +21305,9 @@ Applications: (1) Terrain modeling—creating 3D surfaces from LiDAR/survey poin
         }
 
         let triangulation = delaunay_triangulation(&points, 1.0e-9);
+        // The triangulation's indices point into its own deduplicated, reordered
+        // point list; map them back so they index `points` and `z_values`.
+        let triangles = triangulation.triangles_in_input_order(&points);
         let max_edge_len_sq = if max_triangle_edge_length > 0.0 {
             max_triangle_edge_length * max_triangle_edge_length
         } else {
@@ -21329,9 +21332,8 @@ Applications: (1) Terrain modeling—creating 3D surfaces from LiDAR/survey poin
         let sin_theta = altitude.sin();
         let cos_theta = altitude.cos();
 
-        let total_triangles = triangulation.triangles.len().max(1);
-        let triangle_data: Vec<Option<(Vec<wbvector::Coord>, f64, i64)>> = triangulation
-            .triangles
+        let total_triangles = triangles.len().max(1);
+        let triangle_data: Vec<Option<(Vec<wbvector::Coord>, f64, i64)>> = triangles
             .par_iter()
             .map(|tri| {
                 // Maintain legacy clockwise vertex ordering.
@@ -35532,6 +35534,97 @@ mod tests {
             classify_one_way_direction(&wbvector::FieldValue::Text(" reverse ".to_string()), forward, reverse),
             OneWayDirection::Reverse
         );
+    }
+
+    #[test]
+    fn construct_vector_tin_triangles_tile_the_hull_without_overlap() {
+        // The tool indexed its input points with indices into the triangulation's
+        // own deduplicated, x-sorted point list, so triangles joined the wrong
+        // points and overlapped: 30 scattered points came back as 48 triangles
+        // covering 5x the hull's area (opengeos/geolibre-rust#638).
+        // The four corners make the hull the 100 x 100 square, area 10,000.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64 * 100.0
+        };
+        let mut pts: Vec<(f64, f64)> = (0..300).map(|_| (next(), next())).collect();
+        pts.extend([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]);
+
+        let mut input = wbvector::Layer::new("pts".to_string());
+        input.geom_type = Some(wbvector::GeometryType::Point);
+        input.add_field(wbvector::FieldDef::new("Z", wbvector::FieldType::Float));
+        for (i, &(x, y)) in pts.iter().enumerate() {
+            input.push(wbvector::Feature {
+                fid: i as u64,
+                geometry: Some(wbvector::Geometry::Point(wbvector::Coord::xy(x, y))),
+                attributes: vec![wbvector::FieldValue::Float(x + 2.0 * y)],
+            });
+        }
+        let mut args = ToolArgs::new();
+        args.insert(
+            "input_points".to_string(),
+            json!(vector_memory_store::make_vector_memory_path(&vector_memory_store::put_vector(input))),
+        );
+        args.insert("field_name".to_string(), json!("Z"));
+        let out_path = std::env::temp_dir().join(format!(
+            "construct_vector_tin_test_{}.geojson",
+            std::process::id()
+        ));
+        args.insert("output".to_string(), json!(out_path.to_string_lossy()));
+        let sink = RecordingProgressSink::new();
+        let ctx = ToolContext {
+            progress: &sink,
+            capabilities: &AllowAllCapabilities,
+        };
+        let result = ConstructVectorTinTool.run(&args, &ctx).expect("construct_vector_tin runs");
+        let mut read_args = ToolArgs::new();
+        read_args.insert("layer".to_string(), result.outputs["path"].clone());
+        let output = load_vector_arg(&read_args, "layer").expect("output layer");
+        let _ = std::fs::remove_file(&out_path);
+
+        let z_idx = output.schema.field_index("CENTROID_Z").expect("CENTROID_Z field");
+        let mut area = 0.0;
+        let mut triangles = Vec::with_capacity(output.features.len());
+        for feature in &output.features {
+            let Some(wbvector::Geometry::Polygon { exterior, .. }) = feature.geometry.as_ref() else {
+                panic!("TIN triangles are polygons");
+            };
+            let c = &exterior.coords()[..3];
+            area += ((c[1].x - c[0].x) * (c[2].y - c[0].y) - (c[1].y - c[0].y) * (c[2].x - c[0].x)).abs() / 2.0;
+            // CENTROID_Z comes from the same three points as the geometry.
+            let expected: f64 = c.iter().map(|p| p.x + 2.0 * p.y).sum::<f64>() / 3.0;
+            let got = feature.attributes[z_idx].as_f64().expect("numeric CENTROID_Z");
+            assert!((got - expected).abs() < 1e-9, "CENTROID_Z {got} != {expected}");
+            triangles.push([(c[0].x, c[0].y), (c[1].x, c[1].y), (c[2].x, c[2].y)]);
+        }
+
+        // No overlap: no sample point lies strictly inside two triangles. The
+        // samples sit off the 100 x 100 corners and away from round coordinates,
+        // so landing exactly on an edge is vanishingly unlikely; the tolerance
+        // keeps a point on a shared edge from counting for both triangles.
+        let strictly_inside = |t: &[(f64, f64); 3], (px, py): (f64, f64)| {
+            let side = |(ax, ay): (f64, f64), (bx, by): (f64, f64)| {
+                (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+            };
+            let (d0, d1, d2) = (side(t[0], t[1]), side(t[1], t[2]), side(t[2], t[0]));
+            let eps = 1e-9;
+            (d0 > eps && d1 > eps && d2 > eps) || (d0 < -eps && d1 < -eps && d2 < -eps)
+        };
+        for i in 0..60 {
+            for j in 0..60 {
+                let p = ((i as f64 + 0.371) * 100.0 / 60.0, (j as f64 + 0.629) * 100.0 / 60.0);
+                let hits = triangles.iter().filter(|t| strictly_inside(t, p)).count();
+                assert!(hits <= 1, "point {p:?} lies inside {hits} triangles: they overlap");
+            }
+        }
+        // Approximate hull coverage. (The triangulator can drop a few thin
+        // hull-edge slivers, so the cover may fall slightly short; before the
+        // fix it was ~46x the hull.)
+        assert!(area <= 10_000.0 + 1e-6, "triangles cover {area}, more than the 10000 hull");
+        assert!(area > 9_900.0, "triangles cover only {area} of 10000");
     }
 
     /// A square with `size`-long sides whose lower-left corner is at (x, y).

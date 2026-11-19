@@ -40,6 +40,47 @@ pub struct DelaunayTriangulation {
     pub triangles: Vec<[usize; 3]>,
 }
 
+impl DelaunayTriangulation {
+    /// Triangles with vertex indices into `input`, the slice the triangulation
+    /// was built from, instead of into [`Self::points`].
+    ///
+    /// [`Self::points`] is deduplicated and reordered (sorted by x then y, and
+    /// spatially ordered for larger inputs), so its indices do not line up with
+    /// the caller's points. Callers that keep per-point data alongside their
+    /// input (heights, attributes) must map through this before indexing it.
+    /// Each unique point maps to the first input point with the same
+    /// coordinates; near-duplicates dropped by deduplication are not referenced.
+    ///
+    /// # Panics
+    ///
+    /// If `input` is not the slice this triangulation was built from.
+    ///
+    /// [`delaunay_triangulation_with_precision`], and
+    /// [`delaunay_triangulation_with_options`] with a precision model, build
+    /// from snapped copies of the input. Passing the original, unsnapped input
+    /// for those results panics as soon as snapping changed any coordinate:
+    /// pass the snapped coordinates instead, or work from [`Self::points`].
+    pub fn triangles_in_input_order(&self, input: &[Coord]) -> Vec<[usize; 3]> {
+        let mut first_index = HashMap::<(u64, u64), usize>::with_capacity(input.len());
+        for (i, p) in input.iter().enumerate() {
+            first_index.entry((p.x.to_bits(), p.y.to_bits())).or_insert(i);
+        }
+        let to_input: Vec<usize> = self
+            .points
+            .iter()
+            .map(|p| {
+                *first_index
+                    .get(&(p.x.to_bits(), p.y.to_bits()))
+                    .expect("triangulation point missing from input: wrong input slice")
+            })
+            .collect();
+        self.triangles
+            .iter()
+            .map(|t| [to_input[t[0]], to_input[t[1]], to_input[t[2]]])
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Triangle {
     v: [usize; 3],
@@ -741,6 +782,34 @@ mod compaction_tests {
                     "point {idx} lies inside a circumcircle"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn triangles_in_input_order_index_the_callers_points() {
+        // Below and above the 128-point threshold for spatial ordering, plus a
+        // repeated point that deduplication drops.
+        for n in [30, 500] {
+            let mut input = scattered_points(n);
+            input.push(input[3]);
+            let tri = delaunay_triangulation(&input, 1.0e-12);
+            let mapped = tri.triangles_in_input_order(&input);
+            assert_eq!(mapped.len(), tri.triangles.len());
+            for (t, m) in tri.triangles.iter().zip(&mapped) {
+                for k in 0..3 {
+                    let (a, b) = (tri.points[t[k]], input[m[k]]);
+                    assert_eq!((a.x, a.y), (b.x, b.y), "n={n}: vertex maps to a different point");
+                }
+                assert!(m.iter().all(|&i| i < n), "n={n}: duplicate maps to its first occurrence");
+            }
+            // The raw indices do not line up with the input for these sizes,
+            // which is what the mapping is for.
+            assert!(
+                tri.triangles.iter().any(|t| t
+                    .iter()
+                    .any(|&i| (tri.points[i].x, tri.points[i].y) != (input[i].x, input[i].y))),
+                "n={n}: expected the triangulation to reorder its points"
+            );
         }
     }
 }

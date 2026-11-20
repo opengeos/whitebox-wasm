@@ -1424,7 +1424,7 @@ struct MemoryRasterGuard(String);
 
 impl Drop for MemoryRasterGuard {
     fn drop(&mut self) {
-        let _ = memory_store::remove_raster_by_path(&self.0);
+        let _ = memory_store::remove_raster_arc_by_path(&self.0);
     }
 }
 
@@ -1573,6 +1573,8 @@ impl Tool for RidgeAndValleyVectorsTool {
                 }
             })
             .collect();
+        drop(ep);
+        drop(slope);
         for (i, (ridge_v, valley_v)) in mask_values.into_iter().enumerate() {
             ridge_raster.data.set_f64(i, ridge_v);
             valley_raster.data.set_f64(i, valley_v);
@@ -1881,5 +1883,29 @@ mod tests {
             "valley line did not align with valley floor ({valley_lon}); valleys={:?}",
             valleys.features.iter().map(|f| &f.geometry).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn memory_raster_guard_removes_arc_without_cloning() {
+        use wbraster::{DataType, RasterConfig};
+
+        let r = Raster::new(RasterConfig {
+            rows: 2,
+            cols: 2,
+            bands: 1,
+            cell_size: 1.0,
+            nodata: -9999.0,
+            data_type: DataType::F32,
+            ..Default::default()
+        });
+        let guard = raster_mem(r);
+        let path = guard.0.clone();
+        let live_reader = memory_store::get_raster_arc_by_path(&path)
+            .expect("reader handle should exist");
+        assert_eq!(Arc::strong_count(&live_reader), 2);
+
+        drop(guard);
+        assert!(memory_store::get_raster_arc_by_path(&path).is_none());
+        assert_eq!(Arc::strong_count(&live_reader), 1);
     }
 }

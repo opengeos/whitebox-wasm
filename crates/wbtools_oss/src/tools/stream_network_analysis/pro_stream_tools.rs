@@ -422,8 +422,7 @@ impl Tool for PruneVectorStreamsTool {
             .unwrap_or_else(|| format!("{}_pruned.geojson", input));
 
         let src = load_vector_mem(&input, "input")?;
-        let dem = Raster::read(&dem_path)
-            .map_err(|e| ToolError::Execution(format!("failed reading DEM: {}", e)))?;
+        let dem = load_raster_mem(&dem_path, "dem")?;
 
         #[derive(Clone)]
         struct LinkInfo {
@@ -886,14 +885,12 @@ impl Tool for RiverCenterlinesTool {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("{}_centerlines.geojson", water_path));
 
-        let water = Raster::read(&water_path)
-            .map_err(|e| ToolError::Execution(format!("failed reading water raster: {}", e)))?;
+        let water = load_raster_mem(&water_path, "water")?;
 
         let rows = water.rows;
         let cols = water.cols;
         let n = rows * cols;
-        let nodata = water.nodata as f32;
-        let mut dist = vec![nodata; n];
+        let mut dist = vec![0.0f32; n];
         let mut rx = vec![0.0f32; n];
         let mut ry = vec![0.0f32; n];
 
@@ -914,7 +911,7 @@ impl Tool for RiverCenterlinesTool {
             for col in 0..cols {
                 let i = rc_index(row, col, cols);
                 let z = dist[i];
-                if z == 0.0 || !z.is_finite() {
+                if z == 0.0 {
                     continue;
                 }
                 let mut z_min = f32::INFINITY;
@@ -927,7 +924,7 @@ impl Tool for RiverCenterlinesTool {
                     }
                     let j = rc_index(rn as usize, cn as usize, cols);
                     let z2 = dist[j];
-                    if z2 == nodata {
+                    if !z2.is_finite() {
                         continue;
                     }
                     let h = match k {
@@ -957,7 +954,7 @@ impl Tool for RiverCenterlinesTool {
             for col in (0..cols).rev() {
                 let i = rc_index(row, col, cols);
                 let z = dist[i];
-                if z == 0.0 || !z.is_finite() {
+                if z == 0.0 {
                     continue;
                 }
                 let mut z_min = f32::INFINITY;
@@ -970,7 +967,7 @@ impl Tool for RiverCenterlinesTool {
                     }
                     let j = rc_index(rn as usize, cn as usize, cols);
                     let z2 = dist[j];
-                    if z2 == nodata {
+                    if !z2.is_finite() {
                         continue;
                     }
                     let h = match k {
@@ -1423,9 +1420,17 @@ fn get_path_from_result(result: &ToolRunResult) -> Result<String, ToolError> {
         .ok_or_else(|| ToolError::Execution("sub-tool returned no path".to_string()))
 }
 
-fn raster_mem(r: Raster) -> String {
+struct MemoryRasterGuard(String);
+
+impl Drop for MemoryRasterGuard {
+    fn drop(&mut self) {
+        let _ = memory_store::remove_raster_by_path(&self.0);
+    }
+}
+
+fn raster_mem(r: Raster) -> MemoryRasterGuard {
     let id = memory_store::put_raster(r);
-    memory_store::make_raster_memory_path(&id)
+    MemoryRasterGuard(memory_store::make_raster_memory_path(&id))
 }
 
 fn load_raster_mem(path: &str, label: &str) -> Result<Arc<Raster>, ToolError> {
@@ -1528,19 +1533,21 @@ impl Tool for RidgeAndValleyVectorsTool {
         a.insert("filter_size_y".to_string(), json!(filter_size));
         a.insert("sig_digits".to_string(), json!(2));
         let r = ElevationPercentileTool.run(&a, ctx)?;
-        let ep_path = get_path_from_result(&r)?;
+        let ep_path = MemoryRasterGuard(get_path_from_result(&r)?);
 
         // Step 2: Compute slope
         ctx.progress.info("ridge_and_valley_vectors: computing slope");
         let mut a = ToolArgs::new();
         a.insert("input".to_string(), json!(dem_path));
         let r = SlopeTool.run(&a, ctx)?;
-        let slope_path = get_path_from_result(&r)?;
+        let slope_path = MemoryRasterGuard(get_path_from_result(&r)?);
 
         // Step 3: Build ridge and valley binary rasters
         ctx.progress.info("ridge_and_valley_vectors: building ridge/valley masks");
-        let ep = load_raster_mem(&ep_path, "ep")?;
-        let slope = load_raster_mem(&slope_path, "slope")?;
+        let ep = load_raster_mem(&ep_path.0, "ep")?;
+        let slope = load_raster_mem(&slope_path.0, "slope")?;
+        drop(ep_path);
+        drop(slope_path);
         let rows = ep.rows;
         let cols = ep.cols;
         let band_stride = rows * cols;
@@ -1576,11 +1583,13 @@ impl Tool for RidgeAndValleyVectorsTool {
 
         // Step 4: Remove small holes, then morphological closing, then centrelines — for ridges
         ctx.progress.info("ridge_and_valley_vectors: extracting ridge centrelines");
-        let ridge_vec_path = run_ridge_valley_pipeline(ctx, &ridge_mem, min_length, &ridges_path)?;
+        let ridge_vec_path = run_ridge_valley_pipeline(ctx, &ridge_mem.0, min_length, &ridges_path)?;
+        drop(ridge_mem);
 
         // Step 5: Same pipeline for valleys
         ctx.progress.info("ridge_and_valley_vectors: extracting valley centrelines");
-        let valley_vec_path = run_ridge_valley_pipeline(ctx, &valley_mem, min_length, &valleys_path)?;
+        let valley_vec_path = run_ridge_valley_pipeline(ctx, &valley_mem.0, min_length, &valleys_path)?;
+        drop(valley_mem);
 
         let mut outputs = std::collections::BTreeMap::new();
         outputs.insert("ridges_path".to_string(), json!(ridge_vec_path));
@@ -1603,23 +1612,32 @@ fn run_ridge_valley_pipeline(
     a.insert("threshold".to_string(), json!(10));
     a.insert("use_diagonals".to_string(), json!(true));
     let r = RemoveRasterPolygonHolesTool.run(&a, ctx)?;
-    let no_holes_path = r.outputs.get("path")
-        .and_then(|v: &serde_json::Value| v.as_str())
-        .ok_or_else(|| ToolError::Execution("remove_holes returned no path".to_string()))?.to_string();
+    let no_holes_path = MemoryRasterGuard(
+        r.outputs
+            .get("path")
+            .and_then(|v: &serde_json::Value| v.as_str())
+            .ok_or_else(|| ToolError::Execution("remove_holes returned no path".to_string()))?
+            .to_string(),
+    );
 
     // Morphological closing (simplify shapes)
     let mut a = ToolArgs::new();
-    a.insert("input".to_string(), json!(no_holes_path));
+    a.insert("input".to_string(), json!(no_holes_path.0));
     a.insert("filter_size_x".to_string(), json!(5));
     a.insert("filter_size_y".to_string(), json!(5));
     let r = ClosingTool.run(&a, ctx)?;
-    let closed_path = r.outputs.get("path")
-        .and_then(|v: &serde_json::Value| v.as_str())
-        .ok_or_else(|| ToolError::Execution("closing returned no path".to_string()))?.to_string();
+    drop(no_holes_path);
+    let closed_path = MemoryRasterGuard(
+        r.outputs
+            .get("path")
+            .and_then(|v: &serde_json::Value| v.as_str())
+            .ok_or_else(|| ToolError::Execution("closing returned no path".to_string()))?
+            .to_string(),
+    );
 
     // Extract centrelines via RiverCenterlinesTool
     let mut a = ToolArgs::new();
-    a.insert("raster".to_string(), json!(closed_path));
+    a.insert("raster".to_string(), json!(closed_path.0));
     a.insert("min_length".to_string(), json!(min_length));
     a.insert("search_radius".to_string(), json!(9));
     a.insert("output".to_string(), json!(output_path));
@@ -1689,5 +1707,179 @@ mod tests {
         let j_key = endpoint_key(&Coord::xy(1.0 + 1.0e-8, 0.0), 0.001);
 
         assert!(nodes[0].contains(&j_key));
+    }
+
+    #[test]
+    fn river_centerlines_reads_memory_raster_and_extracts_centerline() {
+        use wbcore::{AllowAllCapabilities, RecordingProgressSink};
+        use wbraster::{DataType, RasterConfig};
+
+        let rows = 40usize;
+        let cols = 40usize;
+        // Also test nodata == 0.0 to ensure background distance seeding is not skipped.
+        let mut water = Raster::new(RasterConfig {
+            rows,
+            cols,
+            bands: 1,
+            x_min: 0.0,
+            y_min: 0.0,
+            cell_size: 10.0,
+            cell_size_y: Some(10.0),
+            nodata: 0.0,
+            data_type: DataType::F32,
+            ..Default::default()
+        });
+        for r in 0..rows {
+            for c in 0..cols {
+                let v = if (17..=23).contains(&r) && (4..=35).contains(&c) { 1.0 } else { 0.0 };
+                water.set(0, r as isize, c as isize, v).unwrap();
+            }
+        }
+        let water_guard = raster_mem(water);
+        let out_path = std::env::temp_dir().join(format!(
+            "wb_river_centerlines_{}.geojson",
+            std::process::id()
+        ));
+        let out_str = out_path.to_string_lossy().to_string();
+
+        let mut args = ToolArgs::new();
+        args.insert("raster".to_string(), json!(water_guard.0));
+        args.insert("min_length".to_string(), json!(10));
+        args.insert("output".to_string(), json!(out_str));
+
+        let progress = RecordingProgressSink::new();
+        let caps = AllowAllCapabilities;
+        let ctx = ToolContext {
+            progress: &progress,
+            capabilities: &caps,
+        };
+        let res = RiverCenterlinesTool.run(&args, &ctx).unwrap();
+        drop(water_guard);
+        let returned_path = res.outputs.get("path").unwrap().as_str().unwrap();
+        let layer = wbvector::read(returned_path).unwrap();
+        let _ = std::fs::remove_file(&out_path);
+
+        assert!(
+            !layer.features.is_empty(),
+            "expected at least one extracted centerline"
+        );
+        // Centerline should run near row 20 (y = y_min + (rows - 1 - 20 + 0.5) * 10 = 195.0).
+        let expected_y = 195.0;
+        let mut has_centered_line = false;
+        for f in &layer.features {
+            if let Some(Geometry::LineString(coords)) = &f.geometry {
+                if coords.len() >= 10
+                    && coords.iter().all(|c| (c.y - expected_y).abs() <= 20.0)
+                {
+                    has_centered_line = true;
+                }
+            }
+        }
+        assert!(has_centered_line, "centerline did not track the strip midline");
+    }
+
+    #[test]
+    fn ridge_and_valley_vectors_extracts_ridges_and_valleys_from_synthetic_dem() {
+        use wbcore::{AllowAllCapabilities, RecordingProgressSink};
+        use wbraster::{CrsInfo, DataType, RasterConfig, RasterFormat};
+
+        let rows = 80usize;
+        let cols = 80usize;
+        let cell_size = 30.0;
+        let mut dem = Raster::new(RasterConfig {
+            rows,
+            cols,
+            bands: 1,
+            x_min: 500_000.0,
+            y_min: 7_500_000.0,
+            cell_size,
+            cell_size_y: Some(cell_size),
+            nodata: -9999.0,
+            data_type: DataType::F32,
+            crs: CrsInfo {
+                epsg: Some(31984),
+                ..Default::default()
+            },
+            metadata: Vec::new(),
+        });
+        for r in 0..rows {
+            for c in 0..cols {
+                let ridge = 80.0 * (-((c as f64 - 24.0) / 5.0).powi(2)).exp();
+                let valley = -80.0 * (-((c as f64 - 56.0) / 5.0).powi(2)).exp();
+                // Gentle north-south gradient keeps slope > 0 along the crest/thalweg.
+                let z = 500.0 + 0.5 * r as f64 + ridge + valley;
+                dem.set(0, r as isize, c as isize, z).unwrap();
+            }
+        }
+
+        let pid = std::process::id();
+        let dem_path = std::env::temp_dir().join(format!("wb_rv_dem_{pid}.tif"));
+        let ridges_path = std::env::temp_dir().join(format!("wb_rv_ridges_{pid}.geojson"));
+        let valleys_path = std::env::temp_dir().join(format!("wb_rv_valleys_{pid}.geojson"));
+        dem.write(dem_path.to_str().unwrap(), RasterFormat::GeoTiff).unwrap();
+
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(dem_path.to_str().unwrap()));
+        args.insert(
+            "output_ridges".to_string(),
+            json!(ridges_path.to_str().unwrap()),
+        );
+        args.insert(
+            "output_valleys".to_string(),
+            json!(valleys_path.to_str().unwrap()),
+        );
+
+        let progress = RecordingProgressSink::new();
+        let caps = AllowAllCapabilities;
+        let ctx = ToolContext {
+            progress: &progress,
+            capabilities: &caps,
+        };
+        let run_result = RidgeAndValleyVectorsTool.run(&args, &ctx);
+        let _ = std::fs::remove_file(&dem_path);
+        let res = run_result.expect("ridge_and_valley_vectors should succeed");
+
+        let ridges = wbvector::read(res.outputs.get("ridges_path").unwrap().as_str().unwrap())
+            .expect("ridges geojson should be readable");
+        let valleys = wbvector::read(res.outputs.get("valleys_path").unwrap().as_str().unwrap())
+            .expect("valleys geojson should be readable");
+        let _ = std::fs::remove_file(&ridges_path);
+        let _ = std::fs::remove_file(&valleys_path);
+
+        assert!(
+            !ridges.features.is_empty(),
+            "expected at least one ridge line"
+        );
+        assert!(
+            !valleys.features.is_empty(),
+            "expected at least one valley line"
+        );
+
+        // GeoJSON output is reprojected from EPSG:31984 (UTM 24S) to WGS84.
+        let utm24s = wbprojection::Projection::new(wbprojection::ProjectionParams::utm(24, true))
+            .unwrap();
+        let mid_y = 7_500_000.0 + (rows as f64 / 2.0) * cell_size;
+        let (ridge_lon, _) = utm24s.inverse(500_000.0 + 24.5 * cell_size, mid_y).unwrap();
+        let (valley_lon, _) = utm24s.inverse(500_000.0 + 56.5 * cell_size, mid_y).unwrap();
+        let tol_deg = 4.0 * cell_size / 100_000.0;
+        let near_lon = |layer: &Layer, target_lon: f64| {
+            layer.features.iter().any(|f| match &f.geometry {
+                Some(Geometry::LineString(coords)) => {
+                    coords.len() >= 20
+                        && coords.iter().all(|c| (c.x - target_lon).abs() <= tol_deg)
+                }
+                _ => false,
+            })
+        };
+        assert!(
+            near_lon(&ridges, ridge_lon),
+            "ridge line did not align with ridge crest ({ridge_lon}); ridges={:?}",
+            ridges.features.iter().map(|f| &f.geometry).collect::<Vec<_>>()
+        );
+        assert!(
+            near_lon(&valleys, valley_lon),
+            "valley line did not align with valley floor ({valley_lon}); valleys={:?}",
+            valleys.features.iter().map(|f| &f.geometry).collect::<Vec<_>>()
+        );
     }
 }

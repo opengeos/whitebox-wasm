@@ -81,6 +81,19 @@ pub fn replace_raster_by_path(path: &str, raster: Raster) -> bool {
         .unwrap_or(false)
 }
 
+/// Removes and returns the shared raster handle associated with `id`, or `None` if absent.
+///
+/// Unlike [`remove_raster_by_id`], this never clones the underlying raster when
+/// other `Arc<Raster>` handles still exist.
+pub fn remove_raster_arc_by_id(id: &str) -> Option<Arc<Raster>> {
+    store().lock().ok().and_then(|mut map| map.remove(id))
+}
+
+/// Removes and returns the shared raster handle identified by a `memory://raster/<id>` path.
+pub fn remove_raster_arc_by_path(path: &str) -> Option<Arc<Raster>> {
+    raster_path_to_id(path).and_then(remove_raster_arc_by_id)
+}
+
 /// Removes and returns the raster associated with `id`, or `None` if absent.
 pub fn remove_raster_by_id(id: &str) -> Option<Raster> {
     store()

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::json;
 use rayon::prelude::*;
@@ -373,6 +374,25 @@ fn write_vector_output(layer: &Layer, output_path: &Path) -> Result<ToolRunResul
         json!(output_path.to_string_lossy().to_string()),
     );
     Ok(ToolRunResult { outputs })
+}
+
+fn read_raster(path: &str, label: &str) -> Result<Arc<Raster>, ToolError> {
+    if memory_store::raster_is_memory_path(path) {
+        let id = memory_store::raster_path_to_id(path).ok_or_else(|| {
+            ToolError::Validation(format!(
+                "failed reading {label} raster '{path}': malformed in-memory raster path"
+            ))
+        })?;
+        return memory_store::get_raster_arc_by_id(id).ok_or_else(|| {
+            ToolError::Validation(format!(
+                "failed reading {label} raster '{path}': unknown in-memory raster id '{id}'"
+            ))
+        });
+    }
+
+    Raster::read(path)
+        .map(Arc::new)
+        .map_err(|e| ToolError::Execution(format!("failed reading {label} raster: {e}")))
 }
 
 fn read_vector_layer(path: &str, label: &str) -> Result<Layer, ToolError> {
@@ -3462,9 +3482,8 @@ impl Tool for ConvertNodataToZeroTool {
         let output_path = parse_optional_output_path(args, "output")?;
 
         ctx.progress.info("running convert_nodata_to_zero");
-        let input = Raster::read(&input_path)
-            .map_err(|e| ToolError::Execution(format!("failed reading input raster: {e}")))?;
-        let mut output = input.clone();
+        let input = read_raster(&input_path, "input")?;
+        let mut output = input.as_ref().clone();
         output.par_fill_with(|i| {
             let value = input.data.get_f64(i);
             if input.is_nodata(value) { 0.0 } else { value }
@@ -3536,9 +3555,8 @@ impl Tool for ModifyNodataValueTool {
         let new_value = parse_optional_f64(args, "new_value")?.unwrap_or(-32768.0);
 
         ctx.progress.info("running modify_nodata_value");
-        let input = Raster::read(&input_path)
-            .map_err(|e| ToolError::Execution(format!("failed reading input raster: {e}")))?;
-        let mut output = input.clone();
+        let input = read_raster(&input_path, "input")?;
+        let mut output = input.as_ref().clone();
         output.par_fill_with(|i| {
             let value = input.data.get_f64(i);
             if input.is_nodata(value) { new_value } else { value }
@@ -3756,8 +3774,7 @@ impl Tool for NewRasterFromBaseRasterTool {
         let data_type = parse_optional_string(args, "data_type")?.unwrap_or("float").to_ascii_lowercase();
 
         ctx.progress.info("running new_raster_from_base_raster");
-        let base = Raster::read(&base_path)
-            .map_err(|e| ToolError::Execution(format!("failed reading base raster: {e}")))?;
+        let base = read_raster(&base_path, "base")?;
 
         let output_data_type = if data_type.contains('i') {
             DataType::I16
@@ -4153,8 +4170,7 @@ impl Tool for RasterToVectorPointsTool {
 
         ctx.progress.info("running raster_to_vector_points");
         let coalescer = PercentCoalescer::new(1, 99);
-        let input = Raster::read(&input_path)
-            .map_err(|e| ToolError::Execution(format!("failed reading input raster: {e}")))?;
+        let input = read_raster(&input_path, "input")?;
         if input.bands != 1 {
             return Err(ToolError::Validation(
                 "input raster must be single-band for raster_to_vector_points".to_string(),
@@ -4386,8 +4402,7 @@ impl Tool for SetNodataValueTool {
         let back_value = parse_optional_f64(args, "back_value")?.unwrap_or(0.0);
 
         ctx.progress.info("running set_nodata_value");
-        let input = Raster::read(&input_path)
-            .map_err(|e| ToolError::Execution(format!("failed reading input raster: {e}")))?;
+        let input = read_raster(&input_path, "input")?;
 
         let output_data_type = nodata_data_type_for_background(input.data_type, back_value);
         let mut output = Raster::new(RasterConfig {
@@ -4921,8 +4936,7 @@ impl Tool for VectorLinesToRasterTool {
         let data_type = if use_fid { DataType::I32 } else { DataType::F32 };
 
         let mut output = if let Some(base) = base_path {
-            let base_raster = Raster::read(base)
-                .map_err(|e| ToolError::Execution(format!("failed reading base raster: {e}")))?;
+            let base_raster = read_raster(base, "base")?;
             Raster::new(RasterConfig {
                 cols: base_raster.cols,
                 rows: base_raster.rows,
@@ -5067,8 +5081,7 @@ impl Tool for RasterToVectorPolygonsTool {
 
         ctx.progress.info("running raster_to_vector_polygons");
         let coalescer = PercentCoalescer::new(1, 99);
-        let input = Raster::read(&input_path)
-            .map_err(|e| ToolError::Execution(format!("failed reading input raster: {e}")))?;
+        let input = read_raster(&input_path, "input")?;
         if input.bands != 1 {
             return Err(ToolError::Validation(
                 "input raster must be single-band for raster_to_vector_polygons".to_string(),
@@ -5430,8 +5443,7 @@ impl Tool for RasterToVectorLinesTool {
 
         ctx.progress.info("running raster_to_vector_lines");
         let coalescer = PercentCoalescer::new(1, 99);
-        let input = Raster::read(&input_path)
-            .map_err(|e| ToolError::Execution(format!("failed reading input raster: {e}")))?;
+        let input = read_raster(&input_path, "input")?;
         if input.bands != 1 {
             return Err(ToolError::Validation(
                 "input raster must be single-band for raster_to_vector_lines".to_string(),
@@ -5741,8 +5753,7 @@ impl Tool for VectorPointsToRasterTool {
         };
 
         let mut output = if let Some(base) = base_path {
-            let base_raster = Raster::read(base)
-                .map_err(|e| ToolError::Execution(format!("failed reading base raster: {e}")))?;
+            let base_raster = read_raster(base, "base")?;
             Raster::new(RasterConfig {
                 cols: base_raster.cols,
                 rows: base_raster.rows,
@@ -6095,8 +6106,7 @@ impl Tool for RemoveRasterPolygonHolesTool {
             .unwrap_or(false);
 
         ctx.progress.info("running remove_raster_polygon_holes");
-        let input = Raster::read(&input_path)
-            .map_err(|e| ToolError::Execution(format!("failed reading input raster: {e}")))?;
+        let input = read_raster(&input_path, "input")?;
         if input.bands != 1 {
             return Err(ToolError::Validation(
                 "input raster must be single-band for remove_raster_polygon_holes".to_string(),
@@ -6172,7 +6182,7 @@ impl Tool for RemoveRasterPolygonHolesTool {
             coalescer.emit_unit_fraction(ctx.progress, (row as f64 + 1.0) / rows.max(1) as f64 * 0.35);
         }
 
-        let mut output = input.clone();
+        let mut output = input.as_ref().clone();
 
         // For each removable hole clump, fill with the most common neighbouring foreground value.
         for label in 1..next_label {
@@ -6909,8 +6919,7 @@ impl Tool for VectorPolygonsToRasterTool {
         let data_type = if use_fid { DataType::I32 } else { DataType::F32 };
 
         let mut output = if let Some(base) = base_path {
-            let base_raster = Raster::read(base)
-                .map_err(|e| ToolError::Execution(format!("failed reading base raster: {e}")))?;
+            let base_raster = read_raster(base, "base")?;
             Raster::new(RasterConfig {
                 cols: base_raster.cols,
                 rows: base_raster.rows,
@@ -7692,7 +7701,6 @@ mod raster_to_vector_polygons_tests {
                 raster.set(0, r as isize, c as isize, v.unwrap_or(-9999.0)).unwrap();
             }
         }
-        // The tool reads its input with `Raster::read`, which takes files only.
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let input = std::env::temp_dir().join(format!("r2vp_{}_{n}.tif", std::process::id()));
@@ -7887,5 +7895,159 @@ mod raster_to_vector_polygons_tests {
             assert!(polys[0].1.is_empty(), "ccw={ccw}");
         }
         assert!(group_traced_rings(&[]).is_empty());
+    }
+
+    #[test]
+    fn data_tools_read_in_memory_rasters() {
+        let ctx = make_ctx();
+
+        // 7x7 raster with a 5x5 foreground block and a 1-cell interior hole at (3, 3),
+        // plus nodata at (0, 0).
+        let mut raster = Raster::new(RasterConfig {
+            rows: 7,
+            cols: 7,
+            bands: 1,
+            nodata: -9999.0,
+            cell_size: 1.0,
+            ..Default::default()
+        });
+        for r in 0..7isize {
+            for c in 0..7isize {
+                let v = if r == 0 && c == 0 {
+                    -9999.0
+                } else if (1..=5).contains(&r) && (1..=5).contains(&c) && !(r == 3 && c == 3) {
+                    1.0
+                } else {
+                    0.0
+                };
+                raster.set(0, r, c, v).unwrap();
+            }
+        }
+        let mem_id = memory_store::put_raster(raster);
+        let mem_path = memory_store::make_raster_memory_path(&mem_id);
+
+        // RemoveRasterPolygonHolesTool
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(mem_path));
+        args.insert("threshold".to_string(), json!(10));
+        args.insert("use_diagonals".to_string(), json!(true));
+        let res = RemoveRasterPolygonHolesTool.run(&args, &ctx).unwrap();
+        let out_path = res.outputs.get("path").unwrap().as_str().unwrap();
+        let filled = read_raster(out_path, "output").unwrap();
+        assert_eq!(filled.get(0, 3, 3), 1.0);
+        let _ = memory_store::remove_raster_by_path(out_path);
+
+        // ConvertNodataToZeroTool
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(mem_path));
+        let res = ConvertNodataToZeroTool.run(&args, &ctx).unwrap();
+        let out_path = res.outputs.get("path").unwrap().as_str().unwrap();
+        let converted = read_raster(out_path, "output").unwrap();
+        assert_eq!(converted.get(0, 0, 0), 0.0);
+        let _ = memory_store::remove_raster_by_path(out_path);
+
+        // ModifyNodataValueTool
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(mem_path));
+        args.insert("new_value".to_string(), json!(-1.0));
+        let res = ModifyNodataValueTool.run(&args, &ctx).unwrap();
+        let out_path = res.outputs.get("path").unwrap().as_str().unwrap();
+        let modified = read_raster(out_path, "output").unwrap();
+        assert_eq!(modified.nodata, -1.0);
+        assert_eq!(modified.get(0, 0, 0), -1.0);
+        let _ = memory_store::remove_raster_by_path(out_path);
+
+        // SetNodataValueTool
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(mem_path));
+        args.insert("back_value".to_string(), json!(-5.0));
+        let res = SetNodataValueTool.run(&args, &ctx).unwrap();
+        let out_path = res.outputs.get("path").unwrap().as_str().unwrap();
+        let nodata_set = read_raster(out_path, "output").unwrap();
+        assert_eq!(nodata_set.nodata, -5.0);
+        let _ = memory_store::remove_raster_by_path(out_path);
+
+        // NewRasterFromBaseRasterTool
+        let mut args = ToolArgs::new();
+        args.insert("base".to_string(), json!(mem_path));
+        args.insert("out_val".to_string(), json!(42.0));
+        let res = NewRasterFromBaseRasterTool.run(&args, &ctx).unwrap();
+        let out_path = res.outputs.get("path").unwrap().as_str().unwrap();
+        let from_base = read_raster(out_path, "output").unwrap();
+        assert_eq!((from_base.rows, from_base.cols), (7, 7));
+        assert_eq!(from_base.get(0, 2, 2), 42.0);
+        let _ = memory_store::remove_raster_by_path(out_path);
+
+        // RasterToVectorPointsTool
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(mem_path));
+        let res = RasterToVectorPointsTool.run(&args, &ctx).unwrap();
+        let pts_path = res.outputs.get("path").unwrap().as_str().unwrap().to_string();
+        let pts_layer = read_vector_layer(&pts_path, "output").unwrap();
+        assert_eq!(pts_layer.features.len(), 24);
+
+        // RasterToVectorPolygonsTool
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(mem_path));
+        let res = RasterToVectorPolygonsTool.run(&args, &ctx).unwrap();
+        let poly_path = res.outputs.get("path").unwrap().as_str().unwrap().to_string();
+        let poly_layer = read_vector_layer(&poly_path, "output").unwrap();
+        assert_eq!(poly_layer.features.len(), 1);
+
+        // RasterToVectorLinesTool (1-cell-wide line in memory)
+        let mut line_raster = Raster::new(RasterConfig {
+            rows: 5,
+            cols: 5,
+            bands: 1,
+            nodata: -9999.0,
+            cell_size: 1.0,
+            ..Default::default()
+        });
+        for r in 0..5isize {
+            for c in 0..5isize {
+                line_raster.set(0, r, c, if r == 2 { 1.0 } else { 0.0 }).unwrap();
+            }
+        }
+        let line_mem_id = memory_store::put_raster(line_raster);
+        let line_mem_path = memory_store::make_raster_memory_path(&line_mem_id);
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(line_mem_path));
+        let res = RasterToVectorLinesTool.run(&args, &ctx).unwrap();
+        let line_vec_path = res.outputs.get("path").unwrap().as_str().unwrap().to_string();
+        let line_layer = read_vector_layer(&line_vec_path, "output").unwrap();
+        assert_eq!(line_layer.features.len(), 1);
+        let _ = memory_store::remove_raster_by_id(&line_mem_id);
+
+        // Vector{Points,Lines,Polygons}ToRasterTool with in-memory base raster
+        for (vec_path, tool_res) in [
+            (&pts_path, {
+                let mut a = ToolArgs::new();
+                a.insert("input".to_string(), json!(&pts_path));
+                a.insert("base".to_string(), json!(&mem_path));
+                VectorPointsToRasterTool.run(&a, &ctx).unwrap()
+            }),
+            (&line_vec_path, {
+                let mut a = ToolArgs::new();
+                a.insert("input".to_string(), json!(&line_vec_path));
+                a.insert("base".to_string(), json!(&mem_path));
+                VectorLinesToRasterTool.run(&a, &ctx).unwrap()
+            }),
+            (&poly_path, {
+                let mut a = ToolArgs::new();
+                a.insert("input".to_string(), json!(&poly_path));
+                a.insert("base".to_string(), json!(&mem_path));
+                VectorPolygonsToRasterTool.run(&a, &ctx).unwrap()
+            }),
+        ] {
+            let out_path = tool_res.outputs.get("path").unwrap().as_str().unwrap();
+            let r = read_raster(out_path, "output").unwrap();
+            assert_eq!((r.rows, r.cols), (7, 7), "base grid mismatch for {vec_path}");
+            let _ = memory_store::remove_raster_by_path(out_path);
+        }
+
+        let _ = vector_memory_store::remove_vector_by_path(&pts_path);
+        let _ = vector_memory_store::remove_vector_by_path(&line_vec_path);
+        let _ = vector_memory_store::remove_vector_by_path(&poly_path);
+        let _ = memory_store::remove_raster_by_id(&mem_id);
     }
 }

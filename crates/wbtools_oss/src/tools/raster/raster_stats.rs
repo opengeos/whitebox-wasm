@@ -8117,7 +8117,15 @@ impl Tool for RasterCalculatorTool {
                         }
                         _ => out_nodata,
                     };
-                    row_vals.push(out_val);
+                    // A result equal to the input's NoData (any NaN when that is
+                    // NaN) is stored as the output's NoData, which differs from it
+                    // when the input's NoData is NaN or outside the f32 range.
+                    let is_input_nodata = if nodatas[0].is_nan() {
+                        out_val.is_nan()
+                    } else {
+                        out_val == nodatas[0]
+                    };
+                    row_vals.push(if is_input_nodata { out_nodata } else { out_val });
                 }
                 row_vals
             })
@@ -8749,29 +8757,34 @@ mod tests {
 
     #[test]
     fn raster_calculator_without_finite_input_nodata_falls_back() {
-        let mut input = Raster::new(RasterConfig {
-            rows: 1,
-            cols: 2,
-            bands: 1,
-            nodata: f64::NAN,
-            cell_size: 10.0,
-            ..Default::default()
-        });
-        input.set(0, 0, 0, 0.0).unwrap();
-        input.set(0, 0, 1, 1.0).unwrap();
-        let id = memory_store::put_raster(input);
-        let mut args = ToolArgs::new();
-        args.insert("expression".to_string(), json!("'a' * 2"));
-        args.insert("inputs".to_string(), json!([memory_store::make_raster_memory_path(&id)]));
-        let result = RasterCalculatorTool.run(&args, &make_ctx()).unwrap();
-        let locator = result.outputs["output"]["path"].as_str().unwrap().to_string();
-        memory_store::remove_raster_by_id(&id);
-        let out = memory_store::raster_path_to_id(&locator)
-            .and_then(memory_store::get_raster_by_id)
-            .expect("output raster should be in the memory store");
-        memory_store::remove_raster_by_path(&locator);
-        assert_eq!(out.nodata, -32768.0);
-        assert_eq!(out.get(0, 0, 1), 2.0);
+        // NaN and a value outside the f32 range cannot be the Float32 output's
+        // NoData; cells set to `nodata` must still be NoData in the output.
+        for input_nodata in [f64::NAN, -1.0e300] {
+            let mut input = Raster::new(RasterConfig {
+                rows: 1,
+                cols: 2,
+                bands: 1,
+                nodata: input_nodata,
+                cell_size: 10.0,
+                ..Default::default()
+            });
+            input.set(0, 0, 0, 0.0).unwrap();
+            input.set(0, 0, 1, 1.0).unwrap();
+            let id = memory_store::put_raster(input);
+            let mut args = ToolArgs::new();
+            args.insert("expression".to_string(), json!("if('a' > 0.5, nodata, 'a' * 2)"));
+            args.insert("inputs".to_string(), json!([memory_store::make_raster_memory_path(&id)]));
+            let result = RasterCalculatorTool.run(&args, &make_ctx()).unwrap();
+            let locator = result.outputs["output"]["path"].as_str().unwrap().to_string();
+            memory_store::remove_raster_by_id(&id);
+            let out = memory_store::raster_path_to_id(&locator)
+                .and_then(memory_store::get_raster_by_id)
+                .expect("output raster should be in the memory store");
+            memory_store::remove_raster_by_path(&locator);
+            assert_eq!(out.nodata, -32768.0, "input NoData {input_nodata}");
+            assert_eq!(out.get(0, 0, 0), 0.0, "input NoData {input_nodata}");
+            assert!(out.is_nodata(out.get(0, 0, 1)), "input NoData {input_nodata}");
+        }
     }
 
     #[test]

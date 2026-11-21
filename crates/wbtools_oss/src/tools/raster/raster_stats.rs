@@ -8023,7 +8023,15 @@ impl Tool for RasterCalculatorTool {
 
         let nodatas: Vec<f64> = inputs.iter().map(|r| r.nodata).collect();
         let stats: Vec<_> = inputs.iter().map(|r| r.statistics()).collect();
-        let out_nodata = -32_768.0f64;
+        // `nodata` and `null` in the expression evaluate to the first input's
+        // NoData value, so the output takes that value as its own NoData: a cell
+        // set to `nodata` is then NoData in the output too. The output is Float32,
+        // so the value is rounded to f32 for the cells and the header to agree.
+        // Without a finite first-input NoData, fall back to -32768.
+        let out_nodata = match nodatas.first() {
+            Some(&nd) if nd.is_finite() && nd.abs() <= f32::MAX as f64 => nd as f32 as f64,
+            _ => -32_768.0f64,
+        };
 
         for i in 0..num_inputs {
             let vn = format!("value{}", i);
@@ -8109,7 +8117,15 @@ impl Tool for RasterCalculatorTool {
                         }
                         _ => out_nodata,
                     };
-                    row_vals.push(out_val);
+                    // A result equal to the input's NoData (any NaN when that is
+                    // NaN) is stored as the output's NoData, which differs from it
+                    // when the input's NoData is NaN or outside the f32 range.
+                    let is_input_nodata = if nodatas[0].is_nan() {
+                        out_val.is_nan()
+                    } else {
+                        out_val == nodatas[0]
+                    };
+                    row_vals.push(if is_input_nodata { out_nodata } else { out_val });
                 }
                 row_vals
             })
@@ -8712,8 +8728,63 @@ mod tests {
         assert_eq!(cells("max('c', 2) + 7 / 2"), [5.5, 5.5, 5.5, 6.5]);
         assert_eq!(cells("'c' >= 2 AND NOT ('c' == 3)"), [0.0, 0.0, 1.0, 0.0]);
         assert_eq!(cells("'c' + bitand(0b110, 0o3)"), [2.0, 3.0, 4.0, 5.0]);
-        // A non-numeric result becomes NoData rather than failing the run.
-        assert_eq!(cells("str::from('c')"), [-32768.0; 4]);
+        // A non-numeric result becomes NoData (the input's -9999) rather than
+        // failing the run.
+        assert_eq!(cells("str::from('c')"), [-9999.0; 4]);
+    }
+
+    #[test]
+    fn raster_calculator_nodata_cells_are_output_nodata() {
+        // The input has NoData -9999 and cells 0, 1, 2 and 3.
+        let out = run_raster_calculator("if('a' > 0.5, nodata, 'a')");
+        assert_eq!(out.nodata, -9999.0);
+        let nodata_cells: Vec<bool> = (0..4).map(|c| out.is_nodata(out.get(0, 0, c as isize))).collect();
+        assert_eq!(nodata_cells, [false, true, true, true]);
+        assert_eq!(out.get(0, 0, 0), 0.0);
+
+        // `null` and `nodata()` name the same value.
+        for expression in ["if('a' > 0.5, null, 'a')", "if('a' > 0.5, nodata(), 'a')"] {
+            let out = run_raster_calculator(expression);
+            let nodata_cells: Vec<bool> = (0..4).map(|c| out.is_nodata(out.get(0, 0, c as isize))).collect();
+            assert_eq!(nodata_cells, [false, true, true, true], "expression {expression:?}");
+        }
+
+        // Comparisons against `nodata` keep meaning the input's NoData value.
+        let out = run_raster_calculator("if('a' == nodata, 1, 0)");
+        let values: Vec<f64> = (0..4).map(|c| out.get(0, 0, c as isize)).collect();
+        assert_eq!(values, [0.0; 4]);
+    }
+
+    #[test]
+    fn raster_calculator_without_finite_input_nodata_falls_back() {
+        // NaN and a value outside the f32 range cannot be the Float32 output's
+        // NoData; cells set to `nodata` must still be NoData in the output.
+        for input_nodata in [f64::NAN, -1.0e300] {
+            let mut input = Raster::new(RasterConfig {
+                rows: 1,
+                cols: 2,
+                bands: 1,
+                nodata: input_nodata,
+                cell_size: 10.0,
+                ..Default::default()
+            });
+            input.set(0, 0, 0, 0.0).unwrap();
+            input.set(0, 0, 1, 1.0).unwrap();
+            let id = memory_store::put_raster(input);
+            let mut args = ToolArgs::new();
+            args.insert("expression".to_string(), json!("if('a' > 0.5, nodata, 'a' * 2)"));
+            args.insert("inputs".to_string(), json!([memory_store::make_raster_memory_path(&id)]));
+            let result = RasterCalculatorTool.run(&args, &make_ctx()).unwrap();
+            let locator = result.outputs["output"]["path"].as_str().unwrap().to_string();
+            memory_store::remove_raster_by_id(&id);
+            let out = memory_store::raster_path_to_id(&locator)
+                .and_then(memory_store::get_raster_by_id)
+                .expect("output raster should be in the memory store");
+            memory_store::remove_raster_by_path(&locator);
+            assert_eq!(out.nodata, -32768.0, "input NoData {input_nodata}");
+            assert_eq!(out.get(0, 0, 0), 0.0, "input NoData {input_nodata}");
+            assert!(out.is_nodata(out.get(0, 0, 1)), "input NoData {input_nodata}");
+        }
     }
 
     #[test]

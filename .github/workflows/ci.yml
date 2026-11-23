@@ -32,6 +32,8 @@ jobs:
       - name: cargo test (expression tools)
         # The evaluator behind the raster, vector and LiDAR expression tools.
         run: cargo test -p wbtools_oss --lib expression
+      - name: cargo test (raster filters)
+        run: cargo test -p wbtools_oss --lib phase3_filters
       - name: wasm-pack build
         run: wasm-pack build crates/whitebox-wasm --release --target web --out-dir pkg
       - name: Node smoke test

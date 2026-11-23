@@ -10,7 +10,7 @@ use wbcore::{
     ToolParamSpec, ToolRunResult, ToolStability,
 };
 use wbraster::color_math::{hsi2value, value2hsi, value2i};
-use wbraster::{Raster, RasterFormat};
+use wbraster::{DataType, Raster, RasterConfig, RasterFormat};
 
 use super::color_support;
 use crate::memory_store;
@@ -96,13 +96,13 @@ impl Phase3Op {
             Self::Adaptive => r#"The Adaptive Filter adjusts filtering strength dynamically based on local image statistics (mean, variance, kurtosis), enabling context-aware smoothing that responds to scene characteristics. Implementation partitions images into moving windows, computes local statistics (detecting noise-dominated versus feature-dominated regions), and selects filter parameters accordingly. Flat regions smooth aggressively; complex regions filter gently. Mathematical basis uses statistical tests to identify local character: regions with variance below threshold smooth heavily; regions exceeding threshold preserve detail. Key features include automatic parameter adaptation (user specifies ranges; algorithm selects locally), applicability to any filter kernel (Gaussian, median, morphological), and effectiveness on optical and radar imagery. Adaptive filtering excels in preprocessing heterogeneous satellite mosaics (different sensors, acquisition conditions), LiDAR point-cloud smoothing (preserves vegetation edges in forests; smooths ground in open areas), selective SAR speckle reduction respecting both targets and background, and multi-temporal image stacking. Output interpretation reveals that homogeneous regions undergo intensive filtering (low local variance → strong smoothing); complex regions filter conservatively (high variance → minimal processing). Smoothing radius dynamically adjusts per-region: flat areas receive large-radius filtering; textured areas receive small-radius or no filtering. Output ranges remain within input; examine spatial filtering-strength map to validate adaptation. Statistics shift toward local means in smooth regions; complex regions remain largely unchanged. Common artifacts include potential over-smoothing at region boundaries (smooth transition typically applied) and sensitivity to noise-variance relationships. Verify adaptation by analyzing local variance maps. Apply in automated preprocessing pipelines handling multi-source data where uniform filtering insufficient."#,
             Self::Lee => r#"The Lee filter reduces speckle in SAR backscatter with Lee's minimum mean-square-error (MMSE) estimator under the multiplicative speckle model I = S·N. For each pixel it computes the mean μ and standard deviation σ of the moving window, the local coefficient of variation Ci = σ/μ and the speckle coefficient of variation Cu = 1/√ENL, then returns F = μ + w·(I − μ) with w = clamp(1 − Cu²/Ci², 0, 1). In homogeneous areas, where the local variation is no more than speckle (Ci ≤ Cu), the pixel is replaced by the window mean; across edges, point targets and texture (Ci ≫ Cu) w approaches 1 and the pixel is kept. Because only the ratio σ/μ enters the weight, the result is scale-invariant: linear power (sigma0, gamma0), amplitude and scaled digital numbers give the same relative result. Input should be linear (not dB) backscatter with positive values; windows whose mean is not positive are left unfiltered. The 'enl' parameter is the equivalent number of looks of the input: 1 for single-look intensity, higher for multilooked products (e.g. 4 or more for GRD, NISAR GCOV or OPERA RTC); a larger ENL means less speckle is assumed and less smoothing is applied. Window size trades smoothing in homogeneous areas against edge blur. The default is 11×11 for consistency with the other filters; 5×5 or 7×7 is usual for SAR and keeps edges and small features sharper. For the classic Lee sigma filter with an absolute intensity range, use lee_sigma_filter."#,
             Self::LeeSigma => r#"The Lee sigma filter averages, for each pixel, only those neighbours whose values lie within ±sigma of the centre value: F = mean(I_j : |I_j − I_center| ≤ sigma). If fewer than m_value neighbours qualify, the pixel is replaced by the mean of its eight immediate neighbours, which removes isolated spikes. The range is absolute, in the units of the data, so this filter suits data whose noise is additive, such as SAR backscatter in decibels (where a sigma of about 1-3 dB is typical) or DEMs. On linear SAR backscatter (values mostly below 1) the default sigma of 10 includes every neighbour and the filter becomes a plain mean; use lee_filter or enhanced_lee_filter for linear backscatter instead."#,
-            Self::RefinedLee => r#"The Refined Lee filter reduces SAR speckle while keeping edges by choosing, for each pixel, the most homogeneous of eight overlapping 3×3 sub-windows within the surrounding 5×5 neighbourhood (the sub-window with the lowest coefficient of variation σ/μ) and returning that sub-window's mean. Because the chosen sub-window usually lies on the same side of an edge as the pixel, edges stay sharp, while uniform areas are smoothed over nine cells. The neighbourhood is fixed at 5×5; there is no window-size parameter. Speckle reduction is therefore moderate; use lee_filter or enhanced_lee_filter with a larger window for stronger smoothing of homogeneous areas. Input should be linear (not dB) backscatter with positive values."#,
+            Self::RefinedLee => r#"The Refined Lee filter reduces SAR speckle while keeping edges by choosing, for each pixel, the most homogeneous of the nine overlapping 3×3 sub-windows that contain it within the surrounding 5×5 neighbourhood (the sub-window with the lowest coefficient of variation σ/μ) and returning that sub-window's mean. Because the chosen sub-window usually lies on the same side of an edge as the pixel, edges stay sharp, while uniform areas are smoothed over nine cells. The neighbourhood is fixed at 5×5; there is no window-size parameter. Speckle reduction is therefore moderate; use lee_filter or enhanced_lee_filter with a larger window for stronger smoothing of homogeneous areas. Input should be linear (not dB) backscatter with positive values."#,
             Self::EnhancedLee => r#"The Enhanced Lee filter (Lopes et al., 1990) reduces SAR speckle and treats homogeneous areas, heterogeneous areas and point targets differently. For each pixel it computes the window mean μ and standard deviation σ, the local coefficient of variation Ci = σ/μ, the speckle coefficient of variation Cu = 1/√ENL and the upper limit Cmax = √(1 + 2/ENL). Where Ci ≤ Cu (homogeneous, speckle only) the pixel is replaced by the mean μ. Where Ci ≥ Cmax (a point target or strong edge) the pixel is kept unchanged. In between, F = μ·W + I·(1 − W) with W = exp(−(Ci − Cu)/(Cmax − Ci)), so smoothing fades out as heterogeneity rises. Because only σ/μ enters the weights the result is scale-invariant: linear power, amplitude and scaled digital numbers give the same relative result. Input should be linear (not dB) backscatter with positive values; windows whose mean is not positive are left unfiltered. 'enl' is the equivalent number of looks of the input (1 for single-look intensity; higher for multilooked products)."#,
             Self::ConservativeSmoothing => r#"Conservative Smoothing implements non-linear filtering by replacing each pixel with the average of similar neighbors (within a defined intensity range), preserving edges while reducing noise. Implementation examines neighborhoods, identifies pixels within intensity threshold of central pixel, and averages these similar-value pixels. Mathematical formulation: F = (1/N) Σ(I_j : |I_j - I_center| < T), where T is similarity threshold and N is count of similar pixels. Key features include simple threshold-based similarity definition, effectiveness on optical and radar imagery, parameter interpretability (threshold controls edge-sharpness), and minimal computational overhead. Conservative Smoothing excels in multispectral satellite image preprocessing (reduces noise while preserving spectral boundaries), thermal image enhancement (smooths radiometric noise while maintaining temperature discontinuities), LiDAR classification smoothing (preserves vegetation/ground boundaries), and noisy survey data preprocessing. Output interpretation shows that homogeneous regions average completely (all neighbors similar); edges filter minimally (similar pixels only on same side). Threshold parameter controls edge preservation: small threshold (strict similarity) produces mild smoothing; large threshold (loose similarity) produces aggressive smoothing potentially losing edges. Output values exactly match input neighbor values (no interpolation; output is average of existing values). Statistics shift toward local clusters; heterogeneous regions show minimal change. Verify threshold effectiveness via visual inspection and local histogram analysis. Common artifacts include insufficient smoothing if thresholds are too strict and edge blurring if thresholds are too loose. Iteration count enables progressive filtering: single pass provides gentle smoothing; multiple passes intensify effect. Apply before classification where noise-driven category confusion must be reduced while class boundaries remain sharp."#,
             Self::Olympic => r#"The Olympic Filter implements rank-based smoothing by removing the single highest and single lowest values from each pixel neighborhood, then averaging the remaining pixels. This robust filtering approach eliminates extreme outliers (likely noise or spurious values) while preserving the central tendency. Mathematical formulation: F = (1/(N-2)) Σ(I_sorted[2:N-1]), where sorted neighborhood values exclude highest and lowest. Implementation requires sorting small neighborhoods (computationally efficient) but produces effective noise reduction. Key features include simple outlier removal strategy, effective salt-pepper noise reduction, edge-aware filtering (edges often appear as extremes), and applicability to any data type. Olympic filtering excels in optical satellite imagery preprocessing (removes isolated bright cloud pixels and dark shadows), DEM smoothing reducing survey noise artifacts, thermal image denoising (removes sensor outliers), and radar image preprocessing. Output interpretation reveals that symmetric noise distributions (equal numbers of high/low outliers) filter symmetrically; skewed distributions (more highs or lows) produce directional filtering. Neighborhood size controls smoothing extent: 3×3 window removes 2 extremes from 9 pixels (mild filtering); larger windows filter more aggressively. Output values remain within input range (output is average of actual neighborhood values). Statistics show controlled variance reduction targeting outliers specifically. Difference images (original - filtered) highlight removed outliers; concentrated high-value regions indicate effective noise isolation. Common artifacts include insufficient smoothing if outlier frequency is low and edge blurring if edge pixels consistently rank as extremes. Multiple iterations enable progressive smoothing: single pass provides noise reduction; repeated passes intensify smoothing. Apply in rapid noise-reduction workflows requiring simple, interpretable filtering, particularly effective for salt-pepper noise in multisensor mosaics."#,
             Self::KNearestMean => r#"Performs edge-preserving k-nearest neighbor mean smoothing: sorts neighborhood by distance to center value, averages k closest values. Hybrid approach preserving edges via similarity weighting. Center pixel and k-1 most similar neighbors are averaged. More sophisticated than simple k-NN (considers both spatial and intensity similarity). Computationally efficient relative to bilateral. K-nearest approach adaptively selects neighbors: pixel values close to center are averaged, dissimilar pixels ignored. K parameter controls smoothing: k=1 (no smoothing), k=n (all neighbors = mean filter). Typically k=n/2 (half the neighborhood). Efficient alternative to bilateral filter—similar edge preservation at lower computational cost. Particularly useful for images with strong intensity discontinuities. Applications: (1) Edge-preserving smoothing (alternative to bilateral), (2) Fast preprocessing for classification, (3) Efficiency-critical preprocessing, (4) Multi-band image filtering. Typical parameters: k=neighborhood_size/2 to 3/4."#,
             Self::HighPassMedian => r#"Performs high-pass filtering by subtracting local median from center values: output = pixel - median_neighborhood. Combines high-pass filtering (enhances detail) with median robustness (removes noise). Center-around-zero output (negative = darker than surroundings, positive = brighter). Robust to outliers compared to Gaussian-based high-pass. High-pass residual reveals local deviations from median trend. Particularly robust for noisy data—median is more stable than mean for outliers. Output emphasizes fine-scale variation. Often applied to Gaussian-smoothed versions (creates band-pass filter). Useful for texture enhancement and feature extraction from noisy imagery. Applications: (1) Texture enhancement from noisy data, (2) Detail extraction before classification, (3) Robust feature detection, (4) Preprocessing for texture-based segmentation, (5) SAR preprocessing."#,
-            Self::LaplacianOfGaussians => r#"Performs Laplacian-of-Gaussians (LoG) edge enhancement combining Gaussian smoothing with Laplacian edge detection. Computationally approximated via difference-of-Gaussians (DoG). First smooths image (reduces noise), then applies Laplacian (detects edges). Classical multi-scale edge detection technique. Zero-crossing detection on LoG output identifies precise edge locations. LoG is standard for scale-space edge detection: Gaussian removes noise, Laplacian amplifies edges. Sigma parameter controls scale of edges detected: small sigma detects fine edges, large sigma detects broad edges. LoG approximated via DoG for efficiency. Multiple sigma values enable multi-scale edge detection (identify features at different scales). Applications: (1) Robust edge detection (noise-resistant), (2) Multi-scale edge detection (use multiple sigma), (3) Zero-crossing edge localization, (4) Preprocessing for segmentation, (5) Blob detection via LoG zero-crossings. Workflow: apply LoG→identify zero-crossings→trace edges→vectorization or further processing."#,
+            Self::LaplacianOfGaussians => r#"Performs Laplacian-of-Gaussians (LoG) edge enhancement combining Gaussian smoothing with Laplacian edge detection. Uses the analytic LoG kernel, truncated where the Gaussian weight falls below 0.001. First smooths image (reduces noise), then applies Laplacian (detects edges). Classical multi-scale edge detection technique. The output is the LoG response itself: zero over flat areas, with opposite signs on either side of an edge. Zero-crossing detection on LoG output identifies precise edge locations. LoG is standard for scale-space edge detection: Gaussian removes noise, Laplacian amplifies edges. Sigma parameter controls scale of edges detected: small sigma detects fine edges, large sigma detects broad edges. Multiple sigma values enable multi-scale edge detection (identify features at different scales). Applications: (1) Robust edge detection (noise-resistant), (2) Multi-scale edge detection (use multiple sigma), (3) Zero-crossing edge localization, (4) Preprocessing for segmentation, (5) Blob detection via LoG zero-crossings. Workflow: apply LoG→identify zero-crossings→trace edges→vectorization or further processing."#,
         }
     }
 }
@@ -1226,10 +1226,12 @@ impl FastAlmostGaussianFilterTool {
                                 let mut best_window_sum = 0.0;
                                 let mut best_window_count = 0.0;
 
-                                // 8 directional 3x3 windows centered at different positions
+                                // The nine 3x3 sub-windows of the 5x5 neighbourhood
+                                // that contain the centre pixel.
                                 let window_offsets = [
-                                    (-1, -1), (0, -1), (-1, 0), (0, 0),
-                                    (-1, 1), (0, 1), (1, -1), (1, 0),
+                                    (-1, -1), (-1, 0), (-1, 1),
+                                    (0, -1), (0, 0), (0, 1),
+                                    (1, -1), (1, 0), (1, 1),
                                 ];
 
                                 for (wy, wx) in &window_offsets {
@@ -1923,12 +1925,12 @@ impl FastAlmostGaussianFilterTool {
                 let rows = input.rows;
                 let cols = input.cols;
                 let bands = input.bands;
-                let nodata = input.nodata;
                 let out_vals: Vec<Vec<f64>> = (0..bands)
                     .into_par_iter()
                     .map(|band_idx| {
                         let band = band_idx as isize;
-                        let mut out = vec![nodata; rows * cols];
+                        // NaN marks NoData cells; any finite value is a real response.
+                        let mut out = vec![f64::NAN; rows * cols];
                         out.par_chunks_mut(cols).enumerate().for_each(|(r, out_row)| {
                             let row = r as isize;
                             for c in 0..cols {
@@ -1937,43 +1939,56 @@ impl FastAlmostGaussianFilterTool {
                                 if input.is_nodata(z_raw) {
                                     continue;
                                 }
-                                let mut weighted_sum = 0.0;
-                                let mut weight_sum = 0.0;
-                                if packed_rgb {
-                                    for &(dy, dx, w) in &kernel {
-                                        let zn_raw = input.get(band, row + dy, col + dx);
-                                        if input.is_nodata(zn_raw) {
-                                            continue;
-                                        }
-                                        let zn = value2i(zn_raw);
-                                        weighted_sum += w * zn;
-                                        weight_sum += w;
+                                // Convolve the differences from the centre value. This
+                                // is the LoG response with the truncated kernel made
+                                // zero-sum over the valid cells, so flat areas give 0
+                                // even next to NoData. Dividing by the kernel's sum, as
+                                // before, returned roughly the input value instead.
+                                let z = if packed_rgb { value2i(z_raw) } else { z_raw };
+                                let mut response = 0.0;
+                                for &(dy, dx, w) in &kernel {
+                                    let zn_raw = input.get(band, row + dy, col + dx);
+                                    if input.is_nodata(zn_raw) {
+                                        continue;
                                     }
-                                } else {
-                                    for &(dy, dx, w) in &kernel {
-                                        let zn = input.get(band, row + dy, col + dx);
-                                        if input.is_nodata(zn) {
-                                            continue;
-                                        }
-                                        weighted_sum += w * zn;
-                                        weight_sum += w;
-                                    }
+                                    let zn = if packed_rgb { value2i(zn_raw) } else { zn_raw };
+                                    response += w * (zn - z);
                                 }
-                                if weight_sum != 0.0 {
-                                    out_row[c] = weighted_sum / weight_sum;
-                                }
+                                out_row[c] = response;
                             }
                         });
                         out
                     })
                     .collect();
 
-                let mut out = input.as_ref().clone();
-                if packed_rgb {
-                    // Legacy behavior computes LoG on intensity and writes scalar results.
-                    Self::write_values_into_output(&input, &mut out, &out_vals, false)?;
-                } else {
-                    Self::write_values_into_output(&input, &mut out, &out_vals, false)?;
+                // The response is signed and near zero, so write it to a new
+                // Float32 raster: the input's integer type would truncate it, and
+                // its NoData (often 0) would swallow flat areas. Packed RGB input
+                // is filtered on intensity and written as a scalar.
+                let out_nodata = -32768.0;
+                let mut out = Raster::new(RasterConfig {
+                    cols,
+                    rows,
+                    bands,
+                    x_min: input.x_min,
+                    y_min: input.y_min,
+                    cell_size: input.cell_size_x,
+                    cell_size_y: Some(input.cell_size_y),
+                    nodata: out_nodata,
+                    data_type: DataType::F32,
+                    crs: input.crs.clone(),
+                    metadata: input.metadata.clone(),
+                });
+                for (band_idx, vals) in out_vals.iter().enumerate() {
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            let v = vals[r * cols + c];
+                            let v = if v.is_nan() { out_nodata } else { v };
+                            out.set(band_idx as isize, r as isize, c as isize, v).map_err(|e| {
+                                ToolError::Execution(format!("failed writing output raster: {e}"))
+                            })?;
+                        }
+                    }
                 }
                 out
             }
@@ -2330,6 +2345,69 @@ mod tests {
             .sum::<f64>()
             / 25.0;
         assert!((out.get(0, 10, 49) - window_mean).abs() > 1e-3);
+    }
+
+    #[test]
+    fn refined_lee_treats_all_directions_alike() {
+        // It used to skip the sub-window to the lower right, so rotating the
+        // image by 180 degrees changed the result.
+        let input = make_two_region_speckle_raster(1.0);
+        let mut rotated = make_constant_raster(100, 100, 0.0);
+        for r in 0..100isize {
+            for c in 0..100isize {
+                rotated.set(0, 99 - r, 99 - c, input.get(0, r, c)).unwrap();
+            }
+        }
+        let out = run_with_memory(&RefinedLeeFilterTool, &mut ToolArgs::new(), input);
+        let out_rot = run_with_memory(&RefinedLeeFilterTool, &mut ToolArgs::new(), rotated);
+        for r in 2..98isize {
+            for c in 2..98isize {
+                let a = out.get(0, r, c);
+                let b = out_rot.get(0, 99 - r, 99 - c);
+                assert!((a - b).abs() <= 1e-6 * a.abs() + 1e-12, "({r}, {c}): {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn log_output_is_float_and_keeps_flat_areas_when_nodata_is_zero() {
+        let mut input = Raster::new(RasterConfig {
+            rows: 25,
+            cols: 25,
+            bands: 1,
+            nodata: 0.0,
+            data_type: DataType::U8,
+            ..Default::default()
+        });
+        for r in 0..25isize {
+            for c in 0..25isize {
+                input.set(0, r, c, if c < 13 { 10.0 } else { 20.0 }).unwrap();
+            }
+        }
+        let mut args = ToolArgs::new();
+        args.insert("sigma".to_string(), json!(1.0));
+        let out = run_with_memory(&LaplacianOfGaussiansFilterTool, &mut args, input);
+        assert_eq!(out.data_type, DataType::F32);
+        assert!(!out.is_nodata(out.get(0, 12, 3)), "flat cell became NoData");
+        assert_eq!(out.get(0, 12, 3), 0.0);
+        assert!(out.get(0, 12, 12) * out.get(0, 12, 13) < 0.0);
+    }
+
+    #[test]
+    fn log_responds_to_a_step_with_a_zero_crossing() {
+        let mut step = make_constant_raster(25, 25, 10.0);
+        for r in 0..25isize {
+            for c in 13..25isize {
+                step.set(0, r, c, 20.0).unwrap();
+            }
+        }
+        let mut args = ToolArgs::new();
+        args.insert("sigma".to_string(), json!(1.0));
+        let out = run_with_memory(&LaplacianOfGaussiansFilterTool, &mut args, step);
+        let (dark, bright) = (out.get(0, 12, 12), out.get(0, 12, 13));
+        // Opposite signs on either side of the edge, zero far from it.
+        assert!(dark * bright < 0.0, "{dark} {bright}");
+        assert!(out.get(0, 12, 3).abs() < 1e-9 && out.get(0, 12, 22).abs() < 1e-9);
     }
 
     #[test]

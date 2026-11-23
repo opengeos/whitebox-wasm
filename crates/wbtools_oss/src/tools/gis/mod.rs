@@ -4841,19 +4841,52 @@ fn read_vector_layer_aligned_to_raster(
     }
 
     if let Some(dst_epsg) = raster_epsg {
-        let reprojected = layer.reproject_to_epsg(dst_epsg).map_err(|e| {
-            ToolError::Validation(format!(
-                "{} vector CRS does not match raster CRS; automatic reprojection to EPSG:{} failed: {}",
-                input_name, dst_epsg, e
-            ))
-        })?;
-        return Ok(reprojected);
+        match layer.reproject_to_epsg(dst_epsg) {
+            Ok(reprojected) => return Ok(reprojected),
+            // An EPSG code missing from the registry is not fatal when the
+            // raster also carries its full definition as WKT.
+            Err(e) if raster_wkt.is_none() => {
+                return Err(ToolError::Validation(format!(
+                    "{} vector CRS does not match raster CRS; automatic reprojection to EPSG:{} failed: {}",
+                    input_name, dst_epsg, e
+                )));
+            }
+            Err(_) => {}
+        }
     }
 
-    Err(ToolError::Validation(format!(
-        "{} vector CRS does not match raster CRS and raster has no EPSG code for automatic reprojection",
-        input_name
-    )))
+    // The raster's CRS is known only by WKT (a custom Albers without an EPSG
+    // code, say): reproject the vector to the CRS that WKT defines.
+    let dst_wkt = raster_wkt.expect("raster has EPSG or WKT at this point");
+    reproject_layer_to_raster_wkt(&layer, dst_wkt, input_name)
+}
+
+/// Reprojects `layer` to the CRS defined by a raster's WKT.
+///
+/// Args:
+///     layer: Vector layer carrying its own CRS metadata (EPSG or WKT).
+///     dst_wkt: The raster's CRS as WKT.
+///     input_name: Parameter name used in error messages.
+///
+/// Returns:
+///     The reprojected layer, tagged with `dst_wkt` as its CRS.
+fn reproject_layer_to_raster_wkt(
+    layer: &wbvector::Layer,
+    dst_wkt: &str,
+    input_name: &str,
+) -> Result<wbvector::Layer, ToolError> {
+    let dst = Crs::from_wkt(dst_wkt).map_err(|e| {
+        ToolError::Validation(format!(
+            "{} vector CRS does not match raster CRS, and the raster's WKT could not be read for automatic reprojection: {}",
+            input_name, e
+        ))
+    })?;
+    wbvector::reproject::layer_to_crs_wkt(layer, &dst, dst_wkt).map_err(|e| {
+        ToolError::Validation(format!(
+            "{} vector CRS does not match raster CRS; automatic reprojection to the raster's WKT CRS failed: {}",
+            input_name, e
+        ))
+    })
 }
 
 fn collect_layer_polygons_recursive(
@@ -35497,6 +35530,114 @@ impl Tool for NetworkServiceAreaTool {
 mod tests {
     use super::*;
     use wbcore::{AllowAllCapabilities, RecordingProgressSink};
+
+    const BDC_ALBERS_WKT: &str = r#"PROJCS["unknown",GEOGCS["unknown",DATUM["Unknown based on GRS80 ellipsoid",SPHEROID["GRS 1980",6378137,298.257222101]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Albers_Conic_Equal_Area"],PARAMETER["latitude_of_center",-12],PARAMETER["longitude_of_center",-54],PARAMETER["standard_parallel_1",-2],PARAMETER["standard_parallel_2",-22],PARAMETER["false_easting",5000000],PARAMETER["false_northing",10000000],UNIT["metre",1],AXIS["Easting",EAST],AXIS["Northing",NORTH]]"#;
+
+    fn clip_with_polygon(raster_id: &str, polygon: wbvector::Layer) -> Raster {
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(memory_store::make_raster_memory_path(raster_id)));
+        args.insert(
+            "polygons".to_string(),
+            json!(vector_memory_store::make_vector_memory_path(&vector_memory_store::put_vector(polygon))),
+        );
+        args.insert("maintain_dimensions".to_string(), json!(true));
+        let sink = RecordingProgressSink::new();
+        let ctx = ToolContext { progress: &sink, capabilities: &AllowAllCapabilities };
+        let result = ClipRasterToPolygonTool.run(&args, &ctx).expect("clip_raster_to_polygon runs");
+        let mut read_args = ToolArgs::new();
+        read_args.insert("r".to_string(), result.outputs["path"].clone());
+        load_required_raster_arg(&read_args, "r").expect("output raster")
+    }
+
+    fn polygon_layer(ring: Vec<(f64, f64)>) -> wbvector::Layer {
+        let mut layer = wbvector::Layer::new("area".to_string());
+        layer.geom_type = Some(wbvector::GeometryType::Polygon);
+        layer.push(wbvector::Feature {
+            fid: 0,
+            geometry: Some(wbvector::Geometry::Polygon {
+                exterior: wbvector::Ring::new(ring.into_iter().map(|(x, y)| wbvector::Coord::xy(x, y)).collect()),
+                interiors: vec![],
+            }),
+            attributes: vec![],
+        });
+        layer
+    }
+
+    #[test]
+    fn clip_raster_to_polygon_reprojects_vector_to_wkt_only_raster_crs() {
+        // A raster whose CRS is a custom Albers known only by WKT (Brazil Data
+        // Cube) was refused when clipped by an EPSG:4326 polygon, though the
+        // polygon can be reprojected to that WKT (whitebox-wasm#64).
+        let albers = Crs::from_wkt(BDC_ALBERS_WKT).expect("BDC Albers WKT parses");
+        let wgs84 = Crs::from_epsg(4326).unwrap();
+        let ring_ll = vec![
+            (-42.95, -20.80),
+            (-42.80, -20.80),
+            (-42.80, -20.70),
+            (-42.95, -20.70),
+            (-42.95, -20.80),
+        ];
+        let ring_albers: Vec<(f64, f64)> = ring_ll
+            .iter()
+            .map(|&(x, y)| wgs84.transform_to(x, y, &albers).unwrap())
+            .collect();
+        let (cx, cy) = wgs84.transform_to(-42.875, -20.75, &albers).unwrap();
+
+        // 200 x 200 cells of 100 m centred on the polygon.
+        let mut raster = Raster::new(RasterConfig {
+            rows: 200,
+            cols: 200,
+            bands: 1,
+            x_min: cx - 10_000.0,
+            y_min: cy - 10_000.0,
+            cell_size: 100.0,
+            nodata: -9999.0,
+            crs: CrsInfo { epsg: None, wkt: Some(BDC_ALBERS_WKT.to_string()), proj4: None },
+            ..Default::default()
+        });
+        for r in 0..200isize {
+            for c in 0..200isize {
+                raster.set(0, r, c, (r * 200 + c) as f64).unwrap();
+            }
+        }
+        let raster_id = memory_store::put_raster(raster);
+
+        let mut poly_ll = polygon_layer(ring_ll);
+        poly_ll.set_crs_epsg(Some(4326));
+        let clipped = clip_with_polygon(&raster_id, poly_ll);
+
+        let mut poly_albers = polygon_layer(ring_albers);
+        poly_albers.set_crs_wkt(Some(BDC_ALBERS_WKT.to_string()));
+        let expected = clip_with_polygon(&raster_id, poly_albers);
+
+        let kept = (0..clipped.data.len())
+            .filter(|&i| clipped.data.get_f64(i) != clipped.nodata)
+            .count();
+        assert!(kept > 1000, "clip kept only {kept} cells");
+        assert_eq!(clipped.data.len(), expected.data.len());
+        let differing = (0..clipped.data.len())
+            .filter(|&i| clipped.data.get_f64(i) != expected.data.get_f64(i))
+            .count();
+        assert_eq!(differing, 0, "{differing} cells differ from the hand-reprojected clip");
+    }
+
+    #[test]
+    fn vector_alignment_reports_unreadable_raster_wkt() {
+        let raster = Raster::new(RasterConfig {
+            rows: 2,
+            cols: 2,
+            bands: 1,
+            cell_size: 1.0,
+            nodata: -9999.0,
+            crs: CrsInfo { epsg: None, wkt: Some("NOT A WKT".to_string()), proj4: None },
+            ..Default::default()
+        });
+        let mut poly = polygon_layer(vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0)]);
+        poly.set_crs_epsg(Some(4326));
+        let path = vector_memory_store::make_vector_memory_path(&vector_memory_store::put_vector(poly));
+        let err = read_vector_layer_aligned_to_raster(&raster, &path, "polygons").unwrap_err();
+        assert!(err.to_string().contains("raster's WKT could not be read"), "{err}");
+    }
 
     #[test]
     fn classify_one_way_direction_supports_forward_reverse_and_bidirectional() {

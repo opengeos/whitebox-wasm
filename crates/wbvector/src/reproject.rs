@@ -159,6 +159,18 @@ where
     layer_with_crs_options_internal(layer, &src, &dst, Some(dst_epsg), options, Some(&progress))
 }
 
+/// Reproject a layer to a caller-supplied destination CRS.
+///
+/// The source CRS is read from the layer's metadata (EPSG, falling back on
+/// WKT). The output layer records `dst_wkt` as its CRS WKT and no EPSG code,
+/// so a destination defined only by WKT (a custom Albers, say) round-trips.
+pub fn layer_to_crs_wkt(layer: &Layer, dst: &Crs, dst_wkt: &str) -> Result<Layer> {
+    let src = source_crs_from_layer(layer)?;
+    let mut out = layer_with_crs(layer, &src, dst, None)?;
+    out.set_crs_wkt(Some(dst_wkt.to_owned()));
+    Ok(out)
+}
+
 /// Reproject a layer between explicit source/destination EPSG codes.
 pub fn layer_from_to_epsg(layer: &Layer, src_epsg: u32, dst_epsg: u32) -> Result<Layer> {
     layer_from_to_epsg_with_options(layer, src_epsg, dst_epsg, &VectorReprojectOptions::default())

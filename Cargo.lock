@@ -3523,6 +3523,7 @@ dependencies = [
  "osmpbfreader",
  "parquet",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "wbprojection",
  "zip 0.6.6",

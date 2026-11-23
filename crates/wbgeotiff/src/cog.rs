@@ -235,6 +235,41 @@ impl CogWriter {
         self.encode_to_vec(data.to_vec())
     }
 
+    /// Encode `i8` raster data as a Cloud Optimized GeoTIFF, returned as bytes.
+    pub fn write_i8_to_vec(mut self, data: &[i8]) -> Result<Vec<u8>> {
+        self.bits_per_sample = 8; self.sample_format = SampleFormat::Int;
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.encode_to_vec(bytes)
+    }
+
+    /// Encode `u16` raster data as a Cloud Optimized GeoTIFF, returned as bytes.
+    pub fn write_u16_to_vec(mut self, data: &[u16]) -> Result<Vec<u8>> {
+        self.bits_per_sample = 16; self.sample_format = SampleFormat::Uint;
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.encode_to_vec(bytes)
+    }
+
+    /// Encode `i16` raster data as a Cloud Optimized GeoTIFF, returned as bytes.
+    pub fn write_i16_to_vec(mut self, data: &[i16]) -> Result<Vec<u8>> {
+        self.bits_per_sample = 16; self.sample_format = SampleFormat::Int;
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.encode_to_vec(bytes)
+    }
+
+    /// Encode `u32` raster data as a Cloud Optimized GeoTIFF, returned as bytes.
+    pub fn write_u32_to_vec(mut self, data: &[u32]) -> Result<Vec<u8>> {
+        self.bits_per_sample = 32; self.sample_format = SampleFormat::Uint;
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.encode_to_vec(bytes)
+    }
+
+    /// Encode `i32` raster data as a Cloud Optimized GeoTIFF, returned as bytes.
+    pub fn write_i32_to_vec(mut self, data: &[i32]) -> Result<Vec<u8>> {
+        self.bits_per_sample = 32; self.sample_format = SampleFormat::Int;
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.encode_to_vec(bytes)
+    }
+
     /// Encode `f32` raster data as a Cloud Optimized GeoTIFF, returned as bytes.
     pub fn write_f32_to_vec(mut self, data: &[f32]) -> Result<Vec<u8>> {
         self.bits_per_sample = 32; self.sample_format = SampleFormat::IeeeFloat;
@@ -1228,5 +1263,39 @@ mod tests {
             .unwrap();
         let tiff_i64 = GeoTiff::open(&path_i64).unwrap();
         assert_eq!(tiff_i64.read_band_i64(0).unwrap(), data_i64);
+    }
+
+    /// The in-memory integer writers keep their sample type and values, so a
+    /// browser host can save 16-bit imagery (e.g. Landsat) without widening it.
+    #[test]
+    fn integer_to_vec_writers_round_trip() {
+        let (w, h) = (300u32, 200u32);
+        let n = (w * h) as usize;
+        let writer = || CogWriter::new(w, h, 1).tile_size(256);
+
+        let u16s: Vec<u16> = (0..n).map(|i| (i * 7 % 65_536) as u16).collect();
+        let tiff = GeoTiff::from_bytes(&writer().write_u16_to_vec(&u16s).unwrap()).unwrap();
+        assert_eq!((tiff.sample_format(), tiff.bits_per_sample()), (SampleFormat::Uint, 16));
+        assert_eq!(tiff.read_band_u16(0).unwrap(), u16s);
+
+        let i16s: Vec<i16> = (0..n).map(|i| (i as i32 % 60_000 - 30_000) as i16).collect();
+        let tiff = GeoTiff::from_bytes(&writer().write_i16_to_vec(&i16s).unwrap()).unwrap();
+        assert_eq!((tiff.sample_format(), tiff.bits_per_sample()), (SampleFormat::Int, 16));
+        assert_eq!(tiff.read_band_i16(0).unwrap(), i16s);
+
+        let u32s: Vec<u32> = (0..n).map(|i| (i as u32).wrapping_mul(70_001)).collect();
+        let tiff = GeoTiff::from_bytes(&writer().write_u32_to_vec(&u32s).unwrap()).unwrap();
+        assert_eq!((tiff.sample_format(), tiff.bits_per_sample()), (SampleFormat::Uint, 32));
+        assert_eq!(tiff.read_band_u32(0).unwrap(), u32s);
+
+        let i32s: Vec<i32> = (0..n).map(|i| (i as i32).wrapping_mul(-70_001)).collect();
+        let tiff = GeoTiff::from_bytes(&writer().write_i32_to_vec(&i32s).unwrap()).unwrap();
+        assert_eq!((tiff.sample_format(), tiff.bits_per_sample()), (SampleFormat::Int, 32));
+        assert_eq!(tiff.read_band_i32(0).unwrap(), i32s);
+
+        let i8s: Vec<i8> = (0..n).map(|i| (i % 256) as u8 as i8).collect();
+        let tiff = GeoTiff::from_bytes(&writer().write_i8_to_vec(&i8s).unwrap()).unwrap();
+        assert_eq!((tiff.sample_format(), tiff.bits_per_sample()), (SampleFormat::Int, 8));
+        assert_eq!(tiff.read_band_i8(0).unwrap(), i8s);
     }
 }

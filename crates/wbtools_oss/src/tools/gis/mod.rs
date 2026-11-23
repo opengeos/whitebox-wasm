@@ -4840,6 +4840,7 @@ fn read_vector_layer_aligned_to_raster(
         return Ok(layer);
     }
 
+    let mut epsg_error = None;
     if let Some(dst_epsg) = raster_epsg {
         match layer.reproject_to_epsg(dst_epsg) {
             Ok(reprojected) => return Ok(reprojected),
@@ -4851,14 +4852,21 @@ fn read_vector_layer_aligned_to_raster(
                     input_name, dst_epsg, e
                 )));
             }
-            Err(_) => {}
+            Err(e) => epsg_error = Some(format!("reprojection to EPSG:{} failed ({})", dst_epsg, e)),
         }
     }
 
     // The raster's CRS is known only by WKT (a custom Albers without an EPSG
-    // code, say): reproject the vector to the CRS that WKT defines.
+    // code, say), or its EPSG code is unsupported: reproject the vector to the
+    // CRS that WKT defines.
     let dst_wkt = raster_wkt.expect("raster has EPSG or WKT at this point");
-    reproject_layer_to_raster_wkt(&layer, dst_wkt, input_name)
+    let mut reprojected = reproject_layer_to_raster_wkt(&layer, dst_wkt, input_name).map_err(|e| match &epsg_error {
+        Some(first) => ToolError::Validation(format!("{}; earlier, {}", e, first)),
+        None => e,
+    })?;
+    // Keep the raster's EPSG tag too, so later EPSG comparisons still match.
+    reprojected.set_crs_epsg(raster_epsg);
+    Ok(reprojected)
 }
 
 /// Reprojects `layer` to the CRS defined by a raster's WKT.

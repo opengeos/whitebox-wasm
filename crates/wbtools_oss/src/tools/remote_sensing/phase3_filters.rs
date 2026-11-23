@@ -10,7 +10,7 @@ use wbcore::{
     ToolParamSpec, ToolRunResult, ToolStability,
 };
 use wbraster::color_math::{hsi2value, value2hsi, value2i};
-use wbraster::{Raster, RasterFormat};
+use wbraster::{DataType, Raster, RasterConfig, RasterFormat};
 
 use super::color_support;
 use crate::memory_store;
@@ -1930,7 +1930,8 @@ impl FastAlmostGaussianFilterTool {
                     .into_par_iter()
                     .map(|band_idx| {
                         let band = band_idx as isize;
-                        let mut out = vec![nodata; rows * cols];
+                        // NaN marks NoData cells; any finite value is a real response.
+                        let mut out = vec![f64::NAN; rows * cols];
                         out.par_chunks_mut(cols).enumerate().for_each(|(r, out_row)| {
                             let row = r as isize;
                             for c in 0..cols {
@@ -1961,12 +1962,34 @@ impl FastAlmostGaussianFilterTool {
                     })
                     .collect();
 
-                let mut out = input.as_ref().clone();
-                if packed_rgb {
-                    // Legacy behavior computes LoG on intensity and writes scalar results.
-                    Self::write_values_into_output(&input, &mut out, &out_vals, false)?;
-                } else {
-                    Self::write_values_into_output(&input, &mut out, &out_vals, false)?;
+                // The response is signed and near zero, so write it to a new
+                // Float32 raster: the input's integer type would truncate it, and
+                // its NoData (often 0) would swallow flat areas. Packed RGB input
+                // is filtered on intensity and written as a scalar.
+                let out_nodata = -32768.0;
+                let mut out = Raster::new(RasterConfig {
+                    cols,
+                    rows,
+                    bands,
+                    x_min: input.x_min,
+                    y_min: input.y_min,
+                    cell_size: input.cell_size_x,
+                    cell_size_y: Some(input.cell_size_y),
+                    nodata: out_nodata,
+                    data_type: DataType::F32,
+                    crs: input.crs.clone(),
+                    metadata: input.metadata.clone(),
+                });
+                for (band_idx, vals) in out_vals.iter().enumerate() {
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            let v = vals[r * cols + c];
+                            let v = if v.is_nan() { out_nodata } else { v };
+                            out.set(band_idx as isize, r as isize, c as isize, v).map_err(|e| {
+                                ToolError::Execution(format!("failed writing output raster: {e}"))
+                            })?;
+                        }
+                    }
                 }
                 out
             }
@@ -2342,9 +2365,33 @@ mod tests {
             for c in 2..98isize {
                 let a = out.get(0, r, c);
                 let b = out_rot.get(0, 99 - r, 99 - c);
-                assert!((a - b).abs() <= 1e-6 * a.abs(), "({r}, {c}): {a} vs {b}");
+                assert!((a - b).abs() <= 1e-6 * a.abs() + 1e-12, "({r}, {c}): {a} vs {b}");
             }
         }
+    }
+
+    #[test]
+    fn log_output_is_float_and_keeps_flat_areas_when_nodata_is_zero() {
+        let mut input = Raster::new(RasterConfig {
+            rows: 25,
+            cols: 25,
+            bands: 1,
+            nodata: 0.0,
+            data_type: DataType::U8,
+            ..Default::default()
+        });
+        for r in 0..25isize {
+            for c in 0..25isize {
+                input.set(0, r, c, if c < 13 { 10.0 } else { 20.0 }).unwrap();
+            }
+        }
+        let mut args = ToolArgs::new();
+        args.insert("sigma".to_string(), json!(1.0));
+        let out = run_with_memory(&LaplacianOfGaussiansFilterTool, &mut args, input);
+        assert_eq!(out.data_type, DataType::F32);
+        assert!(!out.is_nodata(out.get(0, 12, 3)), "flat cell became NoData");
+        assert_eq!(out.get(0, 12, 3), 0.0);
+        assert!(out.get(0, 12, 12) * out.get(0, 12, 13) < 0.0);
     }
 
     #[test]

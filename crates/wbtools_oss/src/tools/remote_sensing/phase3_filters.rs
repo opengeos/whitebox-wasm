@@ -21,6 +21,7 @@ pub struct UnsharpMaskingTool;
 pub struct DiffOfGaussiansFilterTool;
 pub struct AdaptiveFilterTool;
 pub struct LeeFilterTool;
+pub struct LeeSigmaFilterTool;
 pub struct RefinedLeeFilterTool;
 pub struct EnhancedLeeFilterTool;
 pub struct ConservativeSmoothingFilterTool;
@@ -37,6 +38,7 @@ enum Phase3Op {
     DiffOfGaussians,
     Adaptive,
     Lee,
+    LeeSigma,
     RefinedLee,
     EnhancedLee,
     ConservativeSmoothing,
@@ -55,6 +57,7 @@ impl Phase3Op {
             Self::DiffOfGaussians => "diff_of_gaussians_filter",
             Self::Adaptive => "adaptive_filter",
             Self::Lee => "lee_filter",
+            Self::LeeSigma => "lee_sigma_filter",
             Self::RefinedLee => "refined_lee_filter",
             Self::EnhancedLee => "enhanced_lee_filter",
             Self::ConservativeSmoothing => "conservative_smoothing_filter",
@@ -73,6 +76,7 @@ impl Phase3Op {
             Self::DiffOfGaussians => "Difference of Gaussians Filter",
             Self::Adaptive => "Adaptive Filter",
             Self::Lee => "Lee Filter",
+            Self::LeeSigma => "Lee Sigma Filter",
             Self::RefinedLee => "Refined Lee Filter",
             Self::EnhancedLee => "Enhanced Lee Filter",
             Self::ConservativeSmoothing => "Conservative Smoothing Filter",
@@ -90,9 +94,10 @@ impl Phase3Op {
             Self::Unsharp => r#"Unsharp masking performs image sharpening by subtracting a smoothed (low-pass) version from the original image, enhancing edges and fine details. The mathematical transformation is I_sharp = I_original + w·(I_original - I_smooth), where w is sharpening weight controlling enhancement strength. The process isolates high-frequency components and amplifies them, effectively separating detail from broad tonal variation. Key features include flexible parameter control (blur radius and weight enabling detail control), computational efficiency via Gaussian smoothing reuse, interpretable enhancement (weight=0 gives original; weight=1 gives true high-pass; weight>1 provides aggressive sharpening), and effectiveness on multispectral data. Unsharp masking excels in satellite image preparation for manual interpretation (enhances subtle terrain, vegetation, infrastructure), LiDAR-derived product enhancement (sharpens DEMs, vegetation metrics), orthophoto quality improvement for feature visibility, and archaeological/survey imagery enhancement. Output interpretation requires understanding that sharpened values concentrate on edges; homogeneous regions remain unchanged. Weight parameter controls enhancement magnitude: w=0.5-1.0 provides subtle enhancement; w=1.0-2.0 provides moderate sharpening; w>2.0 produces aggressive, potentially artifact-laden results. Blur radius controls feature scale: smaller radius (3-5 pixels) enhances fine texture; larger radius (10-20 pixels) enhances moderate features. Output values may exceed input range; clipping typically necessary. Artifacts include halos around strong edges (larger weight or radius = more pronounced), amplified noise if source is noisy, and potential false colors in multispectral sharpening. Verify enhancement via difference images. Apply selectively in visualization workflows; avoid before automated analysis that's sensitive to output range changes."#,
             Self::DiffOfGaussians => r#"Difference of Gaussians (DoG) filtering detects edges and fine features via subtraction of two Gaussian-blurred versions with different radii, creating a bandpass filter emphasizing intermediate spatial frequencies. Implementation computes two Gaussian blurs (small radius σ₁ and large radius σ₂), then subtracts: DoG = G(σ₁) - G(σ₂). This non-linear combination enhances edges and ridges while suppressing both fine noise and broad illumination trends. Key features include tunable frequency response (ratio σ₂/σ₁ controls bandpass characteristics), zero-centered output (bipolar: positive and negative values), applicability to edge detection and feature extraction, and computational efficiency via Gaussian reuse. Difference of Gaussians excels in geological structure detection (faults, lineaments appear as high DoG response), building extraction from orthophotos, fine-texture enhancement in remote sensing mosaics, and neuroscience-inspired processing models. Output interpretation shows that edges produce peak responses (positive on bright side, negative on dark side) with zero-crossing precisely at transitions. Zero-crossing detection reveals true edges independent of edge direction. DoG magnitude indicates edge strength; typical range spans -1000 to +1000 for 8-bit input depending on local contrast. Ratio σ₂/σ₁ determines bandpass center: ratio~2 emphasizes very fine features; ratio~5 emphasizes intermediate features; ratio~10 emphasizes coarser features. Bimodal output distributions (peaks at positive and negative extremes) indicate good edge separation. Common artifacts include halos around strong edges and potential under-response if frequency band doesn't match feature scale. Combine with magnitude thresholding for edge extraction. Apply before morphological post-processing for robust feature extraction from noisy satellite imagery."#,
             Self::Adaptive => r#"The Adaptive Filter adjusts filtering strength dynamically based on local image statistics (mean, variance, kurtosis), enabling context-aware smoothing that responds to scene characteristics. Implementation partitions images into moving windows, computes local statistics (detecting noise-dominated versus feature-dominated regions), and selects filter parameters accordingly. Flat regions smooth aggressively; complex regions filter gently. Mathematical basis uses statistical tests to identify local character: regions with variance below threshold smooth heavily; regions exceeding threshold preserve detail. Key features include automatic parameter adaptation (user specifies ranges; algorithm selects locally), applicability to any filter kernel (Gaussian, median, morphological), and effectiveness on optical and radar imagery. Adaptive filtering excels in preprocessing heterogeneous satellite mosaics (different sensors, acquisition conditions), LiDAR point-cloud smoothing (preserves vegetation edges in forests; smooths ground in open areas), selective SAR speckle reduction respecting both targets and background, and multi-temporal image stacking. Output interpretation reveals that homogeneous regions undergo intensive filtering (low local variance → strong smoothing); complex regions filter conservatively (high variance → minimal processing). Smoothing radius dynamically adjusts per-region: flat areas receive large-radius filtering; textured areas receive small-radius or no filtering. Output ranges remain within input; examine spatial filtering-strength map to validate adaptation. Statistics shift toward local means in smooth regions; complex regions remain largely unchanged. Common artifacts include potential over-smoothing at region boundaries (smooth transition typically applied) and sensitivity to noise-variance relationships. Verify adaptation by analyzing local variance maps. Apply in automated preprocessing pipelines handling multi-source data where uniform filtering insufficient."#,
-            Self::Lee => r#"The Lee filter performs SAR speckle reduction using Lee's multiplicative model, assuming radar returns follow multiplicative noise: I = S·N, where S is signal and N is multiplicative noise. Implementation computes local means and variances, estimating speckle variance, then filters via: F = μ + (1 - σₙ²/σ_I²)·(I - μ), where σₙ² is speckle variance and σ_I² is total variance. This model-based approach preserves high-coherence features while suppressing speckle. Key features include SAR-specific noise model (multiplicative rather than Gaussian), preservation of point targets and edges, straightforward parameter interpretation (window size controls coherence measurement), and proven effectiveness on single-pol and multi-pol SAR. Lee filtering excels in SAR preprocessing for agricultural monitoring, forest classification, ocean-surface monitoring, and flood-mapping workflows. Output interpretation shows that high-coherence regions (point targets, strong edges) filter minimally; low-coherence regions (speckle noise, weak boundaries) filter aggressively. Speckle variance estimation affects output: accurate estimation requires sufficient homogeneous pixels; underestimated variance yields under-smoothing; overestimated variance causes over-smoothing. Window size controls coherence measurement resolution: small windows (3×3) preserve fine detail; large windows (7×7) improve variance estimation but risk detail loss. Output scaling matches input; logarithmic visualization enhances visibility. Typical noise reduction achieves 5-10 dB variance decrease depending on look number. Monitor output histogram for remaining speckle signature; smooth distributions suggest adequate filtering. Artifacts include potential edge blurring in weak-coherence regions and directional bias in linear features. Apply strategically in SAR classification requiring speckle suppression while maintaining classification feature integrity."#,
-            Self::RefinedLee => r#"The Refined Lee filter improves upon standard Lee filtering through enhanced coherence estimation and edge-preserving adaptations, using refined local statistics and directional analysis for superior speckle reduction. Implementation extends Lee's model by detecting edge orientation, applying directional windows aligned with boundaries, and computing refined coherence estimates. Mathematically: F = μ + √(σ_p²/(σ_I²))·(I - μ) with directionally-aligned variance computation. This refinement improves edge preservation while maintaining speckle suppression. Key features include directional sensitivity (adapts filtering direction to image structures), improved coherence estimation (uses anisotropic windows), superior edge preservation versus standard Lee, and effectiveness on complex SAR scenes. Refined Lee filtering excels in change detection requiring sharp boundaries, InSAR coherence map preparation, polarimetric SAR processing where target preservation is critical, and forestry SAR analysis distinguishing trees from background. Output interpretation reveals that filtering respects edge orientation: horizontal edges filter horizontally; vertical edges filter vertically; diagonal edges filter diagonally. This directional adaptation minimizes filtering across true boundaries. Coherence estimates typically more accurate than standard Lee, reducing filtering artifacts. Output ranges match input; directional adaptation becomes apparent via visual inspection (edges remain sharper than standard Lee). Statistics show greater preservation of high-contrast regions. Directional components reveal scene structure orientation; strong directional bias indicates predominant feature orientation. Common artifacts reduce relative to standard Lee, particularly near edges and complex features. Artifacts include potential over-adaptation if directional estimation fails and directional window artifacts at weak boundaries. Monitor coherence maps to validate edge detection accuracy. Apply strategically in SAR classification where directional structures (e.g., forests, aligned agricultural fields) must be preserved."#,
-            Self::EnhancedLee => r#"The Enhanced Lee filter combines Lee's multiplicative model with refined variance estimation and multi-scale processing, achieving superior speckle reduction while preserving fine details and edges in SAR imagery. Implementation employs local statistics computed via windows of adaptive size, incorporates Laplacian-based edge detection, and applies spatially-varying filter parameters. The enhanced formulation applies: F = μ + w·(I - μ) where w adapts to edge proximity: w→0 near edges (minimal filtering), w→1 in homogeneous regions (aggressive filtering). Key features include edge-adaptive processing (preserving boundaries), multi-scale parameter adaptation, improved target preservation versus standard Lee, and effectiveness on high-noise SAR. Enhanced Lee filtering excels in complex SAR scenes with numerous features, flood-mapping applications where edge localization is critical, building detection from urban SAR, and multi-temporal change analysis. Output interpretation reveals edge preservation via reduced filtering near transitions: boundary pixels retain greater variance than distant pixels. Multi-scale adaptation becomes apparent via histogram analysis showing pronounced peaks corresponding to scene classes. Output ranges match input; comparison with standard Lee shows reduced edge blur and maintained target sharpness. Edge detection quality directly impacts output: strong edges enable good boundary preservation; weak edges may induce over-smoothing. Statistics show controlled variance reduction balancing noise suppression against detail preservation. Common artifacts include potential blocky appearance if multi-scale transitions become visible and over-preservation if edge detection is too aggressive. Monitor edge map quality to validate filtering behavior. Apply in comprehensive SAR analysis pipelines where multiple features must be preserved and edges must remain sharp, particularly important for machine learning preprocessing requiring training data with clear feature boundaries."#,
+            Self::Lee => r#"The Lee filter reduces speckle in SAR backscatter with Lee's minimum mean-square-error (MMSE) estimator under the multiplicative speckle model I = S·N. For each pixel it computes the mean μ and standard deviation σ of the moving window, the local coefficient of variation Ci = σ/μ and the speckle coefficient of variation Cu = 1/√ENL, then returns F = μ + w·(I − μ) with w = clamp(1 − Cu²/Ci², 0, 1). In homogeneous areas, where the local variation is no more than speckle (Ci ≤ Cu), the pixel is replaced by the window mean; across edges, point targets and texture (Ci ≫ Cu) w approaches 1 and the pixel is kept. Because only the ratio σ/μ enters the weight, the result is scale-invariant: linear power (sigma0, gamma0), amplitude and scaled digital numbers give the same relative result. Input should be linear (not dB) backscatter with positive values; windows whose mean is not positive are left unfiltered. The 'enl' parameter is the equivalent number of looks of the input: 1 for single-look intensity, higher for multilooked products (e.g. 4 or more for GRD, NISAR GCOV or OPERA RTC); a larger ENL means less speckle is assumed and less smoothing is applied. Window size trades smoothing in homogeneous areas against edge blur; 5×5 or 7×7 is typical. For the classic Lee sigma filter with an absolute intensity range, use lee_sigma_filter."#,
+            Self::LeeSigma => r#"The Lee sigma filter averages, for each pixel, only those neighbours whose values lie within ±sigma of the centre value: F = mean(I_j : |I_j − I_center| ≤ sigma). If fewer than m_value neighbours qualify, the pixel is replaced by the mean of its eight immediate neighbours, which removes isolated spikes. The range is absolute, in the units of the data, so this filter suits data whose noise is additive, such as SAR backscatter in decibels (where a sigma of about 1-3 dB is typical) or DEMs. On linear SAR backscatter (values mostly below 1) the default sigma of 10 includes every neighbour and the filter becomes a plain mean; use lee_filter or enhanced_lee_filter for linear backscatter instead."#,
+            Self::RefinedLee => r#"The Refined Lee filter reduces SAR speckle while keeping edges by choosing, for each pixel, the most homogeneous of eight overlapping 3×3 sub-windows within the surrounding 5×5 neighbourhood (the sub-window with the lowest coefficient of variation σ/μ) and returning that sub-window's mean. Because the chosen sub-window usually lies on the same side of an edge as the pixel, edges stay sharp, while uniform areas are smoothed over nine cells. The neighbourhood is fixed at 5×5; there is no window-size parameter. Speckle reduction is therefore moderate; use lee_filter or enhanced_lee_filter with a larger window for stronger smoothing of homogeneous areas. Input should be linear (not dB) backscatter with positive values."#,
+            Self::EnhancedLee => r#"The Enhanced Lee filter (Lopes et al., 1990) reduces SAR speckle and treats homogeneous areas, heterogeneous areas and point targets differently. For each pixel it computes the window mean μ and standard deviation σ, the local coefficient of variation Ci = σ/μ, the speckle coefficient of variation Cu = 1/√ENL and the upper limit Cmax = √(1 + 2/ENL). Where Ci ≤ Cu (homogeneous, speckle only) the pixel is replaced by the mean μ. Where Ci ≥ Cmax (a point target or strong edge) the pixel is kept unchanged. In between, F = μ·W + I·(1 − W) with W = exp(−(Ci − Cu)/(Cmax − Ci)), so smoothing fades out as heterogeneity rises. Because only σ/μ enters the weights the result is scale-invariant: linear power, amplitude and scaled digital numbers give the same relative result. Input should be linear (not dB) backscatter with positive values; windows whose mean is not positive are left unfiltered. 'enl' is the equivalent number of looks of the input (1 for single-look intensity; higher for multilooked products)."#,
             Self::ConservativeSmoothing => r#"Conservative Smoothing implements non-linear filtering by replacing each pixel with the average of similar neighbors (within a defined intensity range), preserving edges while reducing noise. Implementation examines neighborhoods, identifies pixels within intensity threshold of central pixel, and averages these similar-value pixels. Mathematical formulation: F = (1/N) Σ(I_j : |I_j - I_center| < T), where T is similarity threshold and N is count of similar pixels. Key features include simple threshold-based similarity definition, effectiveness on optical and radar imagery, parameter interpretability (threshold controls edge-sharpness), and minimal computational overhead. Conservative Smoothing excels in multispectral satellite image preprocessing (reduces noise while preserving spectral boundaries), thermal image enhancement (smooths radiometric noise while maintaining temperature discontinuities), LiDAR classification smoothing (preserves vegetation/ground boundaries), and noisy survey data preprocessing. Output interpretation shows that homogeneous regions average completely (all neighbors similar); edges filter minimally (similar pixels only on same side). Threshold parameter controls edge preservation: small threshold (strict similarity) produces mild smoothing; large threshold (loose similarity) produces aggressive smoothing potentially losing edges. Output values exactly match input neighbor values (no interpolation; output is average of existing values). Statistics shift toward local clusters; heterogeneous regions show minimal change. Verify threshold effectiveness via visual inspection and local histogram analysis. Common artifacts include insufficient smoothing if thresholds are too strict and edge blurring if thresholds are too loose. Iteration count enables progressive filtering: single pass provides gentle smoothing; multiple passes intensify effect. Apply before classification where noise-driven category confusion must be reduced while class boundaries remain sharp."#,
             Self::Olympic => r#"The Olympic Filter implements rank-based smoothing by removing the single highest and single lowest values from each pixel neighborhood, then averaging the remaining pixels. This robust filtering approach eliminates extreme outliers (likely noise or spurious values) while preserving the central tendency. Mathematical formulation: F = (1/(N-2)) Σ(I_sorted[2:N-1]), where sorted neighborhood values exclude highest and lowest. Implementation requires sorting small neighborhoods (computationally efficient) but produces effective noise reduction. Key features include simple outlier removal strategy, effective salt-pepper noise reduction, edge-aware filtering (edges often appear as extremes), and applicability to any data type. Olympic filtering excels in optical satellite imagery preprocessing (removes isolated bright cloud pixels and dark shadows), DEM smoothing reducing survey noise artifacts, thermal image denoising (removes sensor outliers), and radar image preprocessing. Output interpretation reveals that symmetric noise distributions (equal numbers of high/low outliers) filter symmetrically; skewed distributions (more highs or lows) produce directional filtering. Neighborhood size controls smoothing extent: 3×3 window removes 2 extremes from 9 pixels (mild filtering); larger windows filter more aggressively. Output values remain within input range (output is average of actual neighborhood values). Statistics show controlled variance reduction targeting outliers specifically. Difference images (original - filtered) highlight removed outliers; concentrated high-value regions indicate effective noise isolation. Common artifacts include insufficient smoothing if outlier frequency is low and edge blurring if edge pixels consistently rank as extremes. Multiple iterations enable progressive smoothing: single pass provides noise reduction; repeated passes intensify smoothing. Apply in rapid noise-reduction workflows requiring simple, interpretable filtering, particularly effective for salt-pepper noise in multisensor mosaics."#,
             Self::KNearestMean => r#"Performs edge-preserving k-nearest neighbor mean smoothing: sorts neighborhood by distance to center value, averages k closest values. Hybrid approach preserving edges via similarity weighting. Center pixel and k-1 most similar neighbors are averaged. More sophisticated than simple k-NN (considers both spatial and intensity similarity). Computationally efficient relative to bilateral. K-nearest approach adaptively selects neighbors: pixel values close to center are averaged, dissimilar pixels ignored. K parameter controls smoothing: k=1 (no smoothing), k=n (all neighbors = mean filter). Typically k=n/2 (half the neighborhood). Efficient alternative to bilateral filter—similar edge preservation at lower computational cost. Particularly useful for images with strong intensity discontinuities. Applications: (1) Edge-preserving smoothing (alternative to bilateral), (2) Fast preprocessing for classification, (3) Efficiency-critical preprocessing, (4) Multi-band image filtering. Typical parameters: k=neighborhood_size/2 to 3/4."#,
@@ -233,17 +238,12 @@ impl FastAlmostGaussianFilterTool {
                     required: false,
                 });
                 params.push(ToolParamSpec {
-                    name: "sigma",
-                    description: "Intensity inclusion half-width around center value (default 10.0).",
-                    required: false,
-                });
-                params.push(ToolParamSpec {
-                    name: "m_value",
-                    description: "Minimum in-range sample count before fallback averaging (default 5.0).",
+                    name: "enl",
+                    description: "Equivalent number of looks of the input; speckle coefficient of variation is 1/sqrt(enl) (default 1.0, single-look).",
                     required: false,
                 });
             }
-            Phase3Op::RefinedLee => {
+            Phase3Op::LeeSigma => {
                 params.push(ToolParamSpec {
                     name: "filter_size_x",
                     description: "Neighborhood width in pixels (odd integer, default 11).",
@@ -254,7 +254,18 @@ impl FastAlmostGaussianFilterTool {
                     description: "Neighborhood height in pixels (odd integer, default 11).",
                     required: false,
                 });
+                params.push(ToolParamSpec {
+                    name: "sigma",
+                    description: "Absolute inclusion half-width around the center value, in data units (default 10.0).",
+                    required: false,
+                });
+                params.push(ToolParamSpec {
+                    name: "m_value",
+                    description: "Minimum in-range sample count before fallback averaging (default 5.0).",
+                    required: false,
+                });
             }
+            Phase3Op::RefinedLee => {}
             Phase3Op::EnhancedLee => {
                 params.push(ToolParamSpec {
                     name: "filter_size_x",
@@ -268,7 +279,7 @@ impl FastAlmostGaussianFilterTool {
                 });
                 params.push(ToolParamSpec {
                     name: "enl",
-                    description: "Equivalent number of looks parameter for sigma-ratio weighting (default 4.0).",
+                    description: "Equivalent number of looks of the input; sets Cu = 1/sqrt(enl) and Cmax = sqrt(1 + 2/enl) (default 4.0).",
                     required: false,
                 });
             }
@@ -384,6 +395,11 @@ impl FastAlmostGaussianFilterTool {
             Phase3Op::Lee => {
                 defaults.insert("filter_size_x".to_string(), json!(11));
                 defaults.insert("filter_size_y".to_string(), json!(11));
+                defaults.insert("enl".to_string(), json!(1.0));
+            }
+            Phase3Op::LeeSigma => {
+                defaults.insert("filter_size_x".to_string(), json!(11));
+                defaults.insert("filter_size_y".to_string(), json!(11));
                 defaults.insert("sigma".to_string(), json!(10.0));
                 defaults.insert("m_value".to_string(), json!(5.0));
             }
@@ -408,10 +424,7 @@ impl FastAlmostGaussianFilterTool {
             Phase3Op::LaplacianOfGaussians => {
                 defaults.insert("sigma".to_string(), json!(0.75));
             }
-            Phase3Op::RefinedLee => {
-                defaults.insert("filter_size_x".to_string(), json!(11));
-                defaults.insert("filter_size_y".to_string(), json!(11));
-            }
+            Phase3Op::RefinedLee => {}
             Phase3Op::EnhancedLee => {
                 defaults.insert("filter_size_x".to_string(), json!(11));
                 defaults.insert("filter_size_y".to_string(), json!(11));
@@ -1027,7 +1040,72 @@ impl FastAlmostGaussianFilterTool {
                 Self::write_values_into_output(&input, &mut out, &out_vals, packed_rgb)?;
                 out
             }
-            Phase3Op::Lee => {
+            Phase3Op::Lee | Phase3Op::EnhancedLee => {
+                let (_sx, _sy, mx, my) = Self::parse_window_sizes(args, 11, 11);
+                let enhanced = matches!(op, Phase3Op::EnhancedLee);
+                let default_enl = if enhanced { 4.0 } else { 1.0 };
+                let enl = args
+                    .get("enl")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(default_enl);
+                if !enl.is_finite() || enl <= 0.0 {
+                    return Err(ToolError::Validation("enl must be a positive number".to_string()));
+                }
+                let cu = 1.0 / enl.sqrt();
+                let cmax = (1.0 + 2.0 / enl).sqrt();
+
+                let rows = input.rows;
+                let cols = input.cols;
+                let bands = input.bands;
+                let nodata = input.nodata;
+
+                let out_vals: Vec<Vec<f64>> = (0..bands)
+                    .into_par_iter()
+                    .map(|band_idx| {
+                        let band = band_idx as isize;
+                        let mut out = vec![nodata; rows * cols];
+                        out.par_chunks_mut(cols).enumerate().for_each(|(r, out_row)| {
+                            let row = r as isize;
+                            for c in 0..cols {
+                                let col = c as isize;
+                                let z_raw = input.get(band, row, col);
+                                if input.is_nodata(z_raw) {
+                                    continue;
+                                }
+                                let z = if packed_rgb { value2i(z_raw) } else { z_raw };
+
+                                let mut sum = 0.0;
+                                let mut sum2 = 0.0;
+                                let mut n = 0.0;
+                                for ny in (row - my)..=(row + my) {
+                                    for nx in (col - mx)..=(col + mx) {
+                                        let zn_raw = input.get(band, ny, nx);
+                                        if input.is_nodata(zn_raw) {
+                                            continue;
+                                        }
+                                        let zn = if packed_rgb { value2i(zn_raw) } else { zn_raw };
+                                        sum += zn;
+                                        sum2 += zn * zn;
+                                        n += 1.0;
+                                    }
+                                }
+
+                                out_row[c] = if enhanced {
+                                    enhanced_lee_estimate(z, sum, sum2, n, cu, cmax)
+                                } else {
+                                    lee_mmse_estimate(z, sum, sum2, n, cu)
+                                };
+                            }
+                        });
+                        out
+                    })
+                    .collect();
+
+                let mut out = input.as_ref().clone();
+                Self::write_values_into_output(&input, &mut out, &out_vals, packed_rgb)?;
+                out
+            }
+            Phase3Op::LeeSigma => {
                 let (sx, sy, mx, my) = Self::parse_window_sizes(args, 11, 11);
                 let sigma = args
                     .get("sigma")
@@ -1120,7 +1198,6 @@ impl FastAlmostGaussianFilterTool {
                 out
             }
             Phase3Op::RefinedLee => {
-                let (_sx, _sy, _mx, _my) = Self::parse_window_sizes(args, 11, 11);
                 let rows = input.rows;
                 let cols = input.cols;
                 let bands = input.bands;
@@ -1188,69 +1265,6 @@ impl FastAlmostGaussianFilterTool {
 
                                 if best_window_count > 0.0 {
                                     out_row[c] = best_window_sum / best_window_count;
-                                } else {
-                                    out_row[c] = z;
-                                }
-                            }
-                        });
-                        out
-                    })
-                    .collect();
-
-                let mut out = input.as_ref().clone();
-                Self::write_values_into_output(&input, &mut out, &out_vals, packed_rgb)?;
-                out
-            }
-            Phase3Op::EnhancedLee => {
-                let (_sx, _sy, mx, my) = Self::parse_window_sizes(args, 11, 11);
-                let enl = args
-                    .get("enl")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(4.0)
-                    .max(0.1);
-
-                let rows = input.rows;
-                let cols = input.cols;
-                let bands = input.bands;
-                let nodata = input.nodata;
-
-                let out_vals: Vec<Vec<f64>> = (0..bands)
-                    .into_par_iter()
-                    .map(|band_idx| {
-                        let band = band_idx as isize;
-                        let mut out = vec![nodata; rows * cols];
-                        out.par_chunks_mut(cols).enumerate().for_each(|(r, out_row)| {
-                            let row = r as isize;
-                            for c in 0..cols {
-                                let col = c as isize;
-                                let z_raw = input.get(band, row, col);
-                                if input.is_nodata(z_raw) {
-                                    continue;
-                                }
-                                let z = if packed_rgb { value2i(z_raw) } else { z_raw };
-
-                                let mut sum = 0.0;
-                                let mut sum2 = 0.0;
-                                let mut n = 0.0;
-                                for ny in (row - my)..=(row + my) {
-                                    for nx in (col - mx)..=(col + mx) {
-                                        let zn_raw = input.get(band, ny, nx);
-                                        if input.is_nodata(zn_raw) {
-                                            continue;
-                                        }
-                                        let zn = if packed_rgb { value2i(zn_raw) } else { zn_raw };
-                                        sum += zn;
-                                        sum2 += zn * zn;
-                                        n += 1.0;
-                                    }
-                                }
-
-                                if n > 1.0 {
-                                    let mean = sum / n;
-                                    let variance = (sum2 - (sum * sum) / n) / n;
-                                    let sigma_ratio = variance / (mean.abs() + 1e-12);
-                                    let weight = 1.0 / (1.0 + sigma_ratio * enl);
-                                    out_row[c] = (1.0 - weight) * z + weight * mean;
                                 } else {
                                     out_row[c] = z;
                                 }
@@ -1972,6 +1986,80 @@ impl FastAlmostGaussianFilterTool {
     }
 }
 
+/// Window mean and coefficient of variation from running sums.
+///
+/// Args:
+///     sum: Sum of the valid window values.
+///     sum2: Sum of their squares.
+///     n: Number of valid window values.
+///
+/// Returns:
+///     `Some((mean, ci))` when the window has at least two values and a
+///     positive mean, where `ci = std / mean`; `None` otherwise.
+fn window_mean_and_cv(sum: f64, sum2: f64, n: f64) -> Option<(f64, f64)> {
+    if n < 2.0 {
+        return None;
+    }
+    let mean = sum / n;
+    if !(mean > 0.0) {
+        return None;
+    }
+    let variance = ((sum2 - sum * sum / n) / n).max(0.0);
+    Some((mean, variance.sqrt() / mean))
+}
+
+/// Lee MMSE speckle estimate for one pixel.
+///
+/// Args:
+///     z: Centre pixel value (linear backscatter).
+///     sum: Sum of the window values.
+///     sum2: Sum of the squared window values.
+///     n: Number of valid window values.
+///     cu: Speckle coefficient of variation, `1 / sqrt(ENL)`.
+///
+/// Returns:
+///     `mean + w * (z - mean)` with `w = clamp(1 - cu^2 / ci^2, 0, 1)`; `z`
+///     unchanged when the window has no positive mean.
+fn lee_mmse_estimate(z: f64, sum: f64, sum2: f64, n: f64, cu: f64) -> f64 {
+    let Some((mean, ci)) = window_mean_and_cv(sum, sum2, n) else {
+        return z;
+    };
+    let w = if ci > 0.0 {
+        (1.0 - (cu * cu) / (ci * ci)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    mean + w * (z - mean)
+}
+
+/// Enhanced Lee (Lopes et al., 1990) speckle estimate for one pixel.
+///
+/// Args:
+///     z: Centre pixel value (linear backscatter).
+///     sum: Sum of the window values.
+///     sum2: Sum of the squared window values.
+///     n: Number of valid window values.
+///     cu: Speckle coefficient of variation, `1 / sqrt(ENL)`.
+///     cmax: Upper heterogeneity limit, `sqrt(1 + 2 / ENL)`.
+///
+/// Returns:
+///     The window mean when `ci <= cu`, `z` when `ci >= cmax`, and an
+///     exponentially damped blend in between; `z` unchanged when the window
+///     has no positive mean.
+fn enhanced_lee_estimate(z: f64, sum: f64, sum2: f64, n: f64, cu: f64, cmax: f64) -> f64 {
+    let Some((mean, ci)) = window_mean_and_cv(sum, sum2, n) else {
+        return z;
+    };
+    if ci <= cu {
+        mean
+    } else if ci >= cmax {
+        z
+    } else {
+        let w = (-(ci - cu) / (cmax - ci)).exp();
+        mean * w + z * (1.0 - w)
+    }
+}
+
 macro_rules! define_phase3_tool {
     ($tool:ident, $op:expr) => {
         impl Tool for $tool {
@@ -2002,6 +2090,7 @@ define_phase3_tool!(UnsharpMaskingTool, Phase3Op::Unsharp);
 define_phase3_tool!(DiffOfGaussiansFilterTool, Phase3Op::DiffOfGaussians);
 define_phase3_tool!(AdaptiveFilterTool, Phase3Op::Adaptive);
 define_phase3_tool!(LeeFilterTool, Phase3Op::Lee);
+define_phase3_tool!(LeeSigmaFilterTool, Phase3Op::LeeSigma);
 define_phase3_tool!(RefinedLeeFilterTool, Phase3Op::RefinedLee);
 define_phase3_tool!(EnhancedLeeFilterTool, Phase3Op::EnhancedLee);
 define_phase3_tool!(ConservativeSmoothingFilterTool, Phase3Op::ConservativeSmoothing);
@@ -2118,10 +2207,141 @@ mod tests {
         let mut args = ToolArgs::new();
         args.insert("filter_size_x".to_string(), json!(11));
         args.insert("filter_size_y".to_string(), json!(11));
-        args.insert("sigma".to_string(), json!(10.0));
-        args.insert("m_value".to_string(), json!(5.0));
+        args.insert("enl".to_string(), json!(4.0));
         let out = run_with_memory(&LeeFilterTool, &mut args, make_constant_raster(25, 25, 10.0));
         assert!((out.get(0, 12, 12) - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lee_sigma_constant_raster_is_unchanged() {
+        let mut args = ToolArgs::new();
+        args.insert("filter_size_x".to_string(), json!(11));
+        args.insert("filter_size_y".to_string(), json!(11));
+        args.insert("sigma".to_string(), json!(10.0));
+        args.insert("m_value".to_string(), json!(5.0));
+        let out = run_with_memory(&LeeSigmaFilterTool, &mut args, make_constant_raster(25, 25, 10.0));
+        assert!((out.get(0, 12, 12) - 10.0).abs() < 1e-9);
+    }
+
+    /// 100 x 100 linear-power image with 4-look gamma speckle: mean 0.02 in
+    /// columns 0-49 and 0.2 in columns 50-99, as in whitebox-wasm#66.
+    fn make_two_region_speckle_raster(scale: f64) -> Raster {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut uniform = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        let mut r = make_constant_raster(100, 100, 0.0);
+        for row in 0..100isize {
+            for col in 0..100isize {
+                let mean = if col < 50 { 0.02 } else { 0.2 };
+                // Gamma(4, 1/4) as the mean of four unit exponentials.
+                let speckle = (0..4).map(|_| -uniform().ln()).sum::<f64>() / 4.0;
+                r.set(0, row, col, scale * mean * speckle).unwrap();
+            }
+        }
+        r
+    }
+
+    fn db(v: f64) -> f64 {
+        10.0 * v.log10()
+    }
+
+    /// Standard deviation of dB values over rows 5-94 and columns `cols`.
+    fn db_std(r: &Raster, cols: std::ops::Range<isize>) -> f64 {
+        let vals: Vec<f64> = (5..95isize)
+            .flat_map(|row| cols.clone().map(move |col| (row, col)))
+            .map(|(row, col)| db(r.get(0, row, col)))
+            .collect();
+        let m = vals.iter().sum::<f64>() / vals.len() as f64;
+        (vals.iter().map(|v| (v - m).powi(2)).sum::<f64>() / vals.len() as f64).sqrt()
+    }
+
+    /// dB of the mean linear value of column `col` over rows 5-94.
+    fn column_db(r: &Raster, col: isize) -> f64 {
+        db((5..95isize).map(|row| r.get(0, row, col)).sum::<f64>() / 90.0)
+    }
+
+    fn run_speckle_filter(tool: &dyn Tool, enl: f64, scale: f64) -> Raster {
+        let mut args = ToolArgs::new();
+        args.insert("filter_size_x".to_string(), json!(5));
+        args.insert("filter_size_y".to_string(), json!(5));
+        args.insert("enl".to_string(), json!(enl));
+        run_with_memory(tool, &mut args, make_two_region_speckle_raster(scale))
+    }
+
+    fn assert_reduces_speckle_and_keeps_edge(tool: &dyn Tool, name: &str) {
+        let input = make_two_region_speckle_raster(1.0);
+        let out = run_speckle_filter(tool, 4.0, 1.0);
+
+        // Speckle drops in both uniform halves.
+        for cols in [5..44isize, 56..95isize] {
+            let before = db_std(&input, cols.clone());
+            let after = db_std(&out, cols.clone());
+            assert!(after < 0.5 * before, "{name}: dB std over {cols:?} {before:.2} -> {after:.2}");
+        }
+
+        // The edge between columns 49 and 50 stays within one pixel: two
+        // columns away on either side the level is within 1.5 dB of the truth
+        // (-17 dB and -7 dB). A 5 x 5 mean gives about -12.6 dB and -7.7 dB
+        // there, the blur reported in the issue.
+        let left = column_db(&out, 48);
+        let right = column_db(&out, 51);
+        assert!((left - db(0.02)).abs() < 1.5, "{name}: column 48 at {left:.2} dB");
+        assert!((right - db(0.2)).abs() < 1.5, "{name}: column 51 at {right:.2} dB");
+
+        // Scale-invariant: multiplying the input by 1000 multiplies the
+        // output by 1000.
+        let scaled = run_speckle_filter(tool, 4.0, 1000.0);
+        for row in 0..100isize {
+            for col in 0..100isize {
+                let a = out.get(0, row, col);
+                let b = scaled.get(0, row, col) / 1000.0;
+                assert!((a - b).abs() <= 1e-4 * a.abs(), "{name}: ({row}, {col}) {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn lee_filter_reduces_speckle_keeps_edges_and_is_scale_invariant() {
+        assert_reduces_speckle_and_keeps_edge(&LeeFilterTool, "lee_filter");
+    }
+
+    #[test]
+    fn enhanced_lee_filter_reduces_speckle_keeps_edges_and_is_scale_invariant() {
+        assert_reduces_speckle_and_keeps_edge(&EnhancedLeeFilterTool, "enhanced_lee_filter");
+    }
+
+    #[test]
+    fn lee_filter_is_not_a_box_mean_on_linear_backscatter() {
+        // The old lee_filter averaged every neighbour within +/-10 of the centre,
+        // so on linear backscatter (< 1) it returned the plain window mean.
+        let out = run_speckle_filter(&LeeFilterTool, 4.0, 1.0);
+        let input = make_two_region_speckle_raster(1.0);
+        let window_mean = (47..=51isize)
+            .flat_map(|c| (8..=12isize).map(move |r| (r, c)))
+            .map(|(r, c)| input.get(0, r, c))
+            .sum::<f64>()
+            / 25.0;
+        assert!((out.get(0, 10, 49) - window_mean).abs() > 1e-3);
+    }
+
+    #[test]
+    fn refined_lee_has_no_window_size_parameters() {
+        let meta = RefinedLeeFilterTool.metadata();
+        assert!(meta.params.iter().all(|p| !p.name.starts_with("filter_size")));
+        assert!(!RefinedLeeFilterTool.manifest().defaults.contains_key("filter_size_x"));
+    }
+
+    #[test]
+    fn lee_filter_rejects_non_positive_enl() {
+        let id = memory_store::put_raster(make_constant_raster(5, 5, 1.0));
+        let mut args = ToolArgs::new();
+        args.insert("input".to_string(), json!(memory_store::make_raster_memory_path(&id)));
+        args.insert("enl".to_string(), json!(0.0));
+        assert!(LeeFilterTool.run(&args, &make_ctx()).is_err());
     }
 
     #[test]

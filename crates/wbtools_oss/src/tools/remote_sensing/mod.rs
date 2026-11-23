@@ -38,8 +38,7 @@ pub fn remote_sensing_tool_param_schemas(tool_id: &str) -> Option<BTreeMap<Strin
 		}
 		"adaptive_filter" | "closing" | "conservative_smoothing_filter" | "diversity_filter"
 		| "high_pass_filter" | "majority_filter" | "maximum_filter" | "mean_filter"
-		| "minimum_filter" | "olympic_filter" | "opening" | "range_filter"
-		| "refined_lee_filter" => Some(param_schema_map(&[
+		| "minimum_filter" | "olympic_filter" | "opening" | "range_filter" => Some(param_schema_map(&[
 			("input", ToolParamSchema::input_raster()),
 			("filter_size_x", ToolParamSchema::scalar_integer()),
 			("filter_size_y", ToolParamSchema::scalar_integer()),
@@ -196,6 +195,13 @@ pub fn remote_sensing_tool_param_schemas(tool_id: &str) -> Option<BTreeMap<Strin
 			("input", ToolParamSchema::input_raster()),
 			("filter_size_x", ToolParamSchema::scalar_integer()),
 			("filter_size_y", ToolParamSchema::scalar_integer()),
+			("enl", ToolParamSchema::scalar_float()),
+			("output", ToolParamSchema::output_raster()),
+		])),
+		"lee_sigma_filter" => Some(param_schema_map(&[
+			("input", ToolParamSchema::input_raster()),
+			("filter_size_x", ToolParamSchema::scalar_integer()),
+			("filter_size_y", ToolParamSchema::scalar_integer()),
 			("sigma", ToolParamSchema::scalar_float()),
 			("m_value", ToolParamSchema::scalar_float()),
 			("output", ToolParamSchema::output_raster()),
@@ -205,6 +211,10 @@ pub fn remote_sensing_tool_param_schemas(tool_id: &str) -> Option<BTreeMap<Strin
 			("filter_size_x", ToolParamSchema::scalar_integer()),
 			("filter_size_y", ToolParamSchema::scalar_integer()),
 			("enl", ToolParamSchema::scalar_float()),
+			("output", ToolParamSchema::output_raster()),
+		])),
+		"refined_lee_filter" => Some(param_schema_map(&[
+			("input", ToolParamSchema::input_raster()),
 			("output", ToolParamSchema::output_raster()),
 		])),
 		"histogram_matching" => Some(param_schema_map(&[
@@ -1465,6 +1475,7 @@ pub use phase3_filters::EdgePreservingMeanFilterTool;
 pub use phase3_filters::FastAlmostGaussianFilterTool;
 pub use phase3_filters::AdaptiveFilterTool;
 pub use phase3_filters::LeeFilterTool;
+pub use phase3_filters::LeeSigmaFilterTool;
 pub use phase3_filters::RefinedLeeFilterTool;
 pub use phase3_filters::EnhancedLeeFilterTool;
 pub use phase3_filters::ConservativeSmoothingFilterTool;

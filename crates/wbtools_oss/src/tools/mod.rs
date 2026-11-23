@@ -151,6 +151,7 @@ pub use remote_sensing::KNearestMeanFilterTool;
 pub use remote_sensing::IntegralImageTransformTool;
 pub use remote_sensing::LaplacianOfGaussiansFilterTool;
 pub use remote_sensing::LeeFilterTool;
+pub use remote_sensing::LeeSigmaFilterTool;
 pub use remote_sensing::RefinedLeeFilterTool;
 pub use remote_sensing::EnhancedLeeFilterTool;
 pub use remote_sensing::HighPassFilterTool;

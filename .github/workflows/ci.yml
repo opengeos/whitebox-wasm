@@ -22,7 +22,7 @@ jobs:
       - name: cargo test (host)
         # Scope to our crates; the vendored wbprojection ships an authoritative
         # EPSG/datum fixture suite that needs data files we don't vendor.
-        run: cargo test -p wbgeotiff -p whitebox-wasm
+        run: cargo test -p wbgeotiff -p wbvector -p whitebox-wasm
       - name: cargo test (wbprojection)
         # Two tests read authoritative fixture files that are not vendored.
         run: >-

@@ -1066,6 +1066,32 @@ mod tests {
     }
 
     #[test]
+    fn layer_to_crs_wkt_reprojects_to_a_wkt_only_crs_and_records_it() {
+        // A custom Albers with no EPSG code (Brazil Data Cube).
+        let wkt = r#"PROJCS["unknown",GEOGCS["unknown",DATUM["Unknown based on GRS80 ellipsoid",SPHEROID["GRS 1980",6378137,298.257222101]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Albers_Conic_Equal_Area"],PARAMETER["latitude_of_center",-12],PARAMETER["longitude_of_center",-54],PARAMETER["standard_parallel_1",-2],PARAMETER["standard_parallel_2",-22],PARAMETER["false_easting",5000000],PARAMETER["false_northing",10000000],UNIT["metre",1]]"#;
+        let dst = wbprojection::from_wkt(wkt).unwrap();
+        let mut layer = Layer::new("pt")
+            .with_geom_type(GeometryType::Point)
+            .with_crs_epsg(4326);
+        layer.add_feature(Some(Geometry::point(-42.9, -20.75)), &[]).unwrap();
+
+        let out = layer_to_crs_wkt(&layer, &dst, wkt).unwrap();
+        assert_eq!(out.crs_epsg(), None);
+        assert_eq!(out.crs_wkt(), Some(wkt));
+
+        let src = Crs::from_epsg(4326).unwrap();
+        let (ex, ey) = src.transform_to(-42.9, -20.75, &dst).unwrap();
+        match out.features[0].geometry.as_ref().unwrap() {
+            Geometry::Point(c) => {
+                assert!((c.x - ex).abs() < 1e-6 && (c.y - ey).abs() < 1e-6);
+                // East of the central meridian and north of lat_0.
+                assert!(c.x > 5_000_000.0 && c.y > 10_000_000.0 - 1_500_000.0);
+            }
+            g => panic!("unexpected geometry {g:?}"),
+        }
+    }
+
+    #[test]
     fn reproject_to_epsg_requires_source_epsg() {
         let layer = Layer::new("no_crs").with_geom_type(GeometryType::Point);
         let err = layer_to_epsg(&layer, 3857).unwrap_err();

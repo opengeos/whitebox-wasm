@@ -1726,7 +1726,7 @@ mod tests {
 
     #[test]
     fn transform_to_with_operation_validates_codes_and_routes() {
-        let _guard = crate::operations::coordinate_operation_test_guard();
+        let _guard = coordinate_operation_test_guard();
         clear_coordinate_operations().unwrap();
 
         let src = Crs::from_epsg(4326).unwrap();
@@ -1749,7 +1749,7 @@ mod tests {
 
     #[test]
     fn transform_to_with_operation_rejects_crs_mismatch() {
-        let _guard = crate::operations::coordinate_operation_test_guard();
+        let _guard = coordinate_operation_test_guard();
         clear_coordinate_operations().unwrap();
 
         let src = Crs::from_epsg(4326).unwrap();
@@ -1779,7 +1779,7 @@ mod tests {
 
     #[test]
     fn transform_to_with_preferred_operation_falls_back_when_no_mapping() {
-        let _guard = crate::operations::coordinate_operation_test_guard();
+        let _guard = coordinate_operation_test_guard();
         let src = Crs::from_epsg(4326).unwrap();
         let dst = Crs::from_epsg(3857).unwrap();
 
@@ -1845,7 +1845,7 @@ mod tests {
 
     #[test]
     fn transform_to_3d_with_preferred_operation_falls_back_when_no_mapping() {
-        let _guard = crate::operations::coordinate_operation_test_guard();
+        let _guard = coordinate_operation_test_guard();
         let src = Crs::from_epsg(4326).unwrap();
         let dst = Crs::from_epsg(3857).unwrap();
 

@@ -87,6 +87,7 @@ pub fn register_default_tools(registry: &mut ToolRegistry) {
     registry.register(Box::new(tools::DirectDecorrelationStretchTool));
     registry.register(Box::new(tools::AdaptiveFilterTool));
     registry.register(Box::new(tools::LeeFilterTool));
+    registry.register(Box::new(tools::LeeSigmaFilterTool));
     registry.register(Box::new(tools::RefinedLeeFilterTool));
     registry.register(Box::new(tools::EnhancedLeeFilterTool));
     registry.register(Box::new(tools::ConservativeSmoothingFilterTool));

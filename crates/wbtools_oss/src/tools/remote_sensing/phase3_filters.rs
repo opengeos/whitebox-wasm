@@ -1084,8 +1084,11 @@ impl FastAlmostGaussianFilterTool {
                                             continue;
                                         }
                                         let zn = if packed_rgb { value2i(zn_raw) } else { zn_raw };
-                                        sum += zn;
-                                        sum2 += zn * zn;
+                                        // Shift by the centre value so the variance
+                                        // does not cancel catastrophically.
+                                        let d = zn - z;
+                                        sum += d;
+                                        sum2 += d * d;
                                         n += 1.0;
                                     }
                                 }
@@ -1986,21 +1989,22 @@ impl FastAlmostGaussianFilterTool {
     }
 }
 
-/// Window mean and coefficient of variation from running sums.
+/// Window mean and coefficient of variation from shifted running sums.
 ///
 /// Args:
-///     sum: Sum of the valid window values.
-///     sum2: Sum of their squares.
+///     z: Centre pixel value, the shift applied to the sums.
+///     sum: Sum of `(value - z)` over the valid window values.
+///     sum2: Sum of `(value - z)^2`.
 ///     n: Number of valid window values.
 ///
 /// Returns:
 ///     `Some((mean, ci))` when the window has at least two values and a
 ///     positive mean, where `ci = std / mean`; `None` otherwise.
-fn window_mean_and_cv(sum: f64, sum2: f64, n: f64) -> Option<(f64, f64)> {
+fn window_mean_and_cv(z: f64, sum: f64, sum2: f64, n: f64) -> Option<(f64, f64)> {
     if n < 2.0 {
         return None;
     }
-    let mean = sum / n;
+    let mean = z + sum / n;
     if !(mean > 0.0) {
         return None;
     }
@@ -2012,8 +2016,8 @@ fn window_mean_and_cv(sum: f64, sum2: f64, n: f64) -> Option<(f64, f64)> {
 ///
 /// Args:
 ///     z: Centre pixel value (linear backscatter).
-///     sum: Sum of the window values.
-///     sum2: Sum of the squared window values.
+///     sum: Sum of `(value - z)` over the window.
+///     sum2: Sum of `(value - z)^2` over the window.
 ///     n: Number of valid window values.
 ///     cu: Speckle coefficient of variation, `1 / sqrt(ENL)`.
 ///
@@ -2021,7 +2025,7 @@ fn window_mean_and_cv(sum: f64, sum2: f64, n: f64) -> Option<(f64, f64)> {
 ///     `mean + w * (z - mean)` with `w = clamp(1 - cu^2 / ci^2, 0, 1)`; `z`
 ///     unchanged when the window has no positive mean.
 fn lee_mmse_estimate(z: f64, sum: f64, sum2: f64, n: f64, cu: f64) -> f64 {
-    let Some((mean, ci)) = window_mean_and_cv(sum, sum2, n) else {
+    let Some((mean, ci)) = window_mean_and_cv(z, sum, sum2, n) else {
         return z;
     };
     let w = if ci > 0.0 {
@@ -2036,8 +2040,8 @@ fn lee_mmse_estimate(z: f64, sum: f64, sum2: f64, n: f64, cu: f64) -> f64 {
 ///
 /// Args:
 ///     z: Centre pixel value (linear backscatter).
-///     sum: Sum of the window values.
-///     sum2: Sum of the squared window values.
+///     sum: Sum of `(value - z)` over the window.
+///     sum2: Sum of `(value - z)^2` over the window.
 ///     n: Number of valid window values.
 ///     cu: Speckle coefficient of variation, `1 / sqrt(ENL)`.
 ///     cmax: Upper heterogeneity limit, `sqrt(1 + 2 / ENL)`.
@@ -2047,7 +2051,7 @@ fn lee_mmse_estimate(z: f64, sum: f64, sum2: f64, n: f64, cu: f64) -> f64 {
 ///     exponentially damped blend in between; `z` unchanged when the window
 ///     has no positive mean.
 fn enhanced_lee_estimate(z: f64, sum: f64, sum2: f64, n: f64, cu: f64, cmax: f64) -> f64 {
-    let Some((mean, ci)) = window_mean_and_cv(sum, sum2, n) else {
+    let Some((mean, ci)) = window_mean_and_cv(z, sum, sum2, n) else {
         return z;
     };
     if ci <= cu {

@@ -991,7 +991,7 @@ mod tests {
 
     #[test]
     fn parses_geo_metadata_primary_col_and_epsg() {
-        let kv = vec![parquet::format::KeyValue {
+        let kv = vec![parquet::file::metadata::KeyValue {
             key: "geo".to_owned(),
             value: Some(
                 r#"{"primary_column":"geometry","columns":{"geometry":{"crs":{"id":{"authority":"EPSG","code":4326}}}}}"#

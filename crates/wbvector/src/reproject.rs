@@ -1084,8 +1084,9 @@ mod tests {
         match out.features[0].geometry.as_ref().unwrap() {
             Geometry::Point(c) => {
                 assert!((c.x - ex).abs() < 1e-6 && (c.y - ey).abs() < 1e-6);
-                // East of the central meridian and north of lat_0.
-                assert!(c.x > 5_000_000.0 && c.y > 10_000_000.0 - 1_500_000.0);
+                // East of the central meridian (-54) and south of lat_0 (-12),
+                // so x is above the false easting and y below the false northing.
+                assert!(c.x > 5_000_000.0 && c.y < 10_000_000.0);
             }
             g => panic!("unexpected geometry {g:?}"),
         }

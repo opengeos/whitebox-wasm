@@ -32,6 +32,5 @@ serde_json = { version = "1", optional = true }
 # cannot clone/seek a std::fs::File the way parquet's File ChunkReader needs.
 bytes = { version = "1", optional = true }
 
-
 [dev-dependencies]
 tempfile = "3"

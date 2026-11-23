@@ -1925,7 +1925,6 @@ impl FastAlmostGaussianFilterTool {
                 let rows = input.rows;
                 let cols = input.cols;
                 let bands = input.bands;
-                let nodata = input.nodata;
                 let out_vals: Vec<Vec<f64>> = (0..bands)
                     .into_par_iter()
                     .map(|band_idx| {

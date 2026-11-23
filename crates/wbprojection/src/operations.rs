@@ -127,6 +127,7 @@ mod tests {
 
     #[test]
     fn coordinate_operation_registry_round_trip() {
+        let _guard = coordinate_operation_test_guard();
         clear_coordinate_operations().unwrap();
 
         let op = CoordinateOperationDef::new(10715, 22817, 2958, OperationMethod::DynamicGridShift)

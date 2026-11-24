@@ -1543,7 +1543,7 @@ pub(crate) fn encode_zstd(raw: &[u8], level: i32) -> Result<Vec<u8>> {
     Ok(compress_to_vec(raw, level))
 }
 
-fn decode_zstd(bytes: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn decode_zstd(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut source = bytes;
     let mut decoder = ruzstd::decoding::StreamingDecoder::new(&mut source)
         .map_err(|e| RasterError::Other(format!("zstd decode error: {e}")))?;

@@ -1527,15 +1527,17 @@ fn decompress_bytes(compressor: &Option<(String, Option<i32>)>, bytes: &[u8]) ->
     }
 }
 
-fn encode_zstd(raw: &[u8], level: i32) -> Result<Vec<u8>> {
+pub(crate) fn encode_zstd(raw: &[u8], level: i32) -> Result<Vec<u8>> {
     use ruzstd::encoding::{compress_to_vec, CompressionLevel};
 
-    let level = match level {
-        i32::MIN..=0 => CompressionLevel::Uncompressed,
-        1 => CompressionLevel::Fastest,
-        2 | 3 => CompressionLevel::Default,
-        4..=7 => CompressionLevel::Better,
-        _ => CompressionLevel::Best,
+    // ruzstd's encoder implements only `Uncompressed` and `Fastest`; the
+    // `Default`, `Better` and `Best` levels hit `unimplemented!()` and panic.
+    // Every positive level therefore maps to `Fastest`, which still writes a
+    // standard zstd frame that any decoder reads.
+    let level = if level <= 0 {
+        CompressionLevel::Uncompressed
+    } else {
+        CompressionLevel::Fastest
     };
 
     Ok(compress_to_vec(raw, level))

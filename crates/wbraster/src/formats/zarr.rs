@@ -1048,12 +1048,14 @@ fn decompress_bytes(compressor: &Option<CompressorSpec>, bytes: &[u8]) -> Result
 fn encode_zstd(raw: &[u8], level: i32) -> Result<Vec<u8>> {
     use ruzstd::encoding::{compress_to_vec, CompressionLevel};
 
-    let level = match level {
-        i32::MIN..=0 => CompressionLevel::Uncompressed,
-        1 => CompressionLevel::Fastest,
-        2 | 3 => CompressionLevel::Default,
-        4..=7 => CompressionLevel::Better,
-        _ => CompressionLevel::Best,
+    // ruzstd's encoder implements only `Uncompressed` and `Fastest`; the
+    // `Default`, `Better` and `Best` levels hit `unimplemented!()` and panic.
+    // Every positive level therefore maps to `Fastest`, which still writes a
+    // standard zstd frame that any decoder reads.
+    let level = if level <= 0 {
+        CompressionLevel::Uncompressed
+    } else {
+        CompressionLevel::Fastest
     };
 
     Ok(compress_to_vec(raw, level))
@@ -1088,6 +1090,19 @@ mod tests {
         let pid = std::process::id();
         let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         temp_dir().join(format!("zarr_test_{pid}_{ts}_{n}.zarr"))
+    }
+
+    #[test]
+    fn zstd_every_level_roundtrips() {
+        // Levels 2 and up used to select ruzstd levels that are unimplemented
+        // and panic, which made the default zstd level (3) unusable.
+        let raw: Vec<u8> = (0..4096u32).flat_map(|i| (i % 97).to_le_bytes()).collect();
+        for level in [-1, 0, 1, 2, 3, 5, 9, 22] {
+            let enc = encode_zstd(&raw, level).unwrap();
+            assert_eq!(decode_zstd(&enc).unwrap(), raw, "zarr v2, level {level}");
+            let enc = crate::formats::zarr_v3::encode_zstd(&raw, level).unwrap();
+            assert_eq!(decode_zstd(&enc).unwrap(), raw, "zarr v3, level {level}");
+        }
     }
 
     #[test]

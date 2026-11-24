@@ -6,7 +6,7 @@
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::error::{GeoError, Result};
@@ -32,7 +32,10 @@ pub fn from_bytes(bytes: &[u8]) -> Result<Layer> {
         let f = archive
             .by_index(i)
             .map_err(|e| GeoError::Kmz(format!("failed reading zip entry {i}: {e}")))?;
-        let name = f.name().to_ascii_lowercase();
+        let name = f
+            .name()
+            .map_err(|e| GeoError::Kmz(format!("invalid name for zip entry {i}: {e}")))?
+            .to_ascii_lowercase();
         if name == "doc.kml" {
             preferred_index = Some(i);
             break;
@@ -70,7 +73,7 @@ pub fn to_bytes(layer: &Layer) -> Result<Vec<u8>> {
     let mut cursor = Cursor::new(Vec::<u8>::new());
     {
         let mut writer = ZipWriter::new(&mut cursor);
-        let opts = FileOptions::default().compression_method(CompressionMethod::Deflated);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         writer
             .start_file("doc.kml", opts)
             .map_err(|e| GeoError::Kmz(format!("failed creating doc.kml entry: {e}")))?;

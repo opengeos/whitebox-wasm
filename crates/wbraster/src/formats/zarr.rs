@@ -13,6 +13,8 @@ use serde_json::{json, Value};
 
 use crate::error::{RasterError, Result};
 use crate::raster::{DataType, Raster, RasterConfig};
+// Zarr v2 and v3 share one zstd codec, so the level mapping cannot drift.
+use crate::formats::zarr_v3::{decode_zstd, encode_zstd};
 
 /// Read a Zarr raster from a `.zarr` directory or from a `.zarray` file.
 ///
@@ -1045,33 +1047,6 @@ fn decompress_bytes(compressor: &Option<CompressorSpec>, bytes: &[u8]) -> Result
     }
 }
 
-fn encode_zstd(raw: &[u8], level: i32) -> Result<Vec<u8>> {
-    use ruzstd::encoding::{compress_to_vec, CompressionLevel};
-
-    // ruzstd's encoder implements only `Uncompressed` and `Fastest`; the
-    // `Default`, `Better` and `Best` levels hit `unimplemented!()` and panic.
-    // Every positive level therefore maps to `Fastest`, which still writes a
-    // standard zstd frame that any decoder reads.
-    let level = if level <= 0 {
-        CompressionLevel::Uncompressed
-    } else {
-        CompressionLevel::Fastest
-    };
-
-    Ok(compress_to_vec(raw, level))
-}
-
-fn decode_zstd(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut source = bytes;
-    let mut decoder = ruzstd::decoding::StreamingDecoder::new(&mut source)
-        .map_err(|e| RasterError::Other(format!("zstd decode error: {e}")))?;
-    let mut out = Vec::new();
-    decoder
-        .read_to_end(&mut out)
-        .map_err(|e| RasterError::Other(format!("zstd decode error: {e}")))?;
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1099,9 +1074,7 @@ mod tests {
         let raw: Vec<u8> = (0..4096u32).flat_map(|i| (i % 97).to_le_bytes()).collect();
         for level in [-1, 0, 1, 2, 3, 5, 9, 22] {
             let enc = encode_zstd(&raw, level).unwrap();
-            assert_eq!(decode_zstd(&enc).unwrap(), raw, "zarr v2, level {level}");
-            let enc = crate::formats::zarr_v3::encode_zstd(&raw, level).unwrap();
-            assert_eq!(decode_zstd(&enc).unwrap(), raw, "zarr v3, level {level}");
+            assert_eq!(decode_zstd(&enc).unwrap(), raw, "level {level}");
         }
     }
 

@@ -32,10 +32,12 @@ pub fn from_bytes(bytes: &[u8]) -> Result<Layer> {
         let f = archive
             .by_index(i)
             .map_err(|e| GeoError::Kmz(format!("failed reading zip entry {i}: {e}")))?;
-        let name = f
-            .name()
-            .map_err(|e| GeoError::Kmz(format!("invalid name for zip entry {i}: {e}")))?
-            .to_ascii_lowercase();
+        // Skip entries whose name cannot be decoded (e.g. a non-UTF-8 asset
+        // name from an older tool) rather than failing the whole read.
+        let Ok(name) = f.name() else {
+            continue;
+        };
+        let name = name.to_ascii_lowercase();
         if name == "doc.kml" {
             preferred_index = Some(i);
             break;
